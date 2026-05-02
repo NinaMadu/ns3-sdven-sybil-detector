@@ -7,6 +7,7 @@
 #include "ns3/netanim-module.h"
 #include "ns3/network-module.h"
 #include "ns3/wifi-module.h"
+#include "sybil_metrics.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -329,6 +330,17 @@ LogReceivedPacket(const std::string& receiverRole,
         << delay << ","
         << aggCount << ","
         << (hasTag ? "received_tagged" : "received_untagged") << "\n";
+
+    // For M1 PDR: only credit a V2V beacon delivery when the receiver is another
+    // vehicle.  RSUs and the controller overhear broadcast frames at the MAC layer
+    // but are not the intended destinations of BSM beacons, so counting them would
+    // inflate the numerator and make PDR > 1.  Unicast flows always count.
+    bool isV2VBroadcast = hasTag &&
+                          tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
+    bool countForPDR    = !isV2VBroadcast || receiverRole == "vehicle";
+
+    bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
+    MetricsOnReceive(isSybil, delay, countForPDR);
 }
 
 static void
@@ -379,6 +391,13 @@ SendTaggedPacket(Ptr<Socket> socket,
                        tx->sequenceNumber);
     packet->AddPacketTag(tag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
+
+    // V2V beacons are broadcast: one send reaches (N_Vehicles - 1) other vehicles.
+    // All other flows are unicast and expect exactly 1 delivery.
+    uint32_t expectedDeliveries = (tx->destinationId == 0xFFFFFFFF)
+                                  ? (N_Vehicles > 1 ? N_Vehicles - 1 : 1)
+                                  : 1;
+    MetricsOnTransmit(expectedDeliveries);
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +545,7 @@ main(int argc, char* argv[])
     }
 
     InitializeCommunicationCsv();
+    InitializeMetricsCsvFiles();
 
     // -----------------------------------------------------------------------
     // Node creation — populate globals so scheduled callbacks can reach them.
@@ -773,6 +793,13 @@ main(int argc, char* argv[])
     }
 
     // -----------------------------------------------------------------------
+    // Metrics flush scheduling
+    // -----------------------------------------------------------------------
+
+    g_nextMetricWindow = 1.0;
+    Simulator::Schedule(Seconds(1.0), &FlushMetrics);
+
+    // -----------------------------------------------------------------------
     // NetAnim visualisation
     // -----------------------------------------------------------------------
 
@@ -790,10 +817,15 @@ main(int argc, char* argv[])
     std::cout << "RSU coverage range: " << rsuCoverageRange << " m" << std::endl;
     std::cout << "NetAnim: " << animFile << std::endl;
     std::cout << "CSV:     " << communicationCsv << std::endl;
+    std::cout << "Metrics: " << metricsPdrCsv << ", " << metricsLatencyCsv
+              << ", " << metricsAttractionCsv << ", " << metricsCongestionCsv << std::endl;
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
     Simulator::Destroy();
+
+    WriteMetricsRow(simTime);
+    WriteFinalSummary();
 
     return 0;
 }

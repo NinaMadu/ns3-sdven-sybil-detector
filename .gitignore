@@ -13,6 +13,7 @@
 # Track selected files
 !scratch/Sybil-Developing.cc
 !scratch/Sybil-Developing-Improved.cc
+!scratch/sybil_metrics.h
 
 # Track repository docs/config
 !README.md
