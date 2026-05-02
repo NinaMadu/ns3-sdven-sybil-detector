@@ -341,6 +341,20 @@ LogReceivedPacket(const std::string& receiverRole,
 
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
     MetricsOnReceive(isSybil, delay, countForPDR);
+
+    // M5–M10: feed every received packet into the security evaluation engine
+    if (g_secMetrics)
+    {
+        g_secMetrics->OnPacketReceived(
+            hasTag ? tag.GetRealNodeId()     : 0,
+            hasTag ? tag.GetClaimedNodeId()  : 0,
+            hasTag ? tag.GetSequenceNumber() : 0,
+            hasTag,
+            receiverRole,
+            receiverId,
+            static_cast<uint32_t>(packet->GetSize()),
+            Simulator::Now().GetSeconds());
+    }
 }
 
 static void
@@ -546,6 +560,10 @@ main(int argc, char* argv[])
 
     InitializeCommunicationCsv();
     InitializeMetricsCsvFiles();
+
+    // M5–M10: create and initialise after routing_test / N_RSUs are finalised
+    g_secMetrics = Create<SecurityEvaluationMetrics>();
+    g_secMetrics->Initialize(N_Vehicles, N_RSUs, proposed_method);
 
     // -----------------------------------------------------------------------
     // Node creation — populate globals so scheduled callbacks can reach them.
@@ -799,6 +817,9 @@ main(int argc, char* argv[])
     g_nextMetricWindow = 1.0;
     Simulator::Schedule(Seconds(1.0), &FlushMetrics);
 
+    // M5–M10: schedule periodic FlushWindow, FL stub rounds, and auto-Finalize
+    g_secMetrics->ScheduleAll(simTime);
+
     // -----------------------------------------------------------------------
     // NetAnim visualisation
     // -----------------------------------------------------------------------
@@ -817,8 +838,13 @@ main(int argc, char* argv[])
     std::cout << "RSU coverage range: " << rsuCoverageRange << " m" << std::endl;
     std::cout << "NetAnim: " << animFile << std::endl;
     std::cout << "CSV:     " << communicationCsv << std::endl;
-    std::cout << "Metrics: " << metricsPdrCsv << ", " << metricsLatencyCsv
+    std::cout << "M1-M4:   " << metricsPdrCsv << ", " << metricsLatencyCsv
               << ", " << metricsAttractionCsv << ", " << metricsCongestionCsv << std::endl;
+    std::cout << "M5/M6:   " << g_secMetrics->csvM5M6 << std::endl;
+    std::cout << "M7:      " << g_secMetrics->csvM7 << std::endl;
+    std::cout << "M8:      " << g_secMetrics->csvM8 << std::endl;
+    std::cout << "M9:      " << g_secMetrics->csvM9 << std::endl;
+    std::cout << "M10:     " << g_secMetrics->csvM10 << std::endl;
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
