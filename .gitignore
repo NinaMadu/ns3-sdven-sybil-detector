@@ -14,7 +14,8 @@
 !scratch/Sybil-Developing.cc
 !scratch/Sybil-Developing-Improved.cc
 
-# Track gitignore
+# Track repository docs/config
+!README.md
 !.gitignore
 
 # Ignore Windows downloaded-file metadata even inside included folders
