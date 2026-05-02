@@ -1,69 +1,21 @@
-# Prerequisites
-*.d
+# Ignore everything
+*
+*:Zone.Identifier
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# Allow selected directories
+!scratch/
+!sybil-attack/
 
-# Precompiled Headers
-*.gch
-*.pch
+# Track sybil-attack folder 
+!sybil-attack/**
+!sybil-attack/**/
 
-# Linker files
-*.ilk
+# Track selected files
+!scratch/Sybil-Developing.cc
+!scratch/Sybil-Developing-Improved.cc
 
-# Debugger Files
-*.pdb
+# Track gitignore
+!.gitignore
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Build directories
-build/
-Build/
-build-*/
-
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
-
-# Temporary files
-*.tmp
-*.log
-*.bak
-*.swp
-
-# vcpkg
-vcpkg_installed/
-
-# debug information files
-*.dwo
-
-# test output & cache
-Testing/
-.cache/
+# Ignore Windows downloaded-file metadata even inside included folders
+*:Zone.Identifier
