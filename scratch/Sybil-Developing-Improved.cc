@@ -1,3 +1,19 @@
+// =============================================================================
+// Sybil-Developing-Improved.cc — SDVEN simulation main file
+//
+// Responsibility of this file: network topology, node creation, mobility,
+// channel configuration, IP addressing, traffic scheduling, and main().
+//
+// All Sybil attack logic lives in:
+//   sybil_attacks.h   — attack scenarios, identity spoofing, ScheduleAttackTraffic
+//   sybil_types.h     — shared types, packet tag, port constants, tx utilities
+//   sybil_metrics.h   — evaluation metrics M1–M10
+//
+// To run a specific attack variant (example: type 2, 40% attackers):
+//   ./waf --run "Sybil-Developing-Improved --sybil_attack_enabled=true
+//               --sybil_attack_type=2 --sybil_attack_percentage=40"
+// =============================================================================
+
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/csma-module.h"
@@ -7,7 +23,7 @@
 #include "ns3/netanim-module.h"
 #include "ns3/network-module.h"
 #include "ns3/wifi-module.h"
-#include "sybil_metrics.h"
+#include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
 
 #include <cstdlib>
 #include <fstream>
@@ -21,191 +37,40 @@ using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("SybilDeveloping");
 
 // ---------------------------------------------------------------------------
-// Experiment variables.
-// Change these first when you want a different experiment.
+// Experiment parameters — change these to configure a run.
 // ---------------------------------------------------------------------------
 
-uint32_t N_Vehicles = 8;              // Change this for the number of vehicle nodes.
-uint32_t N_RSUs = 2;                  // Change this for the number of RSU edge nodes.
-double simTime = 12.0;                // Change this for total simulation time.
-double beaconInterval = 1.0;          // Change this for periodic vehicle message frequency.
-double rsuReportInterval = 1.5;       // Change this for periodic RSU-controller frequency.
-bool routing_test = true;             // Like supervisor code: true creates a small test network.
-bool sybil_attack_enabled = false;    // Future: turn Sybil attack behavior on/off.
-uint32_t sybil_attack_percentage = 25;// Future: percentage of vehicles behaving as Sybil attackers.
-bool controller_malicious_assumption = false; // Future: allow malicious controller behavior.
-uint32_t proposed_method = 0;         // Future: switch between your detection methods.
-double rsuCoverageRange = 300.0;      // DSRC typical RSU coverage radius (meters).
+uint32_t N_Vehicles = 8;              ///< Number of vehicle nodes.
+uint32_t N_RSUs = 2;                  ///< Number of RSU edge nodes.
+double simTime = 12.0;                ///< Total simulation time (seconds).
+double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
+double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
+bool routing_test = true;             ///< true → small 6-vehicle test network.
+bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
+uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
+bool controller_malicious_assumption = false; ///< Force controller to be malicious.
+uint32_t proposed_method = 0;         ///< Detection method: 0=rule-based 1=ML 2=FL 3=hybrid.
+uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
+double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
 
-const uint16_t VEHICLE_PORT = 9000;
-const uint16_t RSU_PORT = 9100;
-const uint16_t CONTROLLER_PORT = 9200;
-
-std::string outputDir = "sybil-attack/outputs";
-std::string inputDir = "sybil-attack/inputs";
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
-std::string animFile = "sybil-attack/outputs/sybil-developing-netanim.xml";
+std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
 
 // ---------------------------------------------------------------------------
-// Global containers — needed by dynamically-scheduled callbacks so that
-// distance-based RSU selection and controller sends work at actual fire time.
+// Global containers (NOT static — extern'd in sybil_types.h so attack
+// scenario functions in sybil_attacks.h can reach them at callback fire time).
 // ---------------------------------------------------------------------------
 
-static NodeContainer g_vehicleNodes;
-static NodeContainer g_rsuNodes;
-static NodeContainer g_controllerNode;
-static Ipv4InterfaceContainer g_wirelessInterfaces;
-static Ipv4InterfaceContainer g_wiredInterfaces;
-static uint32_t g_seq = 0;
-
-// Per-RSU count of V2RSU_REPORTs received since last RSU→Controller report.
-// Reset to zero each time the RSU forwards its aggregated report.
-static uint32_t g_rsuReportCount[10] = {};
+NodeContainer            g_vehicleNodes;
+NodeContainer            g_rsuNodes;
+NodeContainer            g_controllerNode;
+Ipv4InterfaceContainer   g_wirelessInterfaces;
+Ipv4InterfaceContainer   g_wiredInterfaces;
+uint32_t                 g_seq = 0;
+uint32_t                 g_rsuReportCount[10] = {};
 
 // ---------------------------------------------------------------------------
-// Packet tag.
-// Every packet carries metadata so the CSV captures both real and claimed IDs.
-// Future Sybil logic should extend this tag, not create many duplicate tags.
-// ---------------------------------------------------------------------------
-
-enum MessageType
-{
-    V2V_BEACON = 1,
-    V2RSU_REPORT = 2,
-    RSU2CONTROLLER_REPORT = 3,
-    CONTROLLER2RSU_COMMAND = 4,
-    RSU2VEHICLE_COMMAND = 5
-};
-
-struct TxInfo : public SimpleRefCount<TxInfo>
-{
-    uint32_t packetSize;
-    uint32_t realNodeId;
-    uint32_t claimedNodeId;
-    uint32_t destinationId;
-    uint32_t messageType;
-    uint32_t sequenceNumber;
-};
-
-class SybilPacketTag : public Tag
-{
-  public:
-    SybilPacketTag();
-    SybilPacketTag(uint32_t realNodeId,
-                   uint32_t claimedNodeId,
-                   uint32_t destinationId,
-                   uint32_t messageType,
-                   uint32_t sequenceNumber);
-
-    static TypeId GetTypeId(void);
-    TypeId GetInstanceTypeId(void) const override;
-    uint32_t GetSerializedSize(void) const override;
-    void Serialize(TagBuffer i) const override;
-    void Deserialize(TagBuffer i) override;
-    void Print(std::ostream& os) const override;
-
-    uint32_t GetRealNodeId() const;
-    uint32_t GetClaimedNodeId() const;
-    uint32_t GetDestinationId() const;
-    uint32_t GetMessageType() const;
-    uint32_t GetSequenceNumber() const;
-    double GetCreatedTime() const;
-
-  private:
-    uint32_t m_realNodeId;
-    uint32_t m_claimedNodeId;
-    uint32_t m_destinationId;
-    uint32_t m_messageType;
-    uint32_t m_sequenceNumber;
-    double m_createdTime;
-};
-
-NS_OBJECT_ENSURE_REGISTERED(SybilPacketTag);
-
-SybilPacketTag::SybilPacketTag()
-    : m_realNodeId(0),
-      m_claimedNodeId(0),
-      m_destinationId(0),
-      m_messageType(0),
-      m_sequenceNumber(0),
-      m_createdTime(Simulator::Now().GetSeconds())
-{
-}
-
-SybilPacketTag::SybilPacketTag(uint32_t realNodeId,
-                               uint32_t claimedNodeId,
-                               uint32_t destinationId,
-                               uint32_t messageType,
-                               uint32_t sequenceNumber)
-    : m_realNodeId(realNodeId),
-      m_claimedNodeId(claimedNodeId),
-      m_destinationId(destinationId),
-      m_messageType(messageType),
-      m_sequenceNumber(sequenceNumber),
-      m_createdTime(Simulator::Now().GetSeconds())
-{
-}
-
-TypeId
-SybilPacketTag::GetTypeId(void)
-{
-    static TypeId tid = TypeId("ns3::SybilPacketTag")
-                            .SetParent<Tag>()
-                            .AddConstructor<SybilPacketTag>();
-    return tid;
-}
-
-TypeId
-SybilPacketTag::GetInstanceTypeId(void) const
-{
-    return SybilPacketTag::GetTypeId();
-}
-
-uint32_t
-SybilPacketTag::GetSerializedSize(void) const
-{
-    return (5 * sizeof(uint32_t)) + sizeof(double);
-}
-
-void
-SybilPacketTag::Serialize(TagBuffer i) const
-{
-    i.WriteU32(m_realNodeId);
-    i.WriteU32(m_claimedNodeId);
-    i.WriteU32(m_destinationId);
-    i.WriteU32(m_messageType);
-    i.WriteU32(m_sequenceNumber);
-    i.WriteDouble(m_createdTime);
-}
-
-void
-SybilPacketTag::Deserialize(TagBuffer i)
-{
-    m_realNodeId = i.ReadU32();
-    m_claimedNodeId = i.ReadU32();
-    m_destinationId = i.ReadU32();
-    m_messageType = i.ReadU32();
-    m_sequenceNumber = i.ReadU32();
-    m_createdTime = i.ReadDouble();
-}
-
-void
-SybilPacketTag::Print(std::ostream& os) const
-{
-    os << "real=" << m_realNodeId << ", claimed=" << m_claimedNodeId
-       << ", dst=" << m_destinationId << ", type=" << m_messageType
-       << ", seq=" << m_sequenceNumber;
-}
-
-uint32_t SybilPacketTag::GetRealNodeId() const { return m_realNodeId; }
-uint32_t SybilPacketTag::GetClaimedNodeId() const { return m_claimedNodeId; }
-uint32_t SybilPacketTag::GetDestinationId() const { return m_destinationId; }
-uint32_t SybilPacketTag::GetMessageType() const { return m_messageType; }
-uint32_t SybilPacketTag::GetSequenceNumber() const { return m_sequenceNumber; }
-double SybilPacketTag::GetCreatedTime() const { return m_createdTime; }
-
-// ---------------------------------------------------------------------------
-// Helper functions.
+// Filesystem setup
 // ---------------------------------------------------------------------------
 
 static void
@@ -218,51 +83,14 @@ static void
 InitializeCommunicationCsv()
 {
     std::ofstream out(communicationCsv.c_str(), std::ios::out);
-    // rsu_aggregated_count: how many V2RSU_REPORTs the receiving RSU has seen
-    // in the current interval — zero for all non-RSU rows.
     out << "receive_time,flow,receiver_role,receiver_id,real_node_id,claimed_node_id,"
         << "destination_id,message_type,sequence_number,channel,packet_size,delay,"
         << "rsu_aggregated_count,status\n";
 }
 
-static std::string
-MessageTypeToString(uint32_t messageType)
-{
-    switch (messageType)
-    {
-    case V2V_BEACON:            return "v2v_beacon";
-    case V2RSU_REPORT:          return "v2rsu_report";
-    case RSU2CONTROLLER_REPORT: return "rsu2controller_report";
-    case CONTROLLER2RSU_COMMAND:return "controller2rsu_command";
-    case RSU2VEHICLE_COMMAND:   return "rsu2vehicle_command";
-    default:                    return "unknown";
-    }
-}
-
-static bool
-IsSybilVehicle(uint32_t vehicleId)
-{
-    if (!sybil_attack_enabled || sybil_attack_percentage == 0)
-    {
-        return false;
-    }
-    return ((vehicleId * 37 + 11) % 100) < sybil_attack_percentage;
-}
-
-static uint32_t
-GetClaimedVehicleId(uint32_t realVehicleId, uint32_t nVehicles)
-{
-    if (!IsSybilVehicle(realVehicleId) || nVehicles == 0)
-    {
-        return realVehicleId;
-    }
-    return (realVehicleId + 1) % nVehicles;
-}
-
 // ---------------------------------------------------------------------------
-// Distance-based RSU selection.
-// Called at actual send time so that vehicle movement is reflected.
-// Returns the index of the nearest RSU in g_rsuNodes.
+// Distance-based RSU selection — called at actual fire time so vehicle
+// movement is reflected.  Returns the nearest RSU index.
 // ---------------------------------------------------------------------------
 
 static uint32_t
@@ -270,23 +98,19 @@ FindNearestRsu(uint32_t vehicleIndex)
 {
     Ptr<MobilityModel> vMob =
         g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>();
-    double minDist = std::numeric_limits<double>::max();
+    double   minDist = std::numeric_limits<double>::max();
     uint32_t nearest = 0;
     for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
     {
         double d = vMob->GetDistanceFrom(
             g_rsuNodes.Get(i)->GetObject<MobilityModel>());
-        if (d < minDist)
-        {
-            minDist = d;
-            nearest = i;
-        }
+        if (d < minDist) { minDist = d; nearest = i; }
     }
     return nearest;
 }
 
 // ---------------------------------------------------------------------------
-// Logging.
+// Packet reception and CSV logging
 // ---------------------------------------------------------------------------
 
 static void
@@ -306,21 +130,18 @@ LogReceivedPacket(const std::string& receiverRole,
         g_rsuReportCount[receiverId]++;
     }
 
-    // Include current RSU aggregation tally in every RSU row.
     uint32_t aggCount = 0;
     if (receiverRole == "rsu_edge" && receiverId < 10)
-    {
         aggCount = g_rsuReportCount[receiverId];
-    }
 
     std::ofstream out(communicationCsv.c_str(), std::ios::app);
-    double delay = hasTag ? Simulator::Now().GetSeconds() - tag.GetCreatedTime() : 0.0;
+    double   delay       = hasTag ? Simulator::Now().GetSeconds() - tag.GetCreatedTime() : 0.0;
     uint32_t messageType = hasTag ? tag.GetMessageType() : 0;
     out << Simulator::Now().GetSeconds() << ","
         << MessageTypeToString(messageType) << ","
         << receiverRole << ","
         << receiverId << ","
-        << (hasTag ? tag.GetRealNodeId() : 0) << ","
+        << (hasTag ? tag.GetRealNodeId()    : 0) << ","
         << (hasTag ? tag.GetClaimedNodeId() : 0) << ","
         << (hasTag ? tag.GetDestinationId() : 0) << ","
         << messageType << ","
@@ -331,18 +152,13 @@ LogReceivedPacket(const std::string& receiverRole,
         << aggCount << ","
         << (hasTag ? "received_tagged" : "received_untagged") << "\n";
 
-    // For M1 PDR: only credit a V2V beacon delivery when the receiver is another
-    // vehicle.  RSUs and the controller overhear broadcast frames at the MAC layer
-    // but are not the intended destinations of BSM beacons, so counting them would
-    // inflate the numerator and make PDR > 1.  Unicast flows always count.
-    bool isV2VBroadcast = hasTag &&
-                          tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
+    // M1 PDR: only credit V2V beacon delivery when the receiver is another vehicle.
+    bool isV2VBroadcast = hasTag && tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
     bool countForPDR    = !isV2VBroadcast || receiverRole == "vehicle";
 
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
     MetricsOnReceive(isSybil, delay, countForPDR);
 
-    // M5–M10: feed every received packet into the security evaluation engine
     if (g_secMetrics)
     {
         g_secMetrics->OnPacketReceived(
@@ -358,10 +174,10 @@ LogReceivedPacket(const std::string& receiverRole,
 }
 
 static void
-ReceivePacket(std::string receiverRole, uint32_t receiverId, std::string channel,
-              Ptr<Socket> socket)
+ReceivePacket(std::string receiverRole, uint32_t receiverId,
+              std::string channel, Ptr<Socket> socket)
 {
-    Address from;
+    Address    from;
     Ptr<Packet> packet;
     while ((packet = socket->RecvFrom(from)))
     {
@@ -372,60 +188,27 @@ ReceivePacket(std::string receiverRole, uint32_t receiverId, std::string channel
 }
 
 static Ptr<Socket>
-InstallUdpReceiver(Ptr<Node> node,
-                   uint16_t port,
-                   const std::string& receiverRole,
-                   uint32_t receiverId,
+InstallUdpReceiver(Ptr<Node> node, uint16_t port,
+                   const std::string& receiverRole, uint32_t receiverId,
                    const std::string& channel)
 {
     Ptr<Socket> socket = Socket::CreateSocket(node, UdpSocketFactory::GetTypeId());
-    InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), port);
-    socket->Bind(local);
-    socket->SetRecvCallback(MakeBoundCallback(&ReceivePacket, receiverRole, receiverId, channel));
+    socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), port));
+    socket->SetRecvCallback(
+        MakeBoundCallback(&ReceivePacket, receiverRole, receiverId, channel));
     return socket;
 }
 
-static Ptr<Socket>
-CreateSenderSocket(Ptr<Node> node)
-{
-    return Socket::CreateSocket(node, UdpSocketFactory::GetTypeId());
-}
-
-static void
-SendTaggedPacket(Ptr<Socket> socket,
-                 Ipv4Address destinationIp,
-                 uint16_t destinationPort,
-                 Ptr<TxInfo> tx)
-{
-    Ptr<Packet> packet = Create<Packet>(tx->packetSize);
-    SybilPacketTag tag(tx->realNodeId,
-                       tx->claimedNodeId,
-                       tx->destinationId,
-                       tx->messageType,
-                       tx->sequenceNumber);
-    packet->AddPacketTag(tag);
-    socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
-
-    // V2V beacons are broadcast: one send reaches (N_Vehicles - 1) other vehicles.
-    // All other flows are unicast and expect exactly 1 delivery.
-    uint32_t expectedDeliveries = (tx->destinationId == 0xFFFFFFFF)
-                                  ? (N_Vehicles > 1 ? N_Vehicles - 1 : 1)
-                                  : 1;
-    MetricsOnTransmit(expectedDeliveries);
-}
-
 // ---------------------------------------------------------------------------
-// Dynamic callbacks — executed at the scheduled fire time so that vehicle
-// position and RSU aggregation state are current.
+// Dynamic send callbacks — fire at scheduled time so position / state is current
 // ---------------------------------------------------------------------------
 
-// V2RSU: picks the nearest RSU at fire time instead of at scheduling time.
 static void
 SendV2RsuReport(uint32_t vehicleIndex)
 {
-    uint32_t rsuIndex        = FindNearestRsu(vehicleIndex);
-    uint32_t rsuWirelessIdx  = g_vehicleNodes.GetN() + rsuIndex;
-    uint32_t claimedId       = GetClaimedVehicleId(vehicleIndex, g_vehicleNodes.GetN());
+    uint32_t rsuIndex       = FindNearestRsu(vehicleIndex);
+    uint32_t rsuWirelessIdx = g_vehicleNodes.GetN() + rsuIndex;
+    uint32_t claimedId      = GetClaimedVehicleId(vehicleIndex, g_vehicleNodes.GetN());
 
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     Ptr<TxInfo> tx   = Create<TxInfo>();
@@ -435,57 +218,43 @@ SendV2RsuReport(uint32_t vehicleIndex)
     tx->destinationId = rsuIndex;
     tx->messageType   = static_cast<uint32_t>(V2RSU_REPORT);
     tx->sequenceNumber = g_seq++;
-
-    SendTaggedPacket(sock,
-                     g_wirelessInterfaces.GetAddress(rsuWirelessIdx),
-                     RSU_PORT,
-                     tx);
+    SendTaggedPacket(sock, g_wirelessInterfaces.GetAddress(rsuWirelessIdx), RSU_PORT, tx);
 }
 
-// RSU→Controller: reads the current aggregation count and resets it, so each
-// report to the controller reflects vehicle activity in the preceding window.
 static void
 SendRsuControllerReport(uint32_t rsuIndex)
 {
-    uint32_t aggregatedCount      = g_rsuReportCount[rsuIndex];
-    g_rsuReportCount[rsuIndex]    = 0; // reset window counter after reporting
+    uint32_t aggregatedCount   = g_rsuReportCount[rsuIndex];
+    g_rsuReportCount[rsuIndex] = 0;   // reset window counter after reporting
 
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     Ptr<TxInfo> tx   = Create<TxInfo>();
-    // Packet size scales with number of aggregated vehicle records (4 bytes each).
-    tx->packetSize    = 180 + 4 * aggregatedCount;
+    tx->packetSize    = 180 + 4 * aggregatedCount;   // scales with aggregated records
     tx->realNodeId    = rsuIndex;
     tx->claimedNodeId = rsuIndex;
-    tx->destinationId = 0; // controller is destination 0
+    tx->destinationId = 0;
     tx->messageType   = static_cast<uint32_t>(RSU2CONTROLLER_REPORT);
     tx->sequenceNumber = g_seq++;
-
-    // wiredInterfaces index for controller = N_RSUs (last in wiredNodes)
-    SendTaggedPacket(sock,
-                     g_wiredInterfaces.GetAddress(N_RSUs),
-                     CONTROLLER_PORT,
-                     tx);
+    SendTaggedPacket(sock, g_wiredInterfaces.GetAddress(N_RSUs), CONTROLLER_PORT, tx);
 }
 
-// Controller→RSU: sent from the actual controller socket, not an RSU socket.
 static void
 SendControllerRsuCommand(uint32_t rsuIndex)
 {
     Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
     Ptr<TxInfo> tx   = Create<TxInfo>();
     tx->packetSize    = 100;
-    tx->realNodeId    = 0; // controller is node 0
+    tx->realNodeId    = 0;
     tx->claimedNodeId = 0;
     tx->destinationId = rsuIndex;
     tx->messageType   = static_cast<uint32_t>(CONTROLLER2RSU_COMMAND);
     tx->sequenceNumber = g_seq++;
-
-    // wiredInterfaces index for RSU i = i
-    SendTaggedPacket(sock,
-                     g_wiredInterfaces.GetAddress(rsuIndex),
-                     CONTROLLER_PORT,
-                     tx);
+    SendTaggedPacket(sock, g_wiredInterfaces.GetAddress(rsuIndex), CONTROLLER_PORT, tx);
 }
+
+// ---------------------------------------------------------------------------
+// NetAnim node colouring — attack type sets the colour of compromised nodes
+// ---------------------------------------------------------------------------
 
 static void
 ColorAndLabelNodes(AnimationInterface& anim,
@@ -497,15 +266,27 @@ ColorAndLabelNodes(AnimationInterface& anim,
     {
         Ptr<Node> node = vehicles.Get(i);
         std::ostringstream label;
-        label << "Vehicle-" << i;
+        label << "V-" << i;
         if (IsSybilVehicle(i))
         {
-            label << "-Sybil";
-            anim.UpdateNodeColor(node, 220, 40, 40);
+            label << "-Atk";
+            switch (g_activeAttackType)
+            {
+            case ATTACK_OUTSIDER:
+                anim.UpdateNodeColor(node, 255, 100,   0); break;  // orange
+            case ATTACK_INSIDER_DIRECT_SIMULTANEOUS:
+                anim.UpdateNodeColor(node, 220,  40,  40); break;  // red
+            case ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS:
+                anim.UpdateNodeColor(node, 180,  40,  80); break;  // crimson
+            case ATTACK_INSIDER_INDIRECT:
+                anim.UpdateNodeColor(node, 200,   0, 200); break;  // magenta
+            default:
+                anim.UpdateNodeColor(node, 220,  40,  40); break;  // fallback red
+            }
         }
         else
         {
-            anim.UpdateNodeColor(node, 0, 170, 0);
+            anim.UpdateNodeColor(node, 0, 170, 0);                 // green
         }
         anim.UpdateNodeDescription(node, label.str());
         anim.UpdateNodeSize(node->GetId(), 16.0, 16.0);
@@ -515,17 +296,37 @@ ColorAndLabelNodes(AnimationInterface& anim,
     {
         Ptr<Node> node = rsus.Get(i);
         std::ostringstream label;
-        label << "RSU-Edge-" << i;
+        label << "RSU-" << i;
+        if (IsRsuMalicious(i))
+        {
+            label << "-Malicious";
+            anim.UpdateNodeColor(node, 255, 80, 0);       // deep orange
+        }
+        else
+        {
+            anim.UpdateNodeColor(node, 255, 210, 0);      // yellow
+        }
         anim.UpdateNodeDescription(node, label.str());
-        anim.UpdateNodeColor(node, 255, 210, 0);
         anim.UpdateNodeSize(node->GetId(), 22.0, 22.0);
     }
 
-    Ptr<Node> controllerNode = controller.Get(0);
-    anim.UpdateNodeDescription(controllerNode, "SDN-Controller");
-    anim.UpdateNodeColor(controllerNode, 150, 60, 220);
-    anim.UpdateNodeSize(controllerNode->GetId(), 24.0, 24.0);
+    Ptr<Node> ctrl = controller.Get(0);
+    if (IsControllerMalicious())
+    {
+        anim.UpdateNodeDescription(ctrl, "SDN-Controller-Malicious");
+        anim.UpdateNodeColor(ctrl, 180, 0, 40);           // dark red
+    }
+    else
+    {
+        anim.UpdateNodeDescription(ctrl, "SDN-Controller");
+        anim.UpdateNodeColor(ctrl, 150, 60, 220);         // purple
+    }
+    anim.UpdateNodeSize(ctrl->GetId(), 24.0, 24.0);
 }
+
+// ===========================================================================
+// main
+// ===========================================================================
 
 int
 main(int argc, char* argv[])
@@ -533,40 +334,41 @@ main(int argc, char* argv[])
     CreateProjectDirectories();
 
     CommandLine cmd;
-    cmd.AddValue("N_Vehicles",                  "Number of vehicle nodes",                   N_Vehicles);
-    cmd.AddValue("N_RSUs",                      "Number of RSU edge nodes",                  N_RSUs);
-    cmd.AddValue("simTime",                     "Simulation time in seconds",                simTime);
-    cmd.AddValue("routing_test",                "Create a small test network",               routing_test);
-    cmd.AddValue("beaconInterval",              "Vehicle message interval",                  beaconInterval);
-    cmd.AddValue("rsuReportInterval",           "RSU-controller report interval",            rsuReportInterval);
-    cmd.AddValue("sybil_attack_enabled",        "Enable Sybil identity behavior",            sybil_attack_enabled);
-    cmd.AddValue("sybil_attack_percentage",     "Percentage of vehicles with Sybil behavior",sybil_attack_percentage);
-    cmd.AddValue("controller_malicious_assumption","Future malicious-controller flag",        controller_malicious_assumption);
-    cmd.AddValue("proposed_method",             "Future switch for detection method",        proposed_method);
-    cmd.AddValue("rsuCoverageRange",            "RSU coverage radius in meters",             rsuCoverageRange);
+    cmd.AddValue("N_Vehicles",                 "Number of vehicle nodes",                N_Vehicles);
+    cmd.AddValue("N_RSUs",                     "Number of RSU edge nodes",               N_RSUs);
+    cmd.AddValue("simTime",                    "Simulation time in seconds",             simTime);
+    cmd.AddValue("routing_test",               "Small 6-vehicle test network",           routing_test);
+    cmd.AddValue("beaconInterval",             "Vehicle beacon period",                  beaconInterval);
+    cmd.AddValue("rsuReportInterval",          "RSU→Controller report period",           rsuReportInterval);
+    cmd.AddValue("sybil_attack_enabled",       "Enable Sybil attack behavior",           sybil_attack_enabled);
+    cmd.AddValue("sybil_attack_type",          "Attack variant 0-6 (see sybil_attacks.h)",sybil_attack_type);
+    cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
+    cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
+    cmd.AddValue("proposed_method",            "Detection method 0=rule 1=ML 2=FL 3=hybrid",proposed_method);
+    cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
     cmd.Parse(argc, argv);
 
     if (routing_test)
     {
         N_Vehicles = 6;
-        N_RSUs = 2;
-        simTime = std::min(simTime, 12.0);
+        N_RSUs     = 2;
+        simTime    = std::min(simTime, 12.0);
     }
+    if (N_RSUs == 0) N_RSUs = 1;
 
-    if (N_RSUs == 0)
-    {
-        N_RSUs = 1;
-    }
+    // Resolve attack type and populate per-node attacker flags.
+    // Must run after routing_test / N_RSUs adjustments.
+    DeclareAttackStates();
+    DeclareAttackers();
 
     InitializeCommunicationCsv();
     InitializeMetricsCsvFiles();
 
-    // M5–M10: create and initialise after routing_test / N_RSUs are finalised
     g_secMetrics = Create<SecurityEvaluationMetrics>();
     g_secMetrics->Initialize(N_Vehicles, N_RSUs, proposed_method);
 
     // -----------------------------------------------------------------------
-    // Node creation — populate globals so scheduled callbacks can reach them.
+    // Node creation
     // -----------------------------------------------------------------------
 
     g_vehicleNodes.Create(N_Vehicles);
@@ -598,9 +400,8 @@ main(int argc, char* argv[])
 
     for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
     {
-        Ptr<ConstantVelocityMobilityModel> mobility =
-            g_vehicleNodes.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-        mobility->SetVelocity(Vector(2.0 + i, 0.0, 0.0));
+        auto mob = g_vehicleNodes.Get(i)->GetObject<ConstantVelocityMobilityModel>();
+        mob->SetVelocity(Vector(2.0 + i, 0.0, 0.0));
     }
 
     MobilityHelper rsuMobility;
@@ -620,25 +421,7 @@ main(int argc, char* argv[])
     g_controllerNode.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(105.0, 195.0, 0.0));
 
     // -----------------------------------------------------------------------
-    // Wireless channel — 802.11p (DSRC/WAVE) with Cost231 urban propagation.
-    //
-    // Why 802.11p:  IEEE 802.11p is the standard for vehicular V2X (DSRC/WAVE)
-    //               operating in the 5.9 GHz ITS band with 10 MHz channels.
-    //               The original 802.11a is a general-purpose indoor standard
-    //               and should not be used for vehicular simulations.
-    //
-    // Why Cost231: Cost231 (COST 231 Hata) is the ITU-recommended model for
-    //              urban macro-cell environments.  It produces realistic path
-    //              loss at 5.9 GHz for inter-vehicle and V2I distances.
-    //              The prior default (Friis free-space) overestimates range by
-    //              ignoring buildings and multipath.
-    //
-    // Why NistErrorRateModel: NIST model supports OFDM MCS correctly for
-    //              802.11p whereas the default YansErrorRateModel is
-    //              calibrated for 802.11b DSSS.
-    //
-    // TxPower 23 dBm: ETSI EN 302 571 specifies 23 dBm default EIRP for DSRC
-    //              road-side and on-board units at 5.9 GHz.
+    // Wireless channel — 802.11p DSRC/WAVE at 5.9 GHz
     // -----------------------------------------------------------------------
 
     YansWifiChannelHelper wifiChannel;
@@ -648,7 +431,7 @@ main(int argc, char* argv[])
     YansWifiPhyHelper wifiPhy;
     wifiPhy.SetChannel(wifiChannel.Create());
     wifiPhy.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy.Set("TxPowerStart", DoubleValue(23.0)); // dBm — ETSI DSRC limit
+    wifiPhy.Set("TxPowerStart", DoubleValue(23.0));   // dBm — ETSI DSRC limit
     wifiPhy.Set("TxPowerEnd",   DoubleValue(23.0));
 
     WifiHelper wifi;
@@ -663,14 +446,7 @@ main(int argc, char* argv[])
     NetDeviceContainer wirelessDevices = wifi.Install(wifiPhy, wifiMac, wirelessNodes);
 
     // -----------------------------------------------------------------------
-    // Wired backhaul — 1000 Mbps / 10 µs matching LDA supervisor simulation.
-    //
-    // Why 1000 Mbps: The backhaul between RSU and SDN controller represents a
-    //               fibre or high-speed Ethernet link.  100 Mbps was an
-    //               unrealistic bottleneck for control-plane traffic.
-    //
-    // Why 10 µs delay: Represents a local fibre segment (<2 km), consistent
-    //                  with typical urban RSU-to-controller deployments.
+    // Wired backhaul — 1 Gbps fibre link, 10 µs delay
     // -----------------------------------------------------------------------
 
     CsmaHelper csma;
@@ -693,25 +469,12 @@ main(int argc, char* argv[])
     ipv4.SetBase("10.1.2.0", "255.255.255.0");
     g_wiredInterfaces = ipv4.Assign(wiredDevices);
 
-    // Cross-subnet routing note:
-    // All traffic stays within its own subnet — V2X on 10.1.1.0/24, backhaul
-    // on 10.1.2.0/24.  The RSU acts as an application-layer relay: it receives
-    // V2RSU_REPORTs on its WiFi interface and originates RSU2CONTROLLER_REPORTs
-    // from its CSMA interface.  No IP-level forwarding across subnets is needed.
-    //
-    // Ipv4GlobalRoutingHelper::PopulateRoutingTables() is intentionally omitted:
-    // in ns-3.35 it asserts on the ECMP routes created by dual-homed RSU nodes
-    // (each RSU is reachable via both WiFi and CSMA), and those cross-subnet
-    // routes are not required by the current traffic flows.
-
     // -----------------------------------------------------------------------
     // UDP receivers
     // -----------------------------------------------------------------------
 
     for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
-    {
-        InstallUdpReceiver(g_vehicleNodes.Get(i), VEHICLE_PORT, "vehicle", i, "wifi");
-    }
+        InstallUdpReceiver(g_vehicleNodes.Get(i), VEHICLE_PORT, "vehicle",      i, "wifi");
 
     for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
     {
@@ -722,23 +485,14 @@ main(int argc, char* argv[])
     InstallUdpReceiver(g_controllerNode.Get(0), CONTROLLER_PORT, "sdn_controller", 0, "csma");
 
     // -----------------------------------------------------------------------
-    // Traffic scheduling
+    // Normal traffic scheduling
     // -----------------------------------------------------------------------
 
-    // --- Tier 1 → Tier 1 / Tier 2 : V2V broadcast beacons + V2RSU reports ---
-    //
-    // V2V uses subnet broadcast (10.1.1.255) so all vehicles within DSRC range
-    // receive the beacon — matching real DSRC BSM behaviour.  SetAllowBroadcast
-    // must be called before SendTo with a broadcast address.
-    //
-    // V2RSU uses SendV2RsuReport() which calls FindNearestRsu() at fire time
-    // so that a moving vehicle always reports to its geographically closest RSU.
-
+    // Tier 1: V2V broadcast beacons + V2RSU reports
     for (double t = 1.0; t < simTime - 1.0; t += beaconInterval)
     {
         for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
         {
-            // V2V broadcast beacon
             Ptr<Socket> vehicleSocket = CreateSenderSocket(g_vehicleNodes.Get(i));
             vehicleSocket->SetAllowBroadcast(true);
 
@@ -747,46 +501,33 @@ main(int argc, char* argv[])
             v2v->packetSize    = 120;
             v2v->realNodeId    = i;
             v2v->claimedNodeId = claimedId;
-            v2v->destinationId = 0xFFFFFFFF; // broadcast sentinel
+            v2v->destinationId = 0xFFFFFFFF;
             v2v->messageType   = static_cast<uint32_t>(V2V_BEACON);
             v2v->sequenceNumber = g_seq++;
 
             Simulator::Schedule(Seconds(t + 0.05 * i),
                                 &SendTaggedPacket,
                                 vehicleSocket,
-                                Ipv4Address("10.1.1.255"), // wireless subnet broadcast
+                                Ipv4Address("10.1.1.255"),
                                 VEHICLE_PORT,
                                 v2v);
 
-            // V2RSU: dynamic callback — RSU chosen at fire time based on position
             Simulator::Schedule(Seconds(t + 0.10 + 0.05 * i),
-                                &SendV2RsuReport,
-                                i);
+                                &SendV2RsuReport, i);
         }
     }
 
-    // --- Tier 2 → Tier 3 / Tier 3 → Tier 2 : RSU↔Controller (SDN control plane) ---
-    //
-    // SendRsuControllerReport() reads and resets g_rsuReportCount so the packet
-    // size reflects the number of vehicles seen in this interval (edge aggregation).
-    //
-    // SendControllerRsuCommand() is called on g_controllerNode's socket — the
-    // controller now genuinely originates commands instead of RSUs faking them.
-
+    // Tier 2↔3: RSU↔Controller backhaul
     for (double t = 2.0; t < simTime - 1.0; t += rsuReportInterval)
     {
         for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
         {
-            Simulator::Schedule(Seconds(t + 0.1 * i),
-                                &SendRsuControllerReport, i);
-
-            Simulator::Schedule(Seconds(t + 0.40 + 0.1 * i),
-                                &SendControllerRsuCommand, i);
+            Simulator::Schedule(Seconds(t + 0.1 * i),       &SendRsuControllerReport, i);
+            Simulator::Schedule(Seconds(t + 0.40 + 0.1 * i),&SendControllerRsuCommand, i);
         }
     }
 
-    // --- Tier 2 → Tier 1 : RSU→Vehicle command downlink ---
-
+    // Tier 2→1: RSU→Vehicle command downlink
     for (double t = 2.6; t < simTime - 1.0; t += rsuReportInterval)
     {
         for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
@@ -811,13 +552,18 @@ main(int argc, char* argv[])
     }
 
     // -----------------------------------------------------------------------
+    // Attack traffic — injected on top of normal flow (additive, no changes
+    // to the normal callbacks above).
+    // -----------------------------------------------------------------------
+
+    ScheduleAttackTraffic(simTime, beaconInterval, rsuReportInterval);
+
+    // -----------------------------------------------------------------------
     // Metrics flush scheduling
     // -----------------------------------------------------------------------
 
     g_nextMetricWindow = 1.0;
     Simulator::Schedule(Seconds(1.0), &FlushMetrics);
-
-    // M5–M10: schedule periodic FlushWindow, FL stub rounds, and auto-Finalize
     g_secMetrics->ScheduleAll(simTime);
 
     // -----------------------------------------------------------------------
@@ -828,23 +574,40 @@ main(int argc, char* argv[])
     anim.SetMaxPktsPerTraceFile(50000);
     ColorAndLabelNodes(anim, g_vehicleNodes, g_rsuNodes, g_controllerNode);
 
+    // -----------------------------------------------------------------------
+    // Startup summary
+    // -----------------------------------------------------------------------
+
     std::cout << "Sybil-Developing SDVEN simulation (improved)" << std::endl;
-    std::cout << "Vehicles=" << N_Vehicles
-              << ", RSUs=" << N_RSUs
-              << ", Sybil enabled=" << sybil_attack_enabled
-              << ", Sybil percentage=" << sybil_attack_percentage << std::endl;
-    std::cout << "WiFi: 802.11p DSRC @ 5.9 GHz, 10 MHz, 23 dBm, Cost231 propagation" << std::endl;
+    std::cout << "Vehicles=" << N_Vehicles << ", RSUs=" << N_RSUs << std::endl;
+    std::cout << "Attack enabled=" << sybil_attack_enabled
+              << ", Type=" << sybil_attack_type
+              << " (" << AttackTypeToString(g_activeAttackType) << ")"
+              << ", Percentage=" << sybil_attack_percentage << "%" << std::endl;
+
+    if (g_activeAttackType != ATTACK_NONE)
+    {
+        std::cout << "Attacker vehicles: ";
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
+            if (g_vehicleIsAttacker[i]) std::cout << i << " ";
+        std::cout << std::endl;
+
+        std::cout << "Malicious RSUs:    ";
+        for (uint32_t i = 0; i < N_RSUs; ++i)
+            if (g_rsuIsMalicious[i]) std::cout << i << " ";
+        std::cout << std::endl;
+
+        if (g_controllerIsMalicious)
+            std::cout << "SDN Controller:    MALICIOUS" << std::endl;
+    }
+
+    std::cout << "WiFi: 802.11p DSRC @ 5.9 GHz, 10 MHz, 23 dBm, Cost231" << std::endl;
     std::cout << "Backhaul: CSMA 1000 Mbps / 10 us" << std::endl;
-    std::cout << "RSU coverage range: " << rsuCoverageRange << " m" << std::endl;
-    std::cout << "NetAnim: " << animFile << std::endl;
-    std::cout << "CSV:     " << communicationCsv << std::endl;
-    std::cout << "M1-M4:   " << metricsPdrCsv << ", " << metricsLatencyCsv
-              << ", " << metricsAttractionCsv << ", " << metricsCongestionCsv << std::endl;
-    std::cout << "M5/M6:   " << g_secMetrics->csvM5M6 << std::endl;
-    std::cout << "M7:      " << g_secMetrics->csvM7 << std::endl;
-    std::cout << "M8:      " << g_secMetrics->csvM8 << std::endl;
-    std::cout << "M9:      " << g_secMetrics->csvM9 << std::endl;
-    std::cout << "M10:     " << g_secMetrics->csvM10 << std::endl;
+    std::cout << "CSV: " << communicationCsv << std::endl;
+
+    // -----------------------------------------------------------------------
+    // Run
+    // -----------------------------------------------------------------------
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();

@@ -14,6 +14,7 @@
 !scratch/Sybil-Developing.cc
 !scratch/Sybil-Developing-Improved.cc
 !scratch/sybil_metrics.h
+!scratch/sybil_attacks.h
 
 # Track repository docs/config
 !README.md
