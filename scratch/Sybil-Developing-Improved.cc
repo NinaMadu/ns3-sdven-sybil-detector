@@ -661,6 +661,36 @@ LogReceivedPacket(const std::string& receiverRole,
     if (receiverRole == "rsu_edge" && receiverId < g_rsuReportCount.size())
         aggCount = g_rsuReportCount[receiverId];
 
+    // Communication-path trace — printed for every tagged packet so the full
+    // SDVEN flow is visible in the terminal.  When sybil_attack_enabled=false
+    // (the default) all packets are legitimate and the output shows the clean path.
+    if (hasTag)
+    {
+        double recvDelay = Simulator::Now().GetSeconds() - tag.GetCreatedTime();
+        uint32_t realId  = tag.GetRealNodeId();
+        uint32_t msgType = tag.GetMessageType();
+        std::string senderLabel;
+        if (msgType == static_cast<uint32_t>(V2V_BEACON) ||
+            msgType == static_cast<uint32_t>(V2RSU_REPORT))
+            senderLabel = "vehicle-" + std::to_string(realId);
+        else if (msgType == static_cast<uint32_t>(RSU2CONTROLLER_REPORT) ||
+                 msgType == static_cast<uint32_t>(RSU2VEHICLE_COMMAND))
+            senderLabel = "rsu-" + std::to_string(realId);
+        else if (msgType == static_cast<uint32_t>(CONTROLLER2RSU_COMMAND))
+            senderLabel = "controller";
+        else
+            senderLabel = "Node-" + std::to_string(realId);
+
+        std::cout << "[" << Simulator::Now().GetSeconds() << "s]"
+                  << " [RECV] " << MessageTypeToString(tag.GetMessageType())
+                  << "  " << senderLabel
+                  << " --> " << receiverRole << "-" << receiverId
+                  << "  seq=" << tag.GetSequenceNumber()
+                  << "  delay=" << recvDelay * 1000.0 << "ms"
+                  << "  channel=" << channel
+                  << std::endl;
+    }
+
     std::ofstream out(communicationCsv.c_str(), std::ios::app);
     double   delay       = hasTag ? Simulator::Now().GetSeconds() - tag.GetCreatedTime() : 0.0;
     uint32_t messageType = hasTag ? tag.GetMessageType() : 0;
@@ -777,6 +807,20 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
 // Dynamic send callbacks — fire at scheduled time so position / state is current
 // ---------------------------------------------------------------------------
 
+// Wrapper for V2V broadcast beacon — adds a send-side trace before handing
+// off to the generic SendTaggedPacket helper.
+static void
+SendV2VBeacon(uint32_t vehicleIndex, Ptr<Socket> sock,
+              Ipv4Address dest, uint16_t port, Ptr<TxInfo> tx)
+{
+    std::cout << "[" << Simulator::Now().GetSeconds() << "s]"
+              << " [SEND] v2v_beacon    vehicle-" << vehicleIndex
+              << " --> broadcast"
+              << "  seq=" << tx->sequenceNumber
+              << std::endl;
+    SendTaggedPacket(sock, dest, port, tx);
+}
+
 static void
 SendV2RsuReport(uint32_t vehicleIndex)
 {
@@ -788,6 +832,18 @@ SendV2RsuReport(uint32_t vehicleIndex)
     // the position is current (vehicles move between schedule and fire time).
     Vector pos = g_vehicleNodes.Get(vehicleIndex)
                      ->GetObject<MobilityModel>()->GetPosition();
+
+    Ptr<MobilityModel> rsuMobForLog = g_rsuNodes.Get(rsuIndex)->GetObject<MobilityModel>();
+    double distLog = g_vehicleNodes.Get(vehicleIndex)
+                         ->GetObject<MobilityModel>()->GetDistanceFrom(rsuMobForLog);
+
+    std::cout << "[" << Simulator::Now().GetSeconds() << "s]"
+              << " [SEND] v2rsu_report  vehicle-" << vehicleIndex
+              << " --> rsu-" << rsuIndex
+              << "  dist=" << distLog << "m"
+              << "  pos=(" << pos.x << "," << pos.y << ")"
+              << "  seq=" << g_seq
+              << std::endl;
 
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     Ptr<TxInfo> tx   = Create<TxInfo>();
@@ -816,8 +872,18 @@ SendRsuControllerReport(uint32_t rsuIndex)
     if (rsuIndex < g_rsuVehicleTables.size() && !g_rsuVehicleTables[rsuIndex].empty())
     {
         const auto& table = g_rsuVehicleTables[rsuIndex];
+        std::cout << "[" << Simulator::Now().GetSeconds() << "s]"
+                  << " [SEND] rsu2controller_report  rsu-" << rsuIndex
+                  << " --> controller"
+                  << "  vehicles_known=" << table.size()
+                  << "  aggregated=" << aggregatedCount
+                  << std::endl;
         for (auto it = table.begin(); it != table.end(); ++it)
         {
+            std::cout << "          record: vehicle-" << it->second.realVehicleId
+                      << "  dist=" << it->second.distanceToRsu << "m"
+                      << "  seq=" << g_seq
+                      << std::endl;
             SendRsuControllerRecordPacket(sock,
                                           controllerIp,
                                           it->second,
@@ -826,6 +892,14 @@ SendRsuControllerReport(uint32_t rsuIndex)
         }
         return;
     }
+
+    std::cout << "[" << Simulator::Now().GetSeconds() << "s]"
+              << " [SEND] rsu2controller_report  rsu-" << rsuIndex
+              << " --> controller"
+              << "  (no vehicles in table)"
+              << "  aggregated=" << aggregatedCount
+              << "  seq=" << g_seq
+              << std::endl;
 
     Ptr<TxInfo> tx   = Create<TxInfo>();
     tx->packetSize    = 180 + 4 * aggregatedCount;   // scales with aggregated records
@@ -848,6 +922,12 @@ SendControllerRsuCommand(uint32_t rsuIndex)
 
     if (hasTarget)
     {
+        std::cout << "[" << Simulator::Now().GetSeconds() << "s]"
+                  << " [SEND] controller2rsu_command  controller"
+                  << " --> rsu-" << rsuIndex
+                  << "  target=vehicle-" << target.realVehicleId
+                  << "  seq=" << g_seq
+                  << std::endl;
         LogControllerVehicleTableEvent("command_issued",
                                        target,
                                        true,
@@ -855,6 +935,13 @@ SendControllerRsuCommand(uint32_t rsuIndex)
         SendControllerRsuCommandPacket(sock, rsuIp, rsuIndex, target, g_seq++);
         return;
     }
+
+    std::cout << "[" << Simulator::Now().GetSeconds() << "s]"
+              << " [SEND] CTRL2RSU_CMD  Controller"
+              << " --> RSU-" << rsuIndex
+              << "  (no target in controller table)"
+              << "  seq=" << g_seq
+              << std::endl;
 
     Ptr<TxInfo> tx   = Create<TxInfo>();
     tx->packetSize    = 100;
@@ -941,6 +1028,14 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
                                        true,
                                        "rsu_forwarded_to_vehicle");
     }
+
+    std::cout << "[" << Simulator::Now().GetSeconds() << "s]"
+              << " [SEND] rsu2vehicle_command   rsu-" << rsuIndex
+              << " --> vehicle-" << vehicleIndex
+              << (selectedFromController ? "  (controller-directed)" :
+                  selectedFromTable      ? "  (table-selected)"     : "")
+              << "  seq=" << tx->sequenceNumber
+              << std::endl;
 
     SendTaggedPacket(sock,
                      g_wirelessInterfaces.GetAddress(vehicleIndex),
@@ -1048,9 +1143,9 @@ main(int argc, char* argv[])
 
     if (routing_test)
     {
-        N_Vehicles = 6;
+        N_Vehicles = 3;
         N_RSUs     = 2;
-        simTime    = std::min(simTime, 12.0);
+        simTime    = std::min(simTime, 6.0);
     }
     if (N_RSUs == 0) N_RSUs = 1;
     g_rsuVehicleTables.assign(N_RSUs, std::map<uint32_t, RsuVehicleRecord>());
@@ -1210,7 +1305,8 @@ main(int argc, char* argv[])
             v2v->sequenceNumber = g_seq++;
 
             Simulator::Schedule(Seconds(t + 0.05 * i),
-                                &SendTaggedPacket,
+                                &SendV2VBeacon,
+                                i,
                                 vehicleSocket,
                                 Ipv4Address("10.1.1.255"),
                                 VEHICLE_PORT,
