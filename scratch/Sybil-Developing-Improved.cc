@@ -29,8 +29,10 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using namespace ns3;
 
@@ -52,8 +54,12 @@ bool controller_malicious_assumption = false; ///< Force controller to be malici
 uint32_t proposed_method = 0;         ///< Detection method: 0=rule-based 1=ML 2=FL 3=hybrid.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
+double rsuVehicleRecordTimeout = 3.0; ///< Seconds before an RSU forgets an unseen vehicle.
+double rsuVehicleTableSnapshotInterval = 1.0; ///< Periodic RSU table CSV snapshot interval.
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
+std::string rsuVehicleTableCsv = "sybil-attack/outputs/rsu_vehicle_table_log.csv";
+std::string controllerVehicleTableCsv = "sybil-attack/outputs/controller_vehicle_table_log.csv";
 std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
 
 // ---------------------------------------------------------------------------
@@ -67,7 +73,185 @@ NodeContainer            g_controllerNode;
 Ipv4InterfaceContainer   g_wirelessInterfaces;
 Ipv4InterfaceContainer   g_wiredInterfaces;
 uint32_t                 g_seq = 0;
-uint32_t                 g_rsuReportCount[10] = {};
+std::vector<uint32_t>    g_rsuReportCount;   // sized to N_RSUs in main()
+
+struct RsuVehicleRecord
+{
+    uint32_t realVehicleId;
+    uint32_t claimedVehicleId;
+    double lastSeenTime;
+    Vector lastPosition;
+    double distanceToRsu;
+};
+
+struct ControllerVehicleRecord
+{
+    uint32_t realVehicleId;
+    uint32_t claimedVehicleId;
+    uint32_t servingRsuId;
+    double lastSeenTime;
+    Vector lastPosition;
+    double distanceToRsu;
+};
+
+struct ControllerCommandTarget
+{
+    bool     valid           = false;
+    uint32_t realVehicleId   = 0;
+    uint32_t claimedVehicleId = 0;
+    double   issuedTime      = 0.0;
+};
+
+static std::vector<std::map<uint32_t, RsuVehicleRecord> > g_rsuVehicleTables;
+static std::map<uint32_t, ControllerVehicleRecord> g_controllerVehicleTable;
+static std::vector<ControllerCommandTarget> g_controllerCommandTargets;
+
+class RsuControllerRecordTag : public Tag
+{
+  public:
+    RsuControllerRecordTag()
+        : m_realVehicleId(0), m_claimedVehicleId(0), m_servingRsuId(0),
+          m_lastSeenTime(0.0), m_x(0.0), m_y(0.0), m_z(0.0), m_distanceToRsu(0.0) {}
+
+    RsuControllerRecordTag(uint32_t realVehicleId,
+                           uint32_t claimedVehicleId,
+                           uint32_t servingRsuId,
+                           double lastSeenTime,
+                           const Vector& position,
+                           double distanceToRsu)
+        : m_realVehicleId(realVehicleId), m_claimedVehicleId(claimedVehicleId),
+          m_servingRsuId(servingRsuId), m_lastSeenTime(lastSeenTime),
+          m_x(position.x), m_y(position.y), m_z(position.z),
+          m_distanceToRsu(distanceToRsu) {}
+
+    static TypeId GetTypeId(void)
+    {
+        static TypeId tid = TypeId("ns3::RsuControllerRecordTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<RsuControllerRecordTag>();
+        return tid;
+    }
+
+    TypeId GetInstanceTypeId(void) const override { return RsuControllerRecordTag::GetTypeId(); }
+    uint32_t GetSerializedSize(void) const override
+    {
+        return 3 * sizeof(uint32_t) + 5 * sizeof(double);
+    }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(m_realVehicleId);
+        i.WriteU32(m_claimedVehicleId);
+        i.WriteU32(m_servingRsuId);
+        i.WriteDouble(m_lastSeenTime);
+        i.WriteDouble(m_x);
+        i.WriteDouble(m_y);
+        i.WriteDouble(m_z);
+        i.WriteDouble(m_distanceToRsu);
+    }
+
+    void Deserialize(TagBuffer i) override
+    {
+        m_realVehicleId = i.ReadU32();
+        m_claimedVehicleId = i.ReadU32();
+        m_servingRsuId = i.ReadU32();
+        m_lastSeenTime = i.ReadDouble();
+        m_x = i.ReadDouble();
+        m_y = i.ReadDouble();
+        m_z = i.ReadDouble();
+        m_distanceToRsu = i.ReadDouble();
+    }
+
+    void Print(std::ostream& os) const override
+    {
+        os << "realVehicle=" << m_realVehicleId
+           << ",claimedVehicle=" << m_claimedVehicleId
+           << ",rsu=" << m_servingRsuId;
+    }
+
+    ControllerVehicleRecord ToControllerRecord() const
+    {
+        ControllerVehicleRecord record;
+        record.realVehicleId = m_realVehicleId;
+        record.claimedVehicleId = m_claimedVehicleId;
+        record.servingRsuId = m_servingRsuId;
+        record.lastSeenTime = m_lastSeenTime;
+        record.lastPosition = Vector(m_x, m_y, m_z);
+        record.distanceToRsu = m_distanceToRsu;
+        return record;
+    }
+
+  private:
+    uint32_t m_realVehicleId;
+    uint32_t m_claimedVehicleId;
+    uint32_t m_servingRsuId;
+    double m_lastSeenTime;
+    double m_x;
+    double m_y;
+    double m_z;
+    double m_distanceToRsu;
+};
+
+class ControllerRsuCommandTag : public Tag
+{
+  public:
+    ControllerRsuCommandTag()
+        : m_realVehicleId(0), m_claimedVehicleId(0), m_issuedTime(0.0) {}
+
+    ControllerRsuCommandTag(uint32_t realVehicleId,
+                            uint32_t claimedVehicleId,
+                            double issuedTime)
+        : m_realVehicleId(realVehicleId),
+          m_claimedVehicleId(claimedVehicleId),
+          m_issuedTime(issuedTime) {}
+
+    static TypeId GetTypeId(void)
+    {
+        static TypeId tid = TypeId("ns3::ControllerRsuCommandTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<ControllerRsuCommandTag>();
+        return tid;
+    }
+
+    TypeId GetInstanceTypeId(void) const override { return ControllerRsuCommandTag::GetTypeId(); }
+    uint32_t GetSerializedSize(void) const override
+    {
+        return 2 * sizeof(uint32_t) + sizeof(double);
+    }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(m_realVehicleId);
+        i.WriteU32(m_claimedVehicleId);
+        i.WriteDouble(m_issuedTime);
+    }
+
+    void Deserialize(TagBuffer i) override
+    {
+        m_realVehicleId = i.ReadU32();
+        m_claimedVehicleId = i.ReadU32();
+        m_issuedTime = i.ReadDouble();
+    }
+
+    void Print(std::ostream& os) const override
+    {
+        os << "targetRealVehicle=" << m_realVehicleId
+           << ",targetClaimedVehicle=" << m_claimedVehicleId;
+    }
+
+    uint32_t GetRealVehicleId() const { return m_realVehicleId; }
+    uint32_t GetClaimedVehicleId() const { return m_claimedVehicleId; }
+    double GetIssuedTime() const { return m_issuedTime; }
+
+  private:
+    uint32_t m_realVehicleId;
+    uint32_t m_claimedVehicleId;
+    double m_issuedTime;
+};
+
+NS_OBJECT_ENSURE_REGISTERED(SybilPacketTag);
+NS_OBJECT_ENSURE_REGISTERED(RsuControllerRecordTag);
+NS_OBJECT_ENSURE_REGISTERED(ControllerRsuCommandTag);
 
 // ---------------------------------------------------------------------------
 // Filesystem setup
@@ -86,6 +270,24 @@ InitializeCommunicationCsv()
     out << "receive_time,flow,receiver_role,receiver_id,real_node_id,claimed_node_id,"
         << "destination_id,message_type,sequence_number,channel,packet_size,delay,"
         << "rsu_aggregated_count,status\n";
+}
+
+static void
+InitializeRsuVehicleTableCsv()
+{
+    std::ofstream out(rsuVehicleTableCsv.c_str(), std::ios::out);
+    out << "time,event,rsu_id,real_vehicle_id,claimed_vehicle_id,last_seen_time,"
+        << "vehicle_x,vehicle_y,vehicle_z,distance_to_rsu,rsu_table_size,"
+        << "selected_for_command,status\n";
+}
+
+static void
+InitializeControllerVehicleTableCsv()
+{
+    std::ofstream out(controllerVehicleTableCsv.c_str(), std::ios::out);
+    out << "time,event,serving_rsu_id,real_vehicle_id,claimed_vehicle_id,"
+        << "last_seen_time,vehicle_x,vehicle_y,vehicle_z,distance_to_rsu,"
+        << "controller_table_size,selected_for_command,status\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +311,327 @@ FindNearestRsu(uint32_t vehicleIndex)
     return nearest;
 }
 
+static void
+LogRsuVehicleTableEvent(const std::string& event,
+                        uint32_t rsuIndex,
+                        const RsuVehicleRecord& record,
+                        bool selectedForCommand,
+                        const std::string& status)
+{
+    uint32_t tableSize = (rsuIndex < g_rsuVehicleTables.size())
+                         ? g_rsuVehicleTables[rsuIndex].size()
+                         : 0;
+
+    std::ofstream out(rsuVehicleTableCsv.c_str(), std::ios::app);
+    out << Simulator::Now().GetSeconds() << ","
+        << event << ","
+        << rsuIndex << ","
+        << record.realVehicleId << ","
+        << record.claimedVehicleId << ","
+        << record.lastSeenTime << ","
+        << record.lastPosition.x << ","
+        << record.lastPosition.y << ","
+        << record.lastPosition.z << ","
+        << record.distanceToRsu << ","
+        << tableSize << ","
+        << (selectedForCommand ? 1 : 0) << ","
+        << status << "\n";
+}
+
+static void
+LogControllerVehicleTableEvent(const std::string& event,
+                               const ControllerVehicleRecord& record,
+                               bool selectedForCommand,
+                               const std::string& status)
+{
+    std::ofstream out(controllerVehicleTableCsv.c_str(), std::ios::app);
+    out << Simulator::Now().GetSeconds() << ","
+        << event << ","
+        << record.servingRsuId << ","
+        << record.realVehicleId << ","
+        << record.claimedVehicleId << ","
+        << record.lastSeenTime << ","
+        << record.lastPosition.x << ","
+        << record.lastPosition.y << ","
+        << record.lastPosition.z << ","
+        << record.distanceToRsu << ","
+        << g_controllerVehicleTable.size() << ","
+        << (selectedForCommand ? 1 : 0) << ","
+        << status << "\n";
+}
+
+static void
+PurgeStaleRsuVehicleRecords(uint32_t rsuIndex)
+{
+    if (rsuIndex >= g_rsuVehicleTables.size()) return;
+
+    double now = Simulator::Now().GetSeconds();
+    auto& table = g_rsuVehicleTables[rsuIndex];
+    for (auto it = table.begin(); it != table.end(); )
+    {
+        if (now - it->second.lastSeenTime > rsuVehicleRecordTimeout)
+        {
+            LogRsuVehicleTableEvent("expired", rsuIndex, it->second, false, "timeout");
+            it = table.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
+static void
+UpdateRsuVehicleRecord(uint32_t rsuIndex, const SybilPacketTag& tag)
+{
+    if (rsuIndex >= g_rsuVehicleTables.size()) return;
+
+    uint32_t realVehicleId = tag.GetRealNodeId();
+    if (realVehicleId >= g_vehicleNodes.GetN()) return;
+
+    Ptr<MobilityModel> vehicleMob =
+        g_vehicleNodes.Get(realVehicleId)->GetObject<MobilityModel>();
+    Ptr<MobilityModel> rsuMob =
+        g_rsuNodes.Get(rsuIndex)->GetObject<MobilityModel>();
+
+    // Physical distance used for range check (RSU estimates via signal strength).
+    double distanceToRsu = vehicleMob->GetDistanceFrom(rsuMob);
+    // Self-reported position comes from the packet, not from the ground-truth model.
+    Vector vehiclePosition = Vector(tag.GetClaimedX(), tag.GetClaimedY(), tag.GetClaimedZ());
+    uint32_t claimedVehicleId = tag.GetClaimedNodeId();
+
+    if (distanceToRsu > rsuCoverageRange)
+    {
+        RsuVehicleRecord outOfRangeRecord;
+        outOfRangeRecord.realVehicleId = realVehicleId;
+        outOfRangeRecord.claimedVehicleId = claimedVehicleId;
+        outOfRangeRecord.lastSeenTime = Simulator::Now().GetSeconds();
+        outOfRangeRecord.lastPosition = vehiclePosition;
+        outOfRangeRecord.distanceToRsu = distanceToRsu;
+        LogRsuVehicleTableEvent("rejected", rsuIndex, outOfRangeRecord, false, "outside_rsu_range");
+        g_rsuVehicleTables[rsuIndex].erase(claimedVehicleId);
+        return;
+    }
+
+    RsuVehicleRecord record;
+    record.realVehicleId = realVehicleId;
+    record.claimedVehicleId = claimedVehicleId;
+    record.lastSeenTime = Simulator::Now().GetSeconds();
+    record.lastPosition = vehiclePosition;
+    record.distanceToRsu = distanceToRsu;
+    g_rsuVehicleTables[rsuIndex][claimedVehicleId] = record;
+    LogRsuVehicleTableEvent("learned_or_updated", rsuIndex, record, false, "in_range");
+}
+
+static bool
+SelectVehicleKnownByRsu(uint32_t rsuIndex, uint32_t& vehicleIndex)
+{
+    if (rsuIndex >= g_rsuVehicleTables.size()) return false;
+
+    PurgeStaleRsuVehicleRecords(rsuIndex);
+
+    bool found = false;
+    double newest = -1.0;
+    const auto& table = g_rsuVehicleTables[rsuIndex];
+    for (auto it = table.begin(); it != table.end(); ++it)
+    {
+        const RsuVehicleRecord& record = it->second;
+        if (record.realVehicleId < g_vehicleNodes.GetN() &&
+            (!found || record.lastSeenTime > newest))
+        {
+            vehicleIndex = record.realVehicleId;
+            newest = record.lastSeenTime;
+            found = true;
+        }
+    }
+    return found;
+}
+
+static bool
+GetRsuRecordForRealVehicle(uint32_t rsuIndex,
+                            uint32_t realVehicleId,
+                            RsuVehicleRecord& record)
+{
+    if (rsuIndex >= g_rsuVehicleTables.size()) return false;
+
+    PurgeStaleRsuVehicleRecords(rsuIndex);
+
+    const auto& table = g_rsuVehicleTables[rsuIndex];
+    for (auto it = table.begin(); it != table.end(); ++it)
+    {
+        if (it->second.realVehicleId == realVehicleId)
+        {
+            record = it->second;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+PurgeStaleControllerVehicleRecords()
+{
+    double now = Simulator::Now().GetSeconds();
+    for (auto it = g_controllerVehicleTable.begin(); it != g_controllerVehicleTable.end(); )
+    {
+        if (now - it->second.lastSeenTime > rsuVehicleRecordTimeout)
+        {
+            LogControllerVehicleTableEvent("expired", it->second, false, "timeout");
+            it = g_controllerVehicleTable.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
+static bool
+SelectControllerTargetForRsu(uint32_t rsuIndex, ControllerVehicleRecord& target)
+{
+    PurgeStaleControllerVehicleRecords();
+
+    bool found = false;
+    double newest = -1.0;
+    for (auto it = g_controllerVehicleTable.begin(); it != g_controllerVehicleTable.end(); ++it)
+    {
+        const ControllerVehicleRecord& record = it->second;
+        if (record.servingRsuId == rsuIndex &&
+            record.realVehicleId < g_vehicleNodes.GetN() &&
+            (!found || record.lastSeenTime > newest))
+        {
+            target = record;
+            newest = record.lastSeenTime;
+            found = true;
+        }
+    }
+    return found;
+}
+
+static void
+HandleRsuControllerRecordPayload(const std::string& receiverRole,
+                                 Ptr<const Packet> packet,
+                                 const SybilPacketTag& tag,
+                                 bool hasTag)
+{
+    if (!hasTag || receiverRole != "sdn_controller") return;
+
+    uint32_t msgType = tag.GetMessageType();
+
+    if (msgType == static_cast<uint32_t>(RSU2CONTROLLER_REPORT))
+    {
+        // Legitimate RSU report: payload carried by RsuControllerRecordTag.
+        RsuControllerRecordTag recordTag;
+        if (!packet->PeekPacketTag(recordTag)) return;
+
+        PurgeStaleControllerVehicleRecords();
+        ControllerVehicleRecord record = recordTag.ToControllerRecord();
+        auto existing = g_controllerVehicleTable.find(record.claimedVehicleId);
+        if (existing == g_controllerVehicleTable.end() ||
+            record.lastSeenTime >= existing->second.lastSeenTime)
+        {
+            g_controllerVehicleTable[record.claimedVehicleId] = record;
+            LogControllerVehicleTableEvent("global_view_updated",
+                                           record, false, "packet_payload_received");
+        }
+    }
+    else if (msgType == static_cast<uint32_t>(SYBIL_INJECTION))
+    {
+        // Type 5 — malicious RSU forges a vehicle report.
+        // The controller is deceived: it adds the phantom to its global table.
+        uint32_t phantomId      = tag.GetClaimedNodeId();
+        uint32_t reportingRsuId = tag.GetRealNodeId();
+        if (phantomId < g_vehicleNodes.GetN()) return;  // only accept out-of-range phantoms
+
+        PurgeStaleControllerVehicleRecords();
+        ControllerVehicleRecord phantom;
+        phantom.realVehicleId    = phantomId;
+        phantom.claimedVehicleId = phantomId;
+        phantom.servingRsuId     = reportingRsuId;
+        phantom.lastSeenTime     = Simulator::Now().GetSeconds();
+        phantom.lastPosition     = Vector(0.0, 0.0, 0.0);
+        phantom.distanceToRsu    = 0.0;
+
+        auto existing = g_controllerVehicleTable.find(phantomId);
+        if (existing == g_controllerVehicleTable.end() ||
+            phantom.lastSeenTime >= existing->second.lastSeenTime)
+        {
+            g_controllerVehicleTable[phantomId] = phantom;
+            LogControllerVehicleTableEvent("global_view_updated",
+                                           phantom, false, "phantom_from_malicious_rsu");
+        }
+    }
+}
+
+static void
+HandleControllerRsuCommandPayload(const std::string& receiverRole,
+                                  uint32_t receiverId,
+                                  Ptr<const Packet> packet,
+                                  const SybilPacketTag& tag,
+                                  bool hasTag)
+{
+    if (!hasTag ||
+        tag.GetMessageType() != static_cast<uint32_t>(CONTROLLER2RSU_COMMAND) ||
+        receiverRole != "rsu_edge" ||
+        receiverId >= g_controllerCommandTargets.size())
+    {
+        return;
+    }
+
+    ControllerRsuCommandTag commandTag;
+    if (!packet->PeekPacketTag(commandTag)) return;
+
+    g_controllerCommandTargets[receiverId].valid = true;
+    g_controllerCommandTargets[receiverId].realVehicleId = commandTag.GetRealVehicleId();
+    g_controllerCommandTargets[receiverId].claimedVehicleId = commandTag.GetClaimedVehicleId();
+    g_controllerCommandTargets[receiverId].issuedTime = commandTag.GetIssuedTime();
+}
+
+// Type 6 — malicious controller injects phantom vehicle records into RSU table.
+// Called for SYBIL_INJECTION packets received at an RSU from the controller.
+static void
+HandleControllerSybilInjection(const std::string& receiverRole,
+                                uint32_t receiverId,
+                                const SybilPacketTag& tag,
+                                bool hasTag)
+{
+    if (!hasTag ||
+        tag.GetMessageType() != static_cast<uint32_t>(SYBIL_INJECTION) ||
+        receiverRole != "rsu_edge" ||
+        receiverId >= g_rsuVehicleTables.size())
+    {
+        return;
+    }
+
+    uint32_t phantomId = tag.GetClaimedNodeId();
+    // Only accept out-of-range IDs — intra-range IDs would collide with real vehicles.
+    if (phantomId < g_vehicleNodes.GetN()) return;
+
+    RsuVehicleRecord phantom;
+    phantom.realVehicleId    = phantomId;
+    phantom.claimedVehicleId = phantomId;
+    phantom.lastSeenTime     = Simulator::Now().GetSeconds();
+    phantom.lastPosition     = Vector(0.0, 0.0, 0.0);
+    phantom.distanceToRsu    = 0.0;
+    g_rsuVehicleTables[receiverId][phantomId] = phantom;
+    LogRsuVehicleTableEvent("learned_or_updated", receiverId, phantom, false,
+                            "phantom_injected_by_controller");
+}
+
+static void
+SnapshotRsuVehicleTables()
+{
+    for (uint32_t rsuIndex = 0; rsuIndex < g_rsuVehicleTables.size(); ++rsuIndex)
+    {
+        PurgeStaleRsuVehicleRecords(rsuIndex);
+        const auto& table = g_rsuVehicleTables[rsuIndex];
+        for (auto it = table.begin(); it != table.end(); ++it)
+        {
+            LogRsuVehicleTableEvent("snapshot", rsuIndex, it->second, false, "active");
+        }
+    }
+
+    double next = Simulator::Now().GetSeconds() + rsuVehicleTableSnapshotInterval;
+    if (rsuVehicleTableSnapshotInterval > 0.0 && next < simTime)
+        Simulator::Schedule(Seconds(rsuVehicleTableSnapshotInterval), &SnapshotRsuVehicleTables);
+}
+
 // ---------------------------------------------------------------------------
 // Packet reception and CSV logging
 // ---------------------------------------------------------------------------
@@ -124,14 +647,18 @@ LogReceivedPacket(const std::string& receiverRole,
     // Edge aggregation: count V2RSU_REPORTs reaching each RSU.
     if (hasTag &&
         tag.GetMessageType() == static_cast<uint32_t>(V2RSU_REPORT) &&
-        receiverRole == "rsu_edge" &&
-        receiverId < 10)
+        receiverRole == "rsu_edge")
     {
-        g_rsuReportCount[receiverId]++;
+        if (receiverId < g_rsuReportCount.size())
+            g_rsuReportCount[receiverId]++;
+        UpdateRsuVehicleRecord(receiverId, tag);
     }
+    HandleRsuControllerRecordPayload(receiverRole, packet, tag, hasTag);
+    HandleControllerRsuCommandPayload(receiverRole, receiverId, packet, tag, hasTag);
+    HandleControllerSybilInjection(receiverRole, receiverId, tag, hasTag);
 
     uint32_t aggCount = 0;
-    if (receiverRole == "rsu_edge" && receiverId < 10)
+    if (receiverRole == "rsu_edge" && receiverId < g_rsuReportCount.size())
         aggCount = g_rsuReportCount[receiverId];
 
     std::ofstream out(communicationCsv.c_str(), std::ios::app);
@@ -199,6 +726,53 @@ InstallUdpReceiver(Ptr<Node> node, uint16_t port,
     return socket;
 }
 
+static void
+SendRsuControllerRecordPacket(Ptr<Socket> socket,
+                              Ipv4Address destinationIp,
+                              const RsuVehicleRecord& record,
+                              uint32_t rsuIndex,
+                              uint32_t sequenceNumber)
+{
+    Ptr<Packet> packet = Create<Packet>(220);
+    SybilPacketTag baseTag(rsuIndex,
+                           rsuIndex,
+                           0,
+                           static_cast<uint32_t>(RSU2CONTROLLER_REPORT),
+                           sequenceNumber);
+    RsuControllerRecordTag payloadTag(record.realVehicleId,
+                                      record.claimedVehicleId,
+                                      rsuIndex,
+                                      record.lastSeenTime,
+                                      record.lastPosition,
+                                      record.distanceToRsu);
+    packet->AddPacketTag(baseTag);
+    packet->AddPacketTag(payloadTag);
+    socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
+    MetricsOnTransmit(1);
+}
+
+static void
+SendControllerRsuCommandPacket(Ptr<Socket> socket,
+                               Ipv4Address destinationIp,
+                               uint32_t rsuIndex,
+                               const ControllerVehicleRecord& target,
+                               uint32_t sequenceNumber)
+{
+    Ptr<Packet> packet = Create<Packet>(140);
+    SybilPacketTag baseTag(0,
+                           0,
+                           rsuIndex,
+                           static_cast<uint32_t>(CONTROLLER2RSU_COMMAND),
+                           sequenceNumber);
+    ControllerRsuCommandTag commandTag(target.realVehicleId,
+                                       target.claimedVehicleId,
+                                       Simulator::Now().GetSeconds());
+    packet->AddPacketTag(baseTag);
+    packet->AddPacketTag(commandTag);
+    socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
+    MetricsOnTransmit(1);
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic send callbacks — fire at scheduled time so position / state is current
 // ---------------------------------------------------------------------------
@@ -210,6 +784,11 @@ SendV2RsuReport(uint32_t vehicleIndex)
     uint32_t rsuWirelessIdx = g_vehicleNodes.GetN() + rsuIndex;
     uint32_t claimedId      = GetClaimedVehicleId(vehicleIndex, g_vehicleNodes.GetN());
 
+    // Self-reported position: read from mobility model at actual fire time so
+    // the position is current (vehicles move between schedule and fire time).
+    Vector pos = g_vehicleNodes.Get(vehicleIndex)
+                     ->GetObject<MobilityModel>()->GetPosition();
+
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     Ptr<TxInfo> tx   = Create<TxInfo>();
     tx->packetSize    = 160;
@@ -218,6 +797,9 @@ SendV2RsuReport(uint32_t vehicleIndex)
     tx->destinationId = rsuIndex;
     tx->messageType   = static_cast<uint32_t>(V2RSU_REPORT);
     tx->sequenceNumber = g_seq++;
+    tx->claimedX      = pos.x;
+    tx->claimedY      = pos.y;
+    tx->claimedZ      = pos.z;
     SendTaggedPacket(sock, g_wirelessInterfaces.GetAddress(rsuWirelessIdx), RSU_PORT, tx);
 }
 
@@ -228,6 +810,23 @@ SendRsuControllerReport(uint32_t rsuIndex)
     g_rsuReportCount[rsuIndex] = 0;   // reset window counter after reporting
 
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
+    Ipv4Address controllerIp = g_wiredInterfaces.GetAddress(N_RSUs);
+
+    PurgeStaleRsuVehicleRecords(rsuIndex);
+    if (rsuIndex < g_rsuVehicleTables.size() && !g_rsuVehicleTables[rsuIndex].empty())
+    {
+        const auto& table = g_rsuVehicleTables[rsuIndex];
+        for (auto it = table.begin(); it != table.end(); ++it)
+        {
+            SendRsuControllerRecordPacket(sock,
+                                          controllerIp,
+                                          it->second,
+                                          rsuIndex,
+                                          g_seq++);
+        }
+        return;
+    }
+
     Ptr<TxInfo> tx   = Create<TxInfo>();
     tx->packetSize    = 180 + 4 * aggregatedCount;   // scales with aggregated records
     tx->realNodeId    = rsuIndex;
@@ -235,13 +834,28 @@ SendRsuControllerReport(uint32_t rsuIndex)
     tx->destinationId = 0;
     tx->messageType   = static_cast<uint32_t>(RSU2CONTROLLER_REPORT);
     tx->sequenceNumber = g_seq++;
-    SendTaggedPacket(sock, g_wiredInterfaces.GetAddress(N_RSUs), CONTROLLER_PORT, tx);
+    SendTaggedPacket(sock, controllerIp, CONTROLLER_PORT, tx);
 }
 
 static void
 SendControllerRsuCommand(uint32_t rsuIndex)
 {
+    ControllerVehicleRecord target;
+    bool hasTarget = SelectControllerTargetForRsu(rsuIndex, target);
+
     Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
+    Ipv4Address rsuIp = g_wiredInterfaces.GetAddress(rsuIndex);
+
+    if (hasTarget)
+    {
+        LogControllerVehicleTableEvent("command_issued",
+                                       target,
+                                       true,
+                                       "payload_sent_to_serving_rsu");
+        SendControllerRsuCommandPacket(sock, rsuIp, rsuIndex, target, g_seq++);
+        return;
+    }
+
     Ptr<TxInfo> tx   = Create<TxInfo>();
     tx->packetSize    = 100;
     tx->realNodeId    = 0;
@@ -249,7 +863,89 @@ SendControllerRsuCommand(uint32_t rsuIndex)
     tx->destinationId = rsuIndex;
     tx->messageType   = static_cast<uint32_t>(CONTROLLER2RSU_COMMAND);
     tx->sequenceNumber = g_seq++;
-    SendTaggedPacket(sock, g_wiredInterfaces.GetAddress(rsuIndex), CONTROLLER_PORT, tx);
+    SendTaggedPacket(sock, rsuIp, CONTROLLER_PORT, tx);
+}
+
+static void
+SendRsuVehicleCommand(uint32_t rsuIndex)
+{
+    uint32_t vehicleIndex = rsuIndex % g_vehicleNodes.GetN();
+    RsuVehicleRecord targetRecord;
+    bool selectedFromController = false;
+    bool selectedFromTable = false;
+
+    if (rsuIndex < g_controllerCommandTargets.size() &&
+        g_controllerCommandTargets[rsuIndex].valid)
+    {
+        uint32_t controllerTarget = g_controllerCommandTargets[rsuIndex].realVehicleId;
+        if (GetRsuRecordForRealVehicle(rsuIndex, controllerTarget, targetRecord))
+        {
+            vehicleIndex = controllerTarget;
+            selectedFromController = true;
+        }
+        g_controllerCommandTargets[rsuIndex].valid = false;
+    }
+
+    if (!selectedFromController)
+        selectedFromTable = SelectVehicleKnownByRsu(rsuIndex, vehicleIndex);
+
+    // No known target — RSU does not send a speculative command.
+    if (!selectedFromController && !selectedFromTable)
+        return;
+
+    Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
+    Ptr<TxInfo> tx   = Create<TxInfo>();
+    tx->packetSize    = 100;
+    tx->realNodeId    = rsuIndex;
+    tx->claimedNodeId = rsuIndex;
+    tx->destinationId = vehicleIndex;
+    tx->messageType   = static_cast<uint32_t>(RSU2VEHICLE_COMMAND);
+    tx->sequenceNumber = g_seq++;
+
+    Ptr<MobilityModel> vehicleMob =
+        g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>();
+    Ptr<MobilityModel> rsuMob =
+        g_rsuNodes.Get(rsuIndex)->GetObject<MobilityModel>();
+    if (!selectedFromController)
+    {
+        targetRecord.realVehicleId = vehicleIndex;
+        targetRecord.claimedVehicleId = vehicleIndex;
+        targetRecord.lastSeenTime = Simulator::Now().GetSeconds();
+        targetRecord.lastPosition = vehicleMob->GetPosition();
+        targetRecord.distanceToRsu = vehicleMob->GetDistanceFrom(rsuMob);
+        if (selectedFromTable)
+        {
+            RsuVehicleRecord tableRecord;
+            if (GetRsuRecordForRealVehicle(rsuIndex, vehicleIndex, tableRecord))
+                targetRecord = tableRecord;
+        }
+    }
+    LogRsuVehicleTableEvent("command_target",
+                            rsuIndex,
+                            targetRecord,
+                            true,
+                            selectedFromController ? "controller_target_forwarded" :
+                            (selectedFromTable ? "selected_from_table" : "fallback_default"));
+
+    if (selectedFromController)
+    {
+        ControllerVehicleRecord forwarded;
+        forwarded.realVehicleId = targetRecord.realVehicleId;
+        forwarded.claimedVehicleId = targetRecord.claimedVehicleId;
+        forwarded.servingRsuId = rsuIndex;
+        forwarded.lastSeenTime = targetRecord.lastSeenTime;
+        forwarded.lastPosition = targetRecord.lastPosition;
+        forwarded.distanceToRsu = targetRecord.distanceToRsu;
+        LogControllerVehicleTableEvent("command_forwarded",
+                                       forwarded,
+                                       true,
+                                       "rsu_forwarded_to_vehicle");
+    }
+
+    SendTaggedPacket(sock,
+                     g_wirelessInterfaces.GetAddress(vehicleIndex),
+                     VEHICLE_PORT,
+                     tx);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +1042,8 @@ main(int argc, char* argv[])
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
     cmd.AddValue("proposed_method",            "Detection method 0=rule 1=ML 2=FL 3=hybrid",proposed_method);
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
+    cmd.AddValue("rsuVehicleRecordTimeout",    "Seconds before an RSU forgets a vehicle",rsuVehicleRecordTimeout);
+    cmd.AddValue("rsuVehicleTableSnapshotInterval","Seconds between RSU table CSV snapshots",rsuVehicleTableSnapshotInterval);
     cmd.Parse(argc, argv);
 
     if (routing_test)
@@ -355,6 +1053,10 @@ main(int argc, char* argv[])
         simTime    = std::min(simTime, 12.0);
     }
     if (N_RSUs == 0) N_RSUs = 1;
+    g_rsuVehicleTables.assign(N_RSUs, std::map<uint32_t, RsuVehicleRecord>());
+    g_controllerVehicleTable.clear();
+    g_controllerCommandTargets.assign(N_RSUs, ControllerCommandTarget());
+    g_rsuReportCount.assign(N_RSUs, 0u);
 
     // Resolve attack type and populate per-node attacker flags.
     // Must run after routing_test / N_RSUs adjustments.
@@ -362,6 +1064,8 @@ main(int argc, char* argv[])
     DeclareAttackers();
 
     InitializeCommunicationCsv();
+    InitializeRsuVehicleTableCsv();
+    InitializeControllerVehicleTableCsv();
     InitializeMetricsCsvFiles();
 
     g_secMetrics = Create<SecurityEvaluationMetrics>();
@@ -532,22 +1236,7 @@ main(int argc, char* argv[])
     {
         for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
         {
-            Ptr<Socket> rsuSocket   = CreateSenderSocket(g_rsuNodes.Get(i));
-            uint32_t vehicleIndex   = i % g_vehicleNodes.GetN();
-            Ptr<TxInfo> rsu2vehicle = Create<TxInfo>();
-            rsu2vehicle->packetSize    = 100;
-            rsu2vehicle->realNodeId    = i;
-            rsu2vehicle->claimedNodeId = i;
-            rsu2vehicle->destinationId = vehicleIndex;
-            rsu2vehicle->messageType   = static_cast<uint32_t>(RSU2VEHICLE_COMMAND);
-            rsu2vehicle->sequenceNumber = g_seq++;
-
-            Simulator::Schedule(Seconds(t + 0.1 * i),
-                                &SendTaggedPacket,
-                                rsuSocket,
-                                g_wirelessInterfaces.GetAddress(vehicleIndex),
-                                VEHICLE_PORT,
-                                rsu2vehicle);
+            Simulator::Schedule(Seconds(t + 0.1 * i), &SendRsuVehicleCommand, i);
         }
     }
 
@@ -564,6 +1253,8 @@ main(int argc, char* argv[])
 
     g_nextMetricWindow = 1.0;
     Simulator::Schedule(Seconds(1.0), &FlushMetrics);
+    if (rsuVehicleTableSnapshotInterval > 0.0)
+        Simulator::Schedule(Seconds(rsuVehicleTableSnapshotInterval), &SnapshotRsuVehicleTables);
     g_secMetrics->ScheduleAll(simTime);
 
     // -----------------------------------------------------------------------
@@ -604,6 +1295,8 @@ main(int argc, char* argv[])
     std::cout << "WiFi: 802.11p DSRC @ 5.9 GHz, 10 MHz, 23 dBm, Cost231" << std::endl;
     std::cout << "Backhaul: CSMA 1000 Mbps / 10 us" << std::endl;
     std::cout << "CSV: " << communicationCsv << std::endl;
+    std::cout << "RSU table CSV: " << rsuVehicleTableCsv << std::endl;
+    std::cout << "Controller table CSV: " << controllerVehicleTableCsv << std::endl;
 
     // -----------------------------------------------------------------------
     // Run

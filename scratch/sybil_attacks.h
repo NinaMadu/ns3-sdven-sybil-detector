@@ -109,11 +109,15 @@ GetClaimedVehicleId(uint32_t realVehicleId, uint32_t nVehicles)
         return (realVehicleId + 1u) % nVehicles;
 
     case ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS:
-        // Rotates fake identity each 2-second window.
-        // At schedule-build time Now()==0 so window=0 (same as simultaneous);
-        // rotation takes full effect inside dynamic callbacks (SendV2RsuReport).
+        // The SendNonSimultaneousBeacon callback (scheduled by ScheduleAttackTraffic)
+        // evaluates GetClaimedVehicleId at actual fire time, capturing the correct
+        // rotating window.  Pre-scheduled main-loop beacons must use the real ID
+        // so that Type 3 sends exactly one fake identity per slot (not two).
         {
-            uint32_t window = static_cast<uint32_t>(Simulator::Now().GetSeconds() / 2.0);
+            double now = Simulator::Now().GetSeconds();
+            if (now < 0.5)
+                return realVehicleId;   // schedule-build phase — do not bake a fake ID
+            uint32_t window = static_cast<uint32_t>(now / 2.0);
             return (realVehicleId + 1u + window) % nVehicles;
         }
 
