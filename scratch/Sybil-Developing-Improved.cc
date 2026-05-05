@@ -1539,6 +1539,21 @@ LogReceivedPacket(const std::string& receiverRole,
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.suspicionFlags   : 0u) << ","
         << (hasTag ? "received_tagged" : "received_untagged") << "\n";
 
+    if (hasTag)
+    {
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[RECV] [" << MessageTypeToString(messageType) << "]";
+        uint32_t padLen = MessageTypeToString(messageType).size();
+        if (padLen < 24) std::cout << std::string(24 - padLen, ' ');
+        std::cout << " Receiver=" << receiverRole << "/" << receiverId
+                  << " FromReal=" << tag.GetRealNodeId();
+        if (tag.GetRealNodeId() != tag.GetClaimedNodeId())
+            std::cout << "(Claimed=" << tag.GetClaimedNodeId() << ")";
+        std::cout << " Seq=" << tag.GetSequenceNumber()
+                  << " Delay=" << delay << "s"
+                  << " Channel=" << channel << std::endl;
+    }
+
     // M1 PDR: only credit V2V beacon delivery when the receiver is another vehicle.
     bool isV2VBroadcast = hasTag && tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
     bool countForPDR    = !isV2VBroadcast || receiverRole == "vehicle";
@@ -1696,6 +1711,18 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
 // ---------------------------------------------------------------------------
 
 static void
+SendV2VBeaconTagged(Ptr<Socket> sock, Ipv4Address dest, uint16_t port, Ptr<TxInfo> tx)
+{
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [V2V_BEACON]              "
+              << "Vehicle=" << tx->realNodeId
+              << " ClaimedId=" << tx->claimedNodeId
+              << " Seq=" << tx->sequenceNumber
+              << " -> Broadcast" << std::endl;
+    SendTaggedPacket(sock, dest, port, tx);
+}
+
+static void
 SendV2RsuReport(uint32_t vehicleIndex)
 {
     uint32_t rsuIndex       = FindNearestRsu(vehicleIndex);
@@ -1708,6 +1735,13 @@ SendV2RsuReport(uint32_t vehicleIndex)
                      ->GetObject<MobilityModel>()->GetPosition();
 
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [V2RSU_REPORT]            "
+              << "Vehicle=" << vehicleIndex
+              << " ClaimedId=" << claimedId
+              << " Seq=" << g_seq
+              << " -> RSU=" << rsuIndex
+              << " Pos=(" << pos.x << "," << pos.y << ")" << std::endl;
     SendV2RsuAwarenessPacket(sock,
                              g_wirelessInterfaces.GetAddress(rsuWirelessIdx),
                              RSU_PORT,
@@ -1752,6 +1786,15 @@ SendRsuControllerReport(uint32_t rsuIndex)
         {
             if (sendSnapshot || it->second.dirty || it->second.lastSeenTime >= windowStart)
             {
+                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                          << "[SEND] [RSU2CONTROLLER_REPORT]   "
+                          << "RSU=" << rsuIndex
+                          << " Seq=" << g_seq
+                          << " -> Controller"
+                          << " VehicleClaimed=" << it->second.claimedVehicleId
+                          << " Observers=" << it->second.observerCount
+                          << " SuspicionFlags=" << it->second.suspicionFlags
+                          << " (awareness)" << std::endl;
                 SendRsuControllerAwarenessPacket(sock,
                                                  controllerIp,
                                                  it->second,
@@ -1778,6 +1821,14 @@ SendRsuControllerReport(uint32_t rsuIndex)
         const auto& table = g_rsuVehicleTables[rsuIndex];
         for (auto it = table.begin(); it != table.end(); ++it)
         {
+            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                      << "[SEND] [RSU2CONTROLLER_REPORT]   "
+                      << "RSU=" << rsuIndex
+                      << " Seq=" << g_seq
+                      << " -> Controller"
+                      << " VehicleClaimed=" << it->second.claimedVehicleId
+                      << " RealId=" << it->second.realVehicleId
+                      << " (record)" << std::endl;
             SendRsuControllerRecordPacket(sock,
                                           controllerIp,
                                           it->second,
@@ -1794,6 +1845,12 @@ SendRsuControllerReport(uint32_t rsuIndex)
     tx->destinationId = 0;
     tx->messageType   = static_cast<uint32_t>(RSU2CONTROLLER_REPORT);
     tx->sequenceNumber = g_seq++;
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [RSU2CONTROLLER_REPORT]   "
+              << "RSU=" << rsuIndex
+              << " Seq=" << tx->sequenceNumber
+              << " -> Controller"
+              << " NoVehicles (empty heartbeat)" << std::endl;
     SendTaggedPacket(sock, controllerIp, CONTROLLER_PORT, tx);
 }
 
@@ -1808,6 +1865,13 @@ SendControllerRsuCommand(uint32_t rsuIndex)
 
     if (hasTarget)
     {
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[SEND] [CONTROLLER2RSU_COMMAND]  "
+                  << "Controller"
+                  << " Seq=" << g_seq
+                  << " -> RSU=" << rsuIndex
+                  << " TargetVehicle=" << target.realVehicleId
+                  << " TargetClaimed=" << target.claimedVehicleId << std::endl;
         LogControllerVehicleTableEvent("command_issued",
                                        target,
                                        true,
@@ -1823,6 +1887,12 @@ SendControllerRsuCommand(uint32_t rsuIndex)
     tx->destinationId = rsuIndex;
     tx->messageType   = static_cast<uint32_t>(CONTROLLER2RSU_COMMAND);
     tx->sequenceNumber = g_seq++;
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [CONTROLLER2RSU_COMMAND]  "
+              << "Controller"
+              << " Seq=" << tx->sequenceNumber
+              << " -> RSU=" << rsuIndex
+              << " NoTarget (empty heartbeat)" << std::endl;
     SendTaggedPacket(sock, rsuIp, CONTROLLER_PORT, tx);
 }
 
@@ -1902,6 +1972,14 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
                                        "rsu_forwarded_to_vehicle");
     }
 
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [RSU2VEHICLE_COMMAND]     "
+              << "RSU=" << rsuIndex
+              << " Seq=" << tx->sequenceNumber
+              << " -> Vehicle=" << vehicleIndex
+              << " Source=" << (selectedFromController ? "controller-directed"
+                               : (selectedFromTable    ? "rsu-table"
+                                                       : "fallback")) << std::endl;
     SendTaggedPacket(sock,
                      g_wirelessInterfaces.GetAddress(vehicleIndex),
                      VEHICLE_PORT,
@@ -2192,7 +2270,7 @@ main(int argc, char* argv[])
             v2v->sequenceNumber = g_seq++;
 
             Simulator::Schedule(Seconds(t + 0.05 * i),
-                                &SendTaggedPacket,
+                                &SendV2VBeaconTagged,
                                 vehicleSocket,
                                 Ipv4Address("10.1.1.255"),
                                 VEHICLE_PORT,
