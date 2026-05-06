@@ -1233,6 +1233,33 @@ SelectControllerTargetForRsu(uint32_t rsuIndex, ControllerVehicleRecord& target)
             found = true;
         }
     }
+
+    // Type 6: when the controller is malicious it also selects Sybil IDs from its
+    // injected global awareness records and issues commands about them to RSUs.
+    // This is how the Sybil IDs propagate downward from the controller to RSU tables.
+    if (!found && sybil_attack_enabled && g_controllerIsMalicious)
+    {
+        for (auto it = g_controllerGlobalAwarenessTable.begin();
+             it != g_controllerGlobalAwarenessTable.end(); ++it)
+        {
+            const ControllerGlobalAwarenessRecord& rec = it->second;
+            if (rec.lastServingRsuId == rsuIndex &&
+                rec.claimedVehicleId >= g_vehicleNodes.GetN() &&
+                (!found || rec.lastSeenTime > newest))
+            {
+                target.realVehicleId    = rec.realVehicleId;
+                target.claimedVehicleId = rec.claimedVehicleId;
+                target.servingRsuId     = rec.lastServingRsuId;
+                target.lastSeenTime     = rec.lastSeenTime;
+                target.lastPosition     = Vector(rec.lastBsm.positionX,
+                                                 rec.lastBsm.positionY,
+                                                 rec.lastBsm.positionZ);
+                target.distanceToRsu    = 50.0;
+                newest = rec.lastSeenTime;
+                found = true;
+            }
+        }
+    }
     return found;
 }
 
@@ -1343,6 +1370,39 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
     g_controllerCommandTargets[receiverId].realVehicleId = commandTag.GetRealVehicleId();
     g_controllerCommandTargets[receiverId].claimedVehicleId = commandTag.GetClaimedVehicleId();
     g_controllerCommandTargets[receiverId].issuedTime = commandTag.GetIssuedTime();
+
+    // Type 6 propagation: if the commanded vehicle is a Sybil ID unknown to this RSU,
+    // create a minimal regional-awareness record so the Sybil propagates into the
+    // RSU's own table and appears in subsequent RSU→Controller reports.
+    if (sybil_attack_enabled && g_controllerIsMalicious &&
+        receiverId < g_rsuRegionalAwarenessTables.size())
+    {
+        uint32_t cmdId = commandTag.GetClaimedVehicleId();
+        auto& rsuTable = g_rsuRegionalAwarenessTables[receiverId];
+        if (rsuTable.find(cmdId) == rsuTable.end())
+        {
+            double now = Simulator::Now().GetSeconds();
+            RsuRegionalAwarenessRecord phantom;
+            phantom.claimedVehicleId            = cmdId;
+            phantom.realVehicleId               = commandTag.GetRealVehicleId();
+            phantom.servingRsuId                = receiverId;
+            phantom.firstSeenTime               = now;
+            phantom.lastSeenTime                = now;
+            phantom.lastBsm.temporaryId         = cmdId;
+            phantom.lastBsm.timestamp           = now;
+            phantom.lastBsm.positionX           = 20.0 + 30.0 * static_cast<double>(cmdId % 5u);
+            phantom.lastBsm.positionY           = 40.0;
+            phantom.lastBsm.positionZ           = 0.0;
+            phantom.lastBsm.speed               = 3.0;
+            phantom.lastBsm.heading             = 0.0;
+            phantom.observerCount               = 1u;
+            phantom.reportCount                 = 1u;
+            phantom.suspicionFlags              = SUSPICION_NONE;
+            phantom.dirty                       = true;
+            phantom.lastReportedToControllerTime = -1.0;
+            rsuTable[cmdId] = phantom;
+        }
+    }
 }
 
 // Type 6 — malicious controller injects phantom vehicle records into RSU table.
@@ -1689,6 +1749,11 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
     V2RsuAwarenessReportTag report =
         BuildV2RsuAwarenessReport(vehicleIndex, claimedId, rsuIndex, sequenceNumber);
 
+    // Types 2 & 3: inject fabricated Sybil neighbor rows into the report before
+    // the packet is assembled.  No-op for all other attack types and baseline runs.
+    if (sybil_attack_enabled)
+        InjectSybilObservationsIntoReport(vehicleIndex, report);
+
     uint32_t packetSize = 220 + 96 * report.GetNeighborCount();
     Ptr<Packet> packet = Create<Packet>(packetSize);
     SybilPacketTag tag(vehicleIndex,
@@ -1763,6 +1828,13 @@ SendRsuControllerReport(uint32_t rsuIndex)
 
     PurgeStaleRsuVehicleRecords(rsuIndex);
     PurgeStaleRsuAwarenessRecords(rsuIndex);
+
+    // Type 5: malicious RSU upserts fabricated Sybil records into its own regional
+    // awareness table before reporting.  The controller receives and stores them as
+    // legitimate vehicles, propagating the Sybil IDs upward.
+    if (sybil_attack_enabled && rsuIndex < g_rsuRegionalAwarenessTables.size())
+        InjectSybilRecordsIntoRsuTable(rsuIndex, g_rsuRegionalAwarenessTables[rsuIndex]);
+
     if (rsuIndex < g_rsuRegionalAwarenessTables.size() &&
         !g_rsuRegionalAwarenessTables[rsuIndex].empty())
     {
@@ -1857,6 +1929,12 @@ SendRsuControllerReport(uint32_t rsuIndex)
 static void
 SendControllerRsuCommand(uint32_t rsuIndex)
 {
+    // Type 6: malicious controller injects Sybil records into its global table.
+    // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections
+    // when N_RSUs > 1).  Records then flow back to RSUs via controller commands.
+    if (sybil_attack_enabled && rsuIndex == 0)
+        InjectSybilRecordsIntoControllerTable(g_controllerGlobalAwarenessTable);
+
     ControllerVehicleRecord target;
     bool hasTarget = SelectControllerTargetForRsu(rsuIndex, target);
 
@@ -2257,6 +2335,12 @@ main(int argc, char* argv[])
     {
         for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
         {
+            // Type 1 (Outsider): the attacker never sends legitimate V2V beacons
+            // or V2RSU self-reports.  It only listens and sends forged reports
+            // (scheduled by ScheduleAttackTraffic).  Skip normal scheduling here.
+            if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
+                continue;
+
             Ptr<Socket> vehicleSocket = CreateSenderSocket(g_vehicleNodes.Get(i));
             vehicleSocket->SetAllowBroadcast(true);
 

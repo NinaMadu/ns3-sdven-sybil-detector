@@ -101,35 +101,21 @@ GetClaimedVehicleId(uint32_t realVehicleId, uint32_t nVehicles)
     {
     case ATTACK_OUTSIDER:
         // Fabricated ID outside the legitimate [0, nVehicles) range.
-        // Models a node with no PKI membership in the network.
         return nVehicles + realVehicleId;
 
     case ATTACK_INSIDER_DIRECT_SIMULTANEOUS:
-        // Fixed spoofed identity — same fake ID in every transmission.
-        return (realVehicleId + 1u) % nVehicles;
-
     case ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS:
-        // The SendNonSimultaneousBeacon callback (scheduled by ScheduleAttackTraffic)
-        // evaluates GetClaimedVehicleId at actual fire time, capturing the correct
-        // rotating window.  Pre-scheduled main-loop beacons must use the real ID
-        // so that Type 3 sends exactly one fake identity per slot (not two).
-        {
-            double now = Simulator::Now().GetSeconds();
-            if (now < 0.5)
-                return realVehicleId;   // schedule-build phase — do not bake a fake ID
-            uint32_t window = static_cast<uint32_t>(now / 2.0);
-            return (realVehicleId + 1u + window) % nVehicles;
-        }
+        // V2V beacons use the real identity — the attack is injected at V2RSU
+        // report level by InjectSybilObservationsIntoReport, not at beacon level.
+        return realVehicleId;
 
     case ATTACK_INSIDER_INDIRECT:
-        // Claims the ID of a relay node (two-hop offset) to simulate injection
-        // through a proxy.  The relay's physical re-broadcast is scheduled by
-        // ScheduleAttackTraffic → IndirectRelayForward.
-        return (realVehicleId + 2u) % nVehicles;
+        // The attacker's own V2V beacons use the real ID.  Sybil identities are
+        // broadcast as separate additional beacons by BroadcastSybilBeacon().
+        return realVehicleId;
 
     case ATTACK_MALICIOUS_RSU:
     case ATTACK_MALICIOUS_SDN_CONTROLLER:
-        // Vehicle-layer IDs are unchanged; the attack is at infrastructure level.
         return realVehicleId;
 
     default:
@@ -179,13 +165,33 @@ DeclareAttackers()
     if (g_activeAttackType == ATTACK_NONE) return;
 
     // --- Vehicle-level (types 1–4) ------------------------------------------
+    // Count-based selection: compute exactly how many attackers are needed, then
+    // rank all nodes by a deterministic hash and mark the lowest-ranked ones.
+    // This guarantees floor(N * percentage / 100) attackers regardless of N —
+    // the old hash-threshold method produced wrong counts for small N (e.g. with
+    // N=2 at 50% both nodes had hash values below the threshold).
     bool vehiclesAttack = (g_activeAttackType == ATTACK_OUTSIDER                        ||
                            g_activeAttackType == ATTACK_INSIDER_DIRECT_SIMULTANEOUS     ||
                            g_activeAttackType == ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS ||
                            g_activeAttackType == ATTACK_INSIDER_INDIRECT);
     if (vehiclesAttack)
+    {
+        uint32_t nAttackers = N_Vehicles * sybil_attack_percentage / 100u;
+        // Build a list of (hash, nodeIndex) pairs and sort ascending by hash.
+        std::vector<std::pair<uint32_t, uint32_t>> ranked;
+        ranked.reserve(N_Vehicles);
         for (uint32_t i = 0; i < N_Vehicles; ++i)
-            g_vehicleIsAttacker[i] = ((i * 37u + 11u) % 100u) < sybil_attack_percentage;
+            ranked.push_back({ (i * 37u + 11u) % 100u, i });
+        std::sort(ranked.begin(), ranked.end());
+        // Mark the first nAttackers nodes (lowest hash = "most likely attacker").
+        for (uint32_t k = 0; k < nAttackers && k < N_Vehicles; ++k)
+            g_vehicleIsAttacker[ranked[k].second] = true;
+
+        if (nAttackers == 0)
+            std::cerr << "[sybil_attacks] INFO: sybil_attack_percentage="
+                      << sybil_attack_percentage << "% rounds to 0 attacker vehicles "
+                      << "with N_Vehicles=" << N_Vehicles << ".\n";
+    }
 
     // --- RSU-level (type 5) -------------------------------------------------
     // Bug 1 fix: no forced minimum — 0 malicious RSUs is a valid result when
@@ -213,68 +219,383 @@ DeclareAttackers()
 // ===========================================================================
 // Attack scenario implementations
 //
-// Design principle: every function below is ADDITIVE — it injects extra attack
-// traffic on top of the unchanged normal simulation flow.  The main .cc send
-// callbacks (SendV2RsuReport, SendRsuControllerReport, SendControllerRsuCommand)
-// are never modified.  This keeps normal and attack paths cleanly separated.
+// Design principle:
+//   Types 2 & 3 — REPORT-LEVEL injection.  No extra packets are sent.
+//     InjectSybilObservationsIntoReport() is called from SendV2RsuAwarenessPacket
+//     (main .cc) immediately after BuildV2RsuAwarenessReport().  It appends
+//     fabricated NeighborAwarenessRecord entries to the already-built report tag.
+//     The RSU receives one normal V2RSU packet whose neighbor-observation list
+//     contains both real and fake rows — indistinguishable at the wire level.
+//
+//   Type 4 — BEACON-LEVEL injection on the real wireless channel.
+//     BroadcastSybilBeacon() sends a genuine V2V broadcast from the attacker node
+//     but claims a Sybil identity and a fabricated BSM position.  Neighbouring
+//     vehicles receive it through their normal UDP callbacks, store it in their
+//     g_vehicleNeighborTables, and later forward it to the RSU in their own
+//     V2RSU reports — the attacker never touches the RSU directly.
 // ===========================================================================
 
+// How many seconds after simulation start the attacker starts misbehaving.
+// Before this time the node behaves as a fully legitimate participant.
+static const double g_attackOnsetTime = 2.0;
+
+// Number of Sybil identities injected simultaneously per report (Type 2).
+static const uint32_t N_SYBIL_SIMULTANEOUS = 2;
+
+// Length of each "presence window" for Type 3 (seconds).
+// Odd-numbered windows inject one Sybil ID; even-numbered windows are clean.
+static const double SYBIL_ROTATION_WINDOW = 2.0;
+
+// Sybil ID budgets per infrastructure attacker (Types 5 & 6).
+static const uint32_t N_SYBIL_RSU = 2;   // per malicious RSU, per report cycle
+static const uint32_t N_SYBIL_SDN = 3;   // per controller injection cycle
+
+// Sybil ID namespace per attack type (no collisions):
+//   Type 1 outsider     :  N_Vehicles + 200 + attacker * 3 + k
+//   Type 2 direct-sim   :  N_Vehicles + attacker * 2 + k
+//   Type 3 direct-non   :  N_Vehicles + attacker * 3 + rotation
+//   Type 4 indirect     :  N_Vehicles + attacker
+//   Type 5 rsu          :  N_Vehicles + 100 + rsuIndex * N_SYBIL_RSU + k
+//   Type 6 sdn          :  N_Vehicles + 150 + k
+
 // ---------------------------------------------------------------------------
-// Type 2 — Insider Direct Simultaneous
+// OutsiderSendSybilReport  (Type 1 — Outsider Sybil)
 //
-// Broadcasts 2 additional beacons in the same logical time slot, each claiming
-// a DIFFERENT fake identity beyond the one already used in the normal beacon.
-//
-// The normal V2V beacon (from the main .cc scheduling loop) uses
-// GetClaimedVehicleId → (realId+1)%N as the first fake ID.
-// This function injects IDs at offsets +2 and +3 so all three transmissions
-// carry distinct claimed identities, demonstrating true multi-ID simultaneous
-// broadcasting.
+// An outsider vehicle was never a legitimate network participant: it broadcasts
+// no V2V beacons and sends no legitimate V2RSU self-reports (those are skipped
+// in the main scheduling loop for outsider attackers).  After a listening
+// period it sends forged V2RSU reports directly to the nearest RSU.  The
+// reports carry:
+//   • A fake out-of-range claimed reporter identity.
+//   • Three fabricated Sybil neighbor observations at plausible positions.
+// The RSU cannot distinguish these from a real V2RSU report and stores the
+// Sybil rows in g_rsuVehicleObservationTables → they propagate to the
+// controller via normal RSU→Controller reporting.
 // ---------------------------------------------------------------------------
 static void
-SimultaneousAttackSend(uint32_t vehicleIndex)
+OutsiderSendSybilReport(uint32_t vehicleIndex)
 {
-    // Bug 2 fix: start at k=2 so these injections differ from the normal beacon
-    // (which already uses (realId+1)%N via GetClaimedVehicleId).
-    for (uint32_t k = 2; k <= 3; ++k)
+    if (!g_vehicleIsAttacker[vehicleIndex]) return;
+    double now = Simulator::Now().GetSeconds();
+    if (now < g_attackOnsetTime) return;
+
+    // Find the nearest RSU (same logic as FindNearestRsu in main .cc).
+    Ptr<MobilityModel> vMob = g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>();
+    double   minDist = std::numeric_limits<double>::max();
+    uint32_t nearestRsu = 0;
+    for (uint32_t j = 0; j < g_rsuNodes.GetN(); ++j)
     {
-        uint32_t fakeId = (vehicleIndex + k) % N_Vehicles;
-        Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
-        sock->SetAllowBroadcast(true);
-        Ptr<TxInfo> tx = Create<TxInfo>();
-        tx->packetSize    = 120;
-        tx->realNodeId    = vehicleIndex;
-        tx->claimedNodeId = fakeId;
-        tx->destinationId = 0xFFFFFFFF;   // subnet broadcast
-        tx->messageType   = static_cast<uint32_t>(V2V_BEACON);
-        tx->sequenceNumber = g_seq++;
-        SendTaggedPacket(sock, Ipv4Address("10.1.1.255"), VEHICLE_PORT, tx);
+        double d = vMob->GetDistanceFrom(g_rsuNodes.Get(j)->GetObject<MobilityModel>());
+        if (d < minDist) { minDist = d; nearestRsu = j; }
+    }
+
+    Vector vPos = vMob->GetPosition();
+
+    // Outsider claims an out-of-range identity so it appears as an unknown sender.
+    // Use a separate namespace (offset 50) from the Sybil payload IDs (offset 200+).
+    uint32_t fakeClaimedId = N_Vehicles + 50u + vehicleIndex;
+
+    // Self BSM: outsider reports its real physical location but with a fake ID.
+    BsmCoreData selfBsm;
+    selfBsm.temporaryId  = fakeClaimedId;
+    selfBsm.messageCount = static_cast<uint32_t>(g_seq % 128u);
+    selfBsm.timestamp    = now;
+    selfBsm.positionX    = vPos.x;
+    selfBsm.positionY    = vPos.y;
+    selfBsm.positionZ    = 0.0;
+    selfBsm.speed        = 0.0;   // stationary listener
+    selfBsm.heading      = 0.0;
+
+    V2RsuAwarenessReportTag report(vehicleIndex, fakeClaimedId, nearestRsu,
+                                   selfBsm, AWARENESS_REPORT_DELTA, 0.0, now);
+
+    // Inject 3 Sybil neighbor observations at fabricated positions around the outsider.
+    static const double kOffX[3] = { +25.0, -25.0, +10.0 };
+    static const double kOffY[3] = {  +5.0,  -5.0, +20.0 };
+    for (uint32_t k = 0; k < 3u; ++k)
+    {
+        uint32_t sybilId = N_Vehicles + 200u + vehicleIndex * 3u + k;
+        NeighborAwarenessRecord rec;
+        rec.observerVehicleId   = vehicleIndex;
+        rec.observedRealId      = vehicleIndex;   // ground truth: same physical node
+        rec.observedClaimedId   = sybilId;
+        rec.firstSeenTime       = now - 2.0;
+        rec.lastSeenTime        = now;
+        rec.receivedBeaconCount = 3u + k;
+        rec.lastBsm.temporaryId  = sybilId;
+        rec.lastBsm.messageCount = static_cast<uint32_t>(sybilId * 7u + 3u) % 128u;
+        rec.lastBsm.timestamp    = now;
+        rec.lastBsm.positionX    = vPos.x + kOffX[k];
+        rec.lastBsm.positionY    = vPos.y + kOffY[k];
+        rec.lastBsm.positionZ    = 0.0;
+        rec.lastBsm.speed        = 2.0 + static_cast<double>(k);
+        rec.lastBsm.heading      = 0.0;
+        rec.estimatedDistance    = std::sqrt(kOffX[k]*kOffX[k] + kOffY[k]*kOffY[k]);
+        rec.dirty                = true;
+        rec.suspicionFlags       = SUSPICION_NONE;
+        report.AddObservation(rec);
+    }
+
+    uint32_t pktSize = 220u + 96u * report.GetNeighborCount();
+    Ptr<Packet> packet = Create<Packet>(pktSize);
+
+    SybilPacketTag sTag(vehicleIndex, fakeClaimedId, nearestRsu,
+                        static_cast<uint32_t>(V2RSU_REPORT), g_seq,
+                        vPos.x, vPos.y, vPos.z);
+    packet->AddPacketTag(sTag);
+    packet->AddPacketTag(BsmCoreDataTag(selfBsm));
+    packet->AddPacketTag(report);
+
+    Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
+    Ipv4Address rsuIp = g_wirelessInterfaces.GetAddress(N_Vehicles + nearestRsu);
+    sock->SendTo(packet, 0, InetSocketAddress(rsuIp, RSU_PORT));
+    MetricsOnTransmit(1);
+    ++g_seq;
+}
+
+// ---------------------------------------------------------------------------
+// InjectSybilRecordsIntoRsuTable  (Type 5 — Malicious RSU)
+//
+// Called from SendRsuControllerReport in the main .cc for malicious RSUs,
+// BEFORE the regional-awareness reporting loop.  Upserts N_SYBIL_RSU fake
+// RsuRegionalAwarenessRecord entries into the RSU's own regional table.
+//
+// On first injection the records are created as new.  On subsequent calls
+// they are refreshed (lastSeenTime + dirty=true) so they appear in every
+// RSU→Controller report cycle, propagating the Sybil IDs continuously.
+//
+// The controller receives and stores them as legitimate regional awareness
+// data — they flow into g_controllerGlobalAwarenessTable and are eventually
+// included in controller commands back to RSUs.
+// ---------------------------------------------------------------------------
+inline void
+InjectSybilRecordsIntoRsuTable(uint32_t rsuIndex,
+                                std::map<uint32_t, RsuRegionalAwarenessRecord>& rsuTable)
+{
+    if (!sybil_attack_enabled || !IsRsuMalicious(rsuIndex)) return;
+    double now = Simulator::Now().GetSeconds();
+    if (now < g_attackOnsetTime) return;
+
+    Vector rsuPos(0.0, 0.0, 0.0);
+    if (rsuIndex < g_rsuNodes.GetN())
+        rsuPos = g_rsuNodes.Get(rsuIndex)->GetObject<MobilityModel>()->GetPosition();
+
+    for (uint32_t k = 0; k < N_SYBIL_RSU; ++k)
+    {
+        uint32_t sybilId = N_Vehicles + 100u + rsuIndex * N_SYBIL_RSU + k;
+
+        RsuRegionalAwarenessRecord rec;
+        auto it = rsuTable.find(sybilId);
+        if (it != rsuTable.end())
+        {
+            // Refresh existing record so it stays dirty and gets re-reported.
+            rec = it->second;
+            rec.lastSeenTime            = now;
+            rec.lastBsm.timestamp       = now;
+            rec.reportCount            += 1u;
+            rec.dirty                   = true;
+        }
+        else
+        {
+            // First injection for this cycle.
+            rec.claimedVehicleId        = sybilId;
+            rec.realVehicleId           = sybilId;
+            rec.servingRsuId            = rsuIndex;
+            rec.firstSeenTime           = now - 1.0;
+            rec.lastSeenTime            = now;
+            rec.lastBsm.temporaryId     = sybilId;
+            rec.lastBsm.messageCount    = static_cast<uint32_t>(sybilId * 7u) % 128u;
+            rec.lastBsm.timestamp       = now;
+            rec.lastBsm.positionX       = rsuPos.x + (k % 2u == 0u ? +25.0 : -25.0);
+            rec.lastBsm.positionY       = rsuPos.y - 60.0 + 15.0 * static_cast<double>(k);
+            rec.lastBsm.positionZ       = 0.0;
+            rec.lastBsm.speed           = 3.0;
+            rec.lastBsm.heading         = 0.0;
+            rec.observerCount           = 1u;
+            rec.reportCount             = 2u;
+            rec.suspicionFlags          = SUSPICION_NONE;
+            rec.dirty                   = true;
+            rec.lastReportedToControllerTime = -1.0;
+        }
+        rsuTable[sybilId] = rec;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Type 4 — Insider Indirect
+// InjectSybilRecordsIntoControllerTable  (Type 6 — Malicious SDN Controller)
 //
-// The attacker (vehicleIndex) instructs the next vehicle in the ring (relay)
-// to re-broadcast a beacon claiming the victim's identity (two hops ahead).
-// realNodeId = relay (physical sender), claimedNodeId = victim (Sybil ID).
-// This models identity injection via a proxy rather than a direct broadcast.
+// Called once per report interval (when rsuIndex==0 fires in
+// SendControllerRsuCommand) to upsert N_SYBIL_SDN fake
+// ControllerGlobalAwarenessRecord entries into the controller's global table.
+//
+// Propagation path: the injected records persist in the controller's table →
+// the controller issues commands to RSUs that reference these Sybil IDs →
+// RSUs receive the commands and create minimal regional-awareness records for
+// them (handled in HandleControllerRsuCommandPayload in main .cc) → the Sybil
+// IDs are then included in subsequent RSU→Controller reports.
+// ---------------------------------------------------------------------------
+inline void
+InjectSybilRecordsIntoControllerTable(std::map<uint32_t, ControllerGlobalAwarenessRecord>& ctrlTable)
+{
+    if (!sybil_attack_enabled || !g_controllerIsMalicious) return;
+    double now = Simulator::Now().GetSeconds();
+    if (now < g_attackOnsetTime) return;
+
+    for (uint32_t k = 0; k < N_SYBIL_SDN; ++k)
+    {
+        uint32_t sybilId = N_Vehicles + 150u + k;
+
+        ControllerGlobalAwarenessRecord rec;
+        auto it = ctrlTable.find(sybilId);
+        if (it != ctrlTable.end())
+        {
+            // Refresh: increment counts so the Sybil looks increasingly credible.
+            rec = it->second;
+            rec.lastSeenTime         = now;
+            rec.lastBsm.timestamp    = now;
+            rec.rsuReportCount      += 1u;
+            rec.observerCount        = std::min(rec.observerCount + 1u, N_RSUs);
+        }
+        else
+        {
+            rec.claimedVehicleId   = sybilId;
+            rec.realVehicleId      = sybilId;
+            rec.lastServingRsuId   = k % N_RSUs;
+            rec.firstSeenTime      = now - 2.0;
+            rec.lastSeenTime       = now;
+            rec.lastBsm.temporaryId  = sybilId;
+            rec.lastBsm.messageCount = static_cast<uint32_t>(sybilId * 7u) % 128u;
+            rec.lastBsm.timestamp    = now;
+            rec.lastBsm.positionX    = 20.0 + 30.0 * static_cast<double>(k);
+            rec.lastBsm.positionY    = 40.0;
+            rec.lastBsm.positionZ    = 0.0;
+            rec.lastBsm.speed        = 3.0;
+            rec.lastBsm.heading      = 0.0;
+            rec.observerCount        = 1u;
+            rec.rsuReportCount       = 2u;
+            rec.trustScore           = 1.0;
+            rec.suspicionFlags       = SUSPICION_NONE;
+        }
+        ctrlTable[sybilId] = rec;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InjectSybilObservationsIntoReport  (Types 2 and 3)
+//
+// Called from SendV2RsuAwarenessPacket in the main .cc after building the
+// normal report.  Appends fabricated NeighborAwarenessRecord entries to the
+// report tag for attacker vehicles.
+//
+// The injected rows look identical to legitimate third-party observations at
+// the RSU: observerVehicleId = attacker, observedClaimedId = Sybil ID, BSM
+// carries a plausible-but-fake position offset from the attacker's real location.
+// ---------------------------------------------------------------------------
+inline void
+InjectSybilObservationsIntoReport(uint32_t vehicleIndex, V2RsuAwarenessReportTag& report)
+{
+    if (!sybil_attack_enabled || !IsSybilVehicle(vehicleIndex))
+        return;
+    double now = Simulator::Now().GetSeconds();
+    if (now < g_attackOnsetTime)
+        return;
+    if (g_activeAttackType != ATTACK_INSIDER_DIRECT_SIMULTANEOUS &&
+        g_activeAttackType != ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS)
+        return;
+
+    Vector pos(0.0, 0.0, 0.0);
+    if (vehicleIndex < g_vehicleNodes.GetN())
+        pos = g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>()->GetPosition();
+
+    // Build a plausible-looking fake NeighborAwarenessRecord for a given Sybil ID
+    // and a position offset (metres) from the attacker.
+    auto makeFakeRecord = [&](uint32_t sybilId, double offX, double offY)
+    {
+        NeighborAwarenessRecord rec;
+        rec.observerVehicleId      = vehicleIndex;   // attacker is the "reporter"
+        rec.observedRealId         = vehicleIndex;   // ground truth: same physical node
+        rec.observedClaimedId      = sybilId;
+        rec.firstSeenTime          = now - 1.0;
+        rec.lastSeenTime           = now;
+        rec.receivedBeaconCount    = 2u + (sybilId % 4u);
+        rec.lastBsm.temporaryId    = sybilId;
+        rec.lastBsm.messageCount   = static_cast<uint32_t>(sybilId * 7u + 3u) % 128u;
+        rec.lastBsm.timestamp      = now;
+        rec.lastBsm.positionX      = pos.x + offX;
+        rec.lastBsm.positionY      = pos.y + offY;
+        rec.lastBsm.positionZ      = 0.0;
+        rec.lastBsm.speed          = 3.0 + static_cast<double>(sybilId % 3u);
+        rec.lastBsm.heading        = 0.0;
+        rec.estimatedDistance      = std::sqrt(offX * offX + offY * offY);
+        rec.dirty                  = true;
+        rec.suspicionFlags         = SUSPICION_NONE;
+        return rec;
+    };
+
+    if (g_activeAttackType == ATTACK_INSIDER_DIRECT_SIMULTANEOUS)
+    {
+        // Inject N_SYBIL_SIMULTANEOUS fake observations in every report after onset.
+        // Sybil IDs are in a range well above the legitimate vehicle count so
+        // SUSPICION_RANGE_ANOMALY fires at the RSU.
+        for (uint32_t k = 0; k < N_SYBIL_SIMULTANEOUS; ++k)
+        {
+            uint32_t sybilId = N_Vehicles + vehicleIndex * N_SYBIL_SIMULTANEOUS + k;
+            double offX = (k % 2u == 0u) ? +30.0 : -30.0;
+            double offY = (k == 0u)       ? +8.0  : -8.0;
+            report.AddObservation(makeFakeRecord(sybilId, offX, offY));
+        }
+    }
+    else // ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS
+    {
+        // Only inject during odd-numbered 2-second windows.
+        // Each odd window rotates to a different Sybil ID → IDs appear and
+        // disappear over time rather than being present in every report.
+        uint32_t window = static_cast<uint32_t>(now / SYBIL_ROTATION_WINDOW);
+        if (window % 2u == 0u)
+            return;  // even window — attacker is "clean" this period
+        uint32_t rotation = (window / 2u) % 3u;   // cycles through 3 distinct IDs
+        uint32_t sybilId  = N_Vehicles + vehicleIndex * 3u + rotation;
+        double offX = (rotation == 0u) ? +30.0 : (rotation == 1u) ? -30.0 : +20.0;
+        double offY = (rotation == 0u) ? +8.0  : (rotation == 1u) ? -8.0  : +15.0;
+        report.AddObservation(makeFakeRecord(sybilId, offX, offY));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BroadcastSybilBeacon  (Type 4 — Insider Indirect)
+//
+// The attacker broadcasts a genuine V2V beacon on the wireless channel claiming
+// a Sybil identity.  The BSM carries a fabricated position so the Sybil appears
+// at a plausible-but-different location.  Neighbouring legitimate vehicles
+// receive this beacon through their normal callbacks, record it in their neighbor
+// tables, and later include it in their own V2RSU reports — the attacker never
+// directly touches the RSU data path.
 // ---------------------------------------------------------------------------
 static void
-IndirectRelayForward(uint32_t attackerIndex)
+BroadcastSybilBeacon(uint32_t vehicleIndex)
 {
-    uint32_t relayIndex = (attackerIndex + 1u) % N_Vehicles;
-    uint32_t victimId   = (attackerIndex + 2u) % N_Vehicles;
+    if (!g_vehicleIsAttacker[vehicleIndex]) return;
+    if (Simulator::Now().GetSeconds() < g_attackOnsetTime) return;
 
-    Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(relayIndex));
+    Vector pos = g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>()->GetPosition();
+
+    // Each attacker has one fixed Sybil ID and a deterministic position offset.
+    uint32_t sybilId = N_Vehicles + vehicleIndex;
+    double offX = 20.0 + 10.0 * static_cast<double>(vehicleIndex % 3u);
+    double offY = -20.0;
+
+    Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     sock->SetAllowBroadcast(true);
-    Ptr<TxInfo> tx = Create<TxInfo>();
+    Ptr<TxInfo> tx   = Create<TxInfo>();
     tx->packetSize    = 120;
-    tx->realNodeId    = relayIndex;   // relay is the physical sender
-    tx->claimedNodeId = victimId;     // relay broadcasts as the victim
+    tx->realNodeId    = vehicleIndex;
+    tx->claimedNodeId = sybilId;
     tx->destinationId = 0xFFFFFFFF;
     tx->messageType   = static_cast<uint32_t>(V2V_BEACON);
     tx->sequenceNumber = g_seq++;
+    tx->claimedX      = pos.x + offX;   // fabricated Sybil position stored in BSM
+    tx->claimedY      = pos.y + offY;
+    tx->claimedZ      = 0.0;
     SendTaggedPacket(sock, Ipv4Address("10.1.1.255"), VEHICLE_PORT, tx);
 }
 
@@ -342,39 +663,18 @@ MaliciousControllerInjectPhantoms(uint32_t rsuIndex)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Type 3 — Insider Direct Non-Simultaneous (dynamic beacon)
-//
-// The main .cc pre-schedules V2V beacons at t=0 with a claimedId baked from
-// GetClaimedVehicleId(i, N) when Simulator::Now()==0 → window always 0.
-// This callback is fired at real simulation time so GetClaimedVehicleId picks
-// up the correct rotating window and sends the genuinely non-simultaneous
-// variant of the beacon alongside the main-loop's static one.
-// ---------------------------------------------------------------------------
-static void
-SendNonSimultaneousBeacon(uint32_t vehicleIndex)
-{
-    if (!g_vehicleIsAttacker[vehicleIndex]) return;
-    uint32_t claimedId = GetClaimedVehicleId(vehicleIndex, N_Vehicles);
-    Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
-    sock->SetAllowBroadcast(true);
-    Ptr<TxInfo> tx = Create<TxInfo>();
-    tx->packetSize    = 120;
-    tx->realNodeId    = vehicleIndex;
-    tx->claimedNodeId = claimedId;
-    tx->destinationId = 0xFFFFFFFF;
-    tx->messageType   = static_cast<uint32_t>(V2V_BEACON);
-    tx->sequenceNumber = g_seq++;
-    SendTaggedPacket(sock, Ipv4Address("10.1.1.255"), VEHICLE_PORT, tx);
-}
-
 // ===========================================================================
 // Public entry point — schedule all attack traffic for this run.
 //
-// Call from main() AFTER the normal V2V / V2RSU / RSU↔Controller scheduling
-// so that attack packets interleave cleanly with legitimate ones.
-// Type 1 needs no extra scheduling (handled by GetClaimedVehicleId at
-// schedule time, which is correct for outsider since the ID never changes).
+// Call from main() AFTER the normal V2V / V2RSU / RSU↔Controller scheduling.
+//
+// Types 2 & 3: NO extra packet scheduling needed.  Sybil observations are
+//   injected into the V2RSU report tag by InjectSybilObservationsIntoReport(),
+//   which is called from SendV2RsuAwarenessPacket() in the main .cc.
+//
+// Type 4: Schedule BroadcastSybilBeacon() at every beacon interval (offset
+//   +250 ms from the normal beacon) so Sybil V2V packets interleave with
+//   legitimate ones on the wireless channel.
 // ===========================================================================
 
 inline void
@@ -385,77 +685,63 @@ ScheduleAttackTraffic(double simTime, double beaconInterval, double rsuReportInt
     switch (g_activeAttackType)
     {
     // -----------------------------------------------------------------------
-    // Type 1 (Outsider):
-    // GetClaimedVehicleId returns a fixed out-of-range ID at any simulation
-    // time, so the baked ID from the main-loop schedule is always correct.
-    // No extra scheduling needed.
+    // Type 1 — Outsider Sybil:
+    // No V2V beacons, no legitimate V2RSU reports (those are suppressed in the
+    // main .cc scheduling loop for outsider vehicles).  After g_attackOnsetTime
+    // the outsider sends forged V2RSU packets containing Sybil observations.
+    // One report per beaconInterval, staggered per attacker to avoid collisions.
     // -----------------------------------------------------------------------
     case ATTACK_OUTSIDER:
-        break;
-
-    // -----------------------------------------------------------------------
-    // Type 3 — Insider Direct Non-Simultaneous:
-    // GetClaimedVehicleId rotates the fake ID by 2-second window.  The
-    // main-loop V2V beacons bake the claimedId at t=0 (window=0), so they
-    // never rotate.  Schedule SendNonSimultaneousBeacon dynamically so the
-    // ID is evaluated at fire time and the rotation is captured in the CSV.
-    // +10 ms offset separates this from the main-loop beacon in the trace.
-    // -----------------------------------------------------------------------
-    case ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS:
-        for (double t = 1.0; t < simTime - 1.0; t += beaconInterval)
+        for (double t = g_attackOnsetTime; t < simTime - 0.5; t += beaconInterval)
             for (uint32_t i = 0; i < N_Vehicles; ++i)
                 if (g_vehicleIsAttacker[i])
-                    Simulator::Schedule(Seconds(t + 0.05 * i + 0.01),
-                                        &SendNonSimultaneousBeacon, i);
+                    Simulator::Schedule(
+                        Seconds(t + 0.05 * static_cast<double>(i) + 0.30),
+                        &OutsiderSendSybilReport, i);
         break;
 
     // -----------------------------------------------------------------------
-    // Type 2 — Insider Direct Simultaneous:
-    // +10 ms offset keeps extra beacons in the same logical slot while staying
-    // separable from the legitimate beacon in the CSV trace.
+    // Types 2 & 3 (Insider Direct Simultaneous / Non-Simultaneous):
+    // Injection is handled at V2RSU report build time via
+    // InjectSybilObservationsIntoReport().  No extra packets are generated.
     // -----------------------------------------------------------------------
     case ATTACK_INSIDER_DIRECT_SIMULTANEOUS:
-        for (double t = 1.0; t < simTime - 1.0; t += beaconInterval)
-            for (uint32_t i = 0; i < N_Vehicles; ++i)
-                if (g_vehicleIsAttacker[i])
-                    Simulator::Schedule(Seconds(t + 0.05 * i + 0.01),
-                                        &SimultaneousAttackSend, i);
+    case ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS:
         break;
 
     // -----------------------------------------------------------------------
     // Type 4 — Insider Indirect:
-    // +20 ms offset simulates the propagation delay introduced by the relay hop.
+    // Attacker broadcasts Sybil V2V beacons on the real wireless channel.
+    // Offset +250 ms from the normal beacon keeps them separable in the CSV
+    // while still falling within the same logical reporting window.
+    // Neighbours receive them naturally and forward via their V2RSU reports.
     // -----------------------------------------------------------------------
     case ATTACK_INSIDER_INDIRECT:
-        for (double t = 1.0; t < simTime - 1.0; t += beaconInterval)
+        for (double t = g_attackOnsetTime; t < simTime - 0.5; t += beaconInterval)
             for (uint32_t i = 0; i < N_Vehicles; ++i)
                 if (g_vehicleIsAttacker[i])
-                    Simulator::Schedule(Seconds(t + 0.05 * i + 0.02),
-                                        &IndirectRelayForward, i);
+                    Simulator::Schedule(Seconds(t + 0.05 * static_cast<double>(i) + 0.25),
+                                        &BroadcastSybilBeacon, i);
         break;
 
     // -----------------------------------------------------------------------
     // Type 5 — Malicious RSU:
-    // Phantom injections are timed between legitimate RSU→Controller reports
-    // (+50 ms offset) so they appear as separate flows in the controller log.
     // -----------------------------------------------------------------------
     case ATTACK_MALICIOUS_RSU:
         for (double t = 2.0; t < simTime - 1.0; t += rsuReportInterval)
             for (uint32_t i = 0; i < N_RSUs; ++i)
                 if (g_rsuIsMalicious[i])
-                    Simulator::Schedule(Seconds(t + 0.1 * i + 0.05),
+                    Simulator::Schedule(Seconds(t + 0.1 * static_cast<double>(i) + 0.05),
                                         &MaliciousRsuInjectPhantoms, i);
         break;
 
     // -----------------------------------------------------------------------
     // Type 6 — Malicious SDN Controller:
-    // Phantom authorisations are sent after the legitimate command window
-    // (+500 ms offset) to simulate out-of-band control-plane manipulation.
     // -----------------------------------------------------------------------
     case ATTACK_MALICIOUS_SDN_CONTROLLER:
         for (double t = 2.0; t < simTime - 1.0; t += rsuReportInterval)
             for (uint32_t i = 0; i < N_RSUs; ++i)
-                Simulator::Schedule(Seconds(t + 0.5 + 0.1 * i),
+                Simulator::Schedule(Seconds(t + 0.5 + 0.1 * static_cast<double>(i)),
                                     &MaliciousControllerInjectPhantoms, i);
         break;
 

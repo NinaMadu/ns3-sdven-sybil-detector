@@ -674,6 +674,14 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
         BsmCoreData bsm = BuildBsmCoreData(tx->realNodeId,
                                            tx->claimedNodeId,
                                            tx->sequenceNumber);
+        // Type-4 indirect attack supplies a fabricated Sybil position via claimedX/Y/Z.
+        // Override the mobility-model position so neighbours store the fake location.
+        if (tx->claimedX != 0.0 || tx->claimedY != 0.0 || tx->claimedZ != 0.0)
+        {
+            bsm.positionX = tx->claimedX;
+            bsm.positionY = tx->claimedY;
+            bsm.positionZ = tx->claimedZ;
+        }
         packet->AddPacketTag(BsmCoreDataTag(bsm));
     }
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
