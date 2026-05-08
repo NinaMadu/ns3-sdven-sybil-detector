@@ -77,6 +77,7 @@ struct TxInfo : public SimpleRefCount<TxInfo>
     uint32_t destinationId;
     uint32_t messageType;
     uint32_t sequenceNumber;
+    uint32_t observableSourceId = 0xFFFFFFFF; ///< network-visible sender/forwarder pseudonym
     double   claimedX = 0.0;   ///< Self-reported X position (metres)
     double   claimedY = 0.0;   ///< Self-reported Y position (metres)
     double   claimedZ = 0.0;   ///< Self-reported Z position (metres)
@@ -97,7 +98,20 @@ enum SdvenSuspicionFlags
     SUSPICION_ID_MISMATCH       = 1u << 0,
     SUSPICION_POSITION_CONFLICT = 1u << 1,
     SUSPICION_DUPLICATE_ID      = 1u << 2,
-    SUSPICION_RANGE_ANOMALY     = 1u << 3
+    SUSPICION_RANGE_ANOMALY     = 1u << 3,
+    SUSPICION_TEMPORAL_BURST    = 1u << 4,
+    SUSPICION_RSSI_COLOCATION   = 1u << 5,
+    SUSPICION_TRAJECTORY_SHADOWING = 1u << 6,
+    SUSPICION_UNCORROBORATED_RSU_APPROVAL = 1u << 7,
+    SUSPICION_RSSI_DISTANCE_MISMATCH      = 1u << 8  ///< Claimed BSM position inconsistent with RSSI-estimated distance
+};
+
+// RSSI-based position verification result stored per neighbor observation.
+enum RssiVerificationState
+{
+    RSSI_UNVERIFIED = 0,  ///< No RSSI sample available yet
+    RSSI_VERIFIED   = 1,  ///< RSSI-estimated distance is consistent with claimed BSM position
+    RSSI_MISMATCH   = 2   ///< RSSI-estimated distance exceeds mismatch threshold — position suspect
 };
 
 enum AwarenessReportType
@@ -134,10 +148,14 @@ struct NeighborAwarenessRecord
     double   lastSeenTime      = 0.0;
     BsmCoreData lastBsm;
     uint32_t receivedBeaconCount = 0;
-    double   estimatedDistance   = 0.0;
+    double   claimedDistance   = 0.0;
     uint32_t suspicionFlags      = SUSPICION_NONE;
     double   lastReportedToRsuTime = -1.0;
     bool     dirty               = true;
+    // RSSI-based distance verification (set by observer vehicle on reception)
+    double   rssiDbm               = -999.0; ///< PHY-measured signal strength (dBm); -999 = not yet observed
+    double   rssiEstimatedDistance = -1.0;   ///< Distance inferred from rssiDbm via path-loss inverse (metres)
+    uint32_t rssiVerificationState = RSSI_UNVERIFIED;
 };
 
 struct V2RsuAwarenessReport
@@ -174,7 +192,7 @@ struct RsuVehicleObservationRow
     double   reportReceiveTime   = 0.0;   ///< when the RSU received the V2RSU report
     double   observationTime     = 0.0;   ///< when the reporter observed the BSM
     BsmCoreData observedBsm;
-    double   estimatedDistance   = 0.0;
+    double   claimedDistance   = 0.0;
     uint32_t receivedBeaconCount = 0;
     uint32_t suspicionFlags      = SUSPICION_NONE;
     bool     dirty               = true;  ///< changed since the last RSU→controller export
@@ -281,9 +299,11 @@ struct V2RsuNeighborObservationPayload
     double positionZ = 0.0;
     double speed = 0.0;
     double heading = 0.0;
-    double estimatedDistance = 0.0;
-    uint32_t receivedBeaconCount = 0;
-    uint32_t suspicionFlags = SUSPICION_NONE;
+    double   claimedDistance     = 0.0;
+    uint32_t receivedBeaconCount   = 0;
+    uint32_t suspicionFlags        = SUSPICION_NONE;
+    double   rssiEstimatedDistance = -1.0;
+    uint32_t rssiVerificationState = RSSI_UNVERIFIED;
 };
 
 class V2RsuAwarenessReportTag : public Tag
@@ -324,7 +344,11 @@ class V2RsuAwarenessReportTag : public Tag
     uint32_t GetSerializedSize(void) const override
     {
         uint32_t bsmSize = 4 * sizeof(uint32_t) + 11 * sizeof(double);
-        uint32_t observationSize = 5 * sizeof(uint32_t) + 7 * sizeof(double);
+        // per-observation: observerVehicleId, observedRealId, observedClaimedId,
+        //   receivedBeaconCount, suspicionFlags, rssiVerificationState  (6 × uint32_t)
+        //   lastSeenTime, posX, posY, posZ, speed, heading, claimedDistance,
+        //   rssiEstimatedDistance  (8 × double)
+        uint32_t observationSize = 6 * sizeof(uint32_t) + 8 * sizeof(double);
         return 5 * sizeof(uint32_t) + 3 * sizeof(double) + bsmSize +
                MAX_V2RSU_NEIGHBOR_OBSERVATIONS * observationSize;
     }
@@ -352,9 +376,11 @@ class V2RsuAwarenessReportTag : public Tag
             i.WriteDouble(obs.positionZ);
             i.WriteDouble(obs.speed);
             i.WriteDouble(obs.heading);
-            i.WriteDouble(obs.estimatedDistance);
+            i.WriteDouble(obs.claimedDistance);
             i.WriteU32(obs.receivedBeaconCount);
             i.WriteU32(obs.suspicionFlags);
+            i.WriteDouble(obs.rssiEstimatedDistance);
+            i.WriteU32(obs.rssiVerificationState);
         }
     }
 
@@ -381,9 +407,11 @@ class V2RsuAwarenessReportTag : public Tag
             obs.positionZ = i.ReadDouble();
             obs.speed = i.ReadDouble();
             obs.heading = i.ReadDouble();
-            obs.estimatedDistance = i.ReadDouble();
-            obs.receivedBeaconCount = i.ReadU32();
-            obs.suspicionFlags = i.ReadU32();
+            obs.claimedDistance = i.ReadDouble();
+            obs.receivedBeaconCount   = i.ReadU32();
+            obs.suspicionFlags        = i.ReadU32();
+            obs.rssiEstimatedDistance = i.ReadDouble();
+            obs.rssiVerificationState = i.ReadU32();
             m_observations[n] = obs;
         }
         if (m_neighborCount > MAX_V2RSU_NEIGHBOR_OBSERVATIONS)
@@ -414,9 +442,11 @@ class V2RsuAwarenessReportTag : public Tag
         obs.positionZ = record.lastBsm.positionZ;
         obs.speed = record.lastBsm.speed;
         obs.heading = record.lastBsm.heading;
-        obs.estimatedDistance = record.estimatedDistance;
-        obs.receivedBeaconCount = record.receivedBeaconCount;
-        obs.suspicionFlags = record.suspicionFlags;
+        obs.claimedDistance = record.claimedDistance;
+        obs.receivedBeaconCount   = record.receivedBeaconCount;
+        obs.suspicionFlags        = record.suspicionFlags;
+        obs.rssiEstimatedDistance = record.rssiEstimatedDistance;
+        obs.rssiVerificationState = record.rssiVerificationState;
         m_observations[m_neighborCount++] = obs;
         return true;
     }
@@ -507,17 +537,19 @@ class SybilPacketTag : public Tag
   public:
     SybilPacketTag()
         : m_realNodeId(0), m_claimedNodeId(0), m_destinationId(0),
-          m_messageType(0), m_sequenceNumber(0),
+          m_messageType(0), m_sequenceNumber(0), m_observableSourceId(0),
           m_createdTime(Simulator::Now().GetSeconds()),
           m_claimedX(0.0), m_claimedY(0.0), m_claimedZ(0.0) {}
 
     SybilPacketTag(uint32_t realNodeId, uint32_t claimedNodeId,
                    uint32_t destinationId, uint32_t messageType,
                    uint32_t sequenceNumber,
-                   double claimedX = 0.0, double claimedY = 0.0, double claimedZ = 0.0)
+                   double claimedX = 0.0, double claimedY = 0.0, double claimedZ = 0.0,
+                   uint32_t observableSourceId = 0xFFFFFFFF)
         : m_realNodeId(realNodeId), m_claimedNodeId(claimedNodeId),
           m_destinationId(destinationId), m_messageType(messageType),
           m_sequenceNumber(sequenceNumber),
+          m_observableSourceId(observableSourceId == 0xFFFFFFFF ? realNodeId : observableSourceId),
           m_createdTime(Simulator::Now().GetSeconds()),
           m_claimedX(claimedX), m_claimedY(claimedY), m_claimedZ(claimedZ) {}
 
@@ -531,7 +563,7 @@ class SybilPacketTag : public Tag
     TypeId   GetInstanceTypeId(void) const override { return SybilPacketTag::GetTypeId(); }
     uint32_t GetSerializedSize(void) const override
     {
-        return 5 * sizeof(uint32_t) + 4 * sizeof(double); // +claimedX,Y,Z
+        return 6 * sizeof(uint32_t) + 4 * sizeof(double); // +sourceId,+claimedX,Y,Z
     }
 
     void Serialize(TagBuffer i) const override
@@ -539,6 +571,7 @@ class SybilPacketTag : public Tag
         i.WriteU32(m_realNodeId);    i.WriteU32(m_claimedNodeId);
         i.WriteU32(m_destinationId); i.WriteU32(m_messageType);
         i.WriteU32(m_sequenceNumber);
+        i.WriteU32(m_observableSourceId);
         i.WriteDouble(m_createdTime);
         i.WriteDouble(m_claimedX);   i.WriteDouble(m_claimedY); i.WriteDouble(m_claimedZ);
     }
@@ -547,6 +580,7 @@ class SybilPacketTag : public Tag
         m_realNodeId     = i.ReadU32();  m_claimedNodeId   = i.ReadU32();
         m_destinationId  = i.ReadU32();  m_messageType     = i.ReadU32();
         m_sequenceNumber = i.ReadU32();
+        m_observableSourceId = i.ReadU32();
         m_createdTime    = i.ReadDouble();
         m_claimedX       = i.ReadDouble(); m_claimedY = i.ReadDouble(); m_claimedZ = i.ReadDouble();
     }
@@ -555,6 +589,7 @@ class SybilPacketTag : public Tag
         os << "real=" << m_realNodeId << ",claimed=" << m_claimedNodeId
            << ",dst=" << m_destinationId << ",type=" << m_messageType
            << ",seq=" << m_sequenceNumber
+           << ",src=" << m_observableSourceId
            << ",pos=(" << m_claimedX << "," << m_claimedY << "," << m_claimedZ << ")";
     }
 
@@ -563,6 +598,7 @@ class SybilPacketTag : public Tag
     uint32_t GetDestinationId()  const { return m_destinationId; }
     uint32_t GetMessageType()    const { return m_messageType; }
     uint32_t GetSequenceNumber() const { return m_sequenceNumber; }
+    uint32_t GetObservableSourceId() const { return m_observableSourceId; }
     double   GetCreatedTime()    const { return m_createdTime; }
     double   GetClaimedX()       const { return m_claimedX; }
     double   GetClaimedY()       const { return m_claimedY; }
@@ -571,6 +607,7 @@ class SybilPacketTag : public Tag
   private:
     uint32_t m_realNodeId, m_claimedNodeId, m_destinationId;
     uint32_t m_messageType, m_sequenceNumber;
+    uint32_t m_observableSourceId;
     double   m_createdTime;
     double   m_claimedX, m_claimedY, m_claimedZ;
 };
@@ -667,7 +704,8 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
     Ptr<Packet> packet = Create<Packet>(tx->packetSize);
     SybilPacketTag tag(tx->realNodeId, tx->claimedNodeId,
                        tx->destinationId, tx->messageType, tx->sequenceNumber,
-                       tx->claimedX, tx->claimedY, tx->claimedZ);
+                       tx->claimedX, tx->claimedY, tx->claimedZ,
+                       tx->observableSourceId);
     packet->AddPacketTag(tag);
     if (tx->messageType == static_cast<uint32_t>(V2V_BEACON))
     {
