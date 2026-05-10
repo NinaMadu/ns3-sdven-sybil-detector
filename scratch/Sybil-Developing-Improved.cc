@@ -4230,7 +4230,14 @@ LogReceivedPacket(const std::string& receiverRole,
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
     MetricsOnReceive(isSybil, delay, countForPDR);
 
-    if (g_secMetrics)
+    bool isDetectionMetricsCandidate =
+        hasTag &&
+        (messageType == static_cast<uint32_t>(V2V_BEACON) ||
+         messageType == static_cast<uint32_t>(V2RSU_REPORT) ||
+         messageType == static_cast<uint32_t>(RSU2CONTROLLER_REPORT) ||
+         messageType == static_cast<uint32_t>(SYBIL_INJECTION));
+
+    if (g_secMetrics && isDetectionMetricsCandidate)
     {
         g_secMetrics->OnPacketReceived(
             hasTag ? tag.GetRealNodeId()     : 0,
