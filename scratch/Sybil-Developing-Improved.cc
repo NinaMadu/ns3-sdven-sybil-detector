@@ -3896,8 +3896,12 @@ LogReceivedPacket(const std::string& receiverRole,
 
     // --- Early decryption pass for encrypted V2RSU reports ---
     // Plaintext layout: hasToken(1B) + token(32B) + report(reportSz).
+    // tokenAccepted: true only when decryption succeeds AND token is present AND valid.
+    // hasDecryptedReport: true whenever decryption succeeds (regardless of token status).
+    // UpdateRsuRegionalAwareness is gated on tokenAccepted, not just hasDecryptedReport.
     V2RsuAwarenessReportTag decryptedReport;
     bool hasDecryptedReport = false;
+    bool tokenAccepted      = false;
     if (hasTag &&
         tag.GetMessageType() == static_cast<uint32_t>(V2RSU_REPORT) &&
         receiverRole == "rsu_edge")
@@ -3927,25 +3931,37 @@ LogReceivedPacket(const std::string& receiverRole,
                     if (!plaintext.empty() &&
                         plaintext.size() == 33 + reportSz)
                     {
-                        // Parse token header.
+                        // ── Step 1: deserialise the report (always, for logging) ──
+                        TagBuffer tb(plaintext.data() + 33,
+                                     plaintext.data() + 33 + reportSz);
+                        decryptedReport.Deserialize(tb);
+                        hasDecryptedReport = true;
+                        std::cout << "[Security] V2RSU decrypted OK"
+                                  << "  RSU=" << rId
+                                  << "  Vehicle=" << vId
+                                  << "  Seq=" << scTag.seqNum << std::endl;
+
+                        // ── Step 2: token authentication — gates awareness update ──
                         bool hasToken = (plaintext[0] != 0);
                         if (hasToken)
                         {
                             std::vector<uint8_t> recvTok(plaintext.begin() + 1,
                                                          plaintext.begin() + 33);
-                            // Authenticate token against g_globalTokenStore.
                             auto tokenIt = g_globalTokenStore.find(vId);
                             if (tokenIt != g_globalTokenStore.end() &&
                                 tokenIt->second == recvTok)
                             {
+                                tokenAccepted = true;
                                 std::cout << "[Reg] RSU " << rId << ": V2RSU token VALID"
-                                          << " vehicle=" << vId << "\n";
+                                          << " vehicle=" << vId
+                                          << " → report accepted into awareness table\n";
                             }
                             else
                             {
+                                // tokenAccepted stays false — report will be dropped.
                                 std::cout << "[Reg] RSU " << rId << ": V2RSU token INVALID"
-                                          << " vehicle=" << vId << " — challenging\n";
-                                // Invalid token: re-challenge.
+                                          << " vehicle=" << vId
+                                          << " → report REJECTED, re-challenging\n";
                                 if (rId < g_rsuPendingChallenges.size() &&
                                     g_rsuPendingChallenges[rId].find(vId) ==
                                     g_rsuPendingChallenges[rId].end())
@@ -3956,9 +3972,10 @@ LogReceivedPacket(const std::string& receiverRole,
                         }
                         else
                         {
-                            // No token: issue challenge if not already pending.
+                            // tokenAccepted stays false — report will be dropped.
                             std::cout << "[Reg] RSU " << rId << ": V2RSU no token"
-                                      << " vehicle=" << vId << " — challenging\n";
+                                      << " vehicle=" << vId
+                                      << " → report REJECTED, challenging\n";
                             if (rId < g_rsuPendingChallenges.size() &&
                                 g_rsuPendingChallenges[rId].find(vId) ==
                                 g_rsuPendingChallenges[rId].end())
@@ -3966,16 +3983,6 @@ LogReceivedPacket(const std::string& receiverRole,
                                 SendRegChallenge(rId, vId);
                             }
                         }
-
-                        // Deserialize report from offset 33.
-                        TagBuffer tb(plaintext.data() + 33,
-                                     plaintext.data() + 33 + reportSz);
-                        decryptedReport.Deserialize(tb);
-                        hasDecryptedReport = true;
-                        std::cout << "[Security] V2RSU decrypted OK"
-                                  << "  RSU=" << rId
-                                  << "  Vehicle=" << vId
-                                  << "  Seq=" << scTag.seqNum << std::endl;
                     }
                     else
                     {
@@ -3995,15 +4002,27 @@ LogReceivedPacket(const std::string& receiverRole,
     {
         if (receiverId < g_rsuReportCount.size())
             g_rsuReportCount[receiverId]++;
+
+        // Always track that this vehicle is present (needed to know who to challenge).
         UpdateRsuVehicleRecord(receiverId, tag, triggerSeq);
-        if (hasDecryptedReport)
-            UpdateRsuRegionalAwareness(receiverId, decryptedReport, triggerSeq);
-        else
+
+        // Only update the regional awareness table (data forwarded to controller)
+        // when the token has been verified.  Unregistered or invalid-token vehicles
+        // are tracked for connectivity but their data is NOT forwarded upstream.
+        if (tokenAccepted)
         {
-            V2RsuAwarenessReportTag v2rsuReport;
-            if (packet->PeekPacketTag(v2rsuReport))
-                UpdateRsuRegionalAwareness(receiverId, v2rsuReport, triggerSeq);
+            UpdateRsuRegionalAwareness(receiverId, decryptedReport, triggerSeq);
         }
+        else if (hasDecryptedReport)
+        {
+            std::cout << "[Security] V2RSU awareness update BLOCKED for vehicle="
+                      << tag.GetRealNodeId()
+                      << " at RSU=" << receiverId
+                      << " (token not accepted)\n";
+        }
+        // Note: plaintext V2RSU packets (no SecureChannelTag) are fully blocked at the
+        // sender (SendV2RsuAwarenessPacket drops if no session).  Any that somehow
+        // arrive here are silently ignored — never enter the awareness table.
     }
     HandleRsuControllerRecordPayload(receiverRole, packet, tag, hasTag, triggerSeq);
     HandleControllerRsuCommandPayload(receiverRole, receiverId, packet, tag, hasTag);
@@ -4370,16 +4389,13 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
         return;
     }
 
-    // ── Fallback: no session yet — send plaintext with a warning ──────────
-    std::cout << "[Security] WARNING: No session V=" << vehicleIndex
-              << "->RSU=" << rsuIndex << "; sending unencrypted report." << std::endl;
-    uint32_t packetSize = 220 + 96 * report.GetNeighborCount();
-    Ptr<Packet> packet = Create<Packet>(packetSize);
-    packet->AddPacketTag(tag);
-    packet->AddPacketTag(BsmCoreDataTag(report.GetSelfBsm()));
-    packet->AddPacketTag(report);
-    socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
-    MetricsOnTransmit(1);
+    // ── No session yet — block the report completely ──────────────────────
+    // Sending an unencrypted report would expose vehicle data in plaintext
+    // and bypass token authentication.  Drop it silently; the vehicle will
+    // retry once the CHAN_HELLO/CHAN_ACK handshake completes.
+    std::cout << "[Security] BLOCKED V2RSU: no session V=" << vehicleIndex
+              << "->RSU=" << rsuIndex << " — report held until handshake completes."
+              << std::endl;
 }
 
 // ---------------------------------------------------------------------------
