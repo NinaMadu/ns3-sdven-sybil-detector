@@ -45,6 +45,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -108,10 +109,11 @@ static uint64_t g_windowLegitimate    = 0;
 
 enum DetectionMode
 {
-    MODE_RULE_BASED   = 0,
-    MODE_ML_LOCAL     = 1,
-    MODE_FL_FEDERATED = 2,
-    MODE_HYBRID       = 3
+    MODE_NONE         = 0,   ///< No detection — pure baseline measurement.
+    MODE_RULE_BASED   = 1,
+    MODE_ML_LOCAL     = 2,
+    MODE_FL_FEDERATED = 3,
+    MODE_HYBRID       = 4
 };
 
 // =============================================================================
@@ -128,6 +130,12 @@ struct NodeBehaviorRecord
     uint32_t lastSeqNum         = 0;
     uint32_t outOfOrderCount    = 0;
     bool     seenMismatch       = false;
+    bool     registryMiss       = false;
+    uint32_t rapidArrivalCount  = 0;
+    uint32_t burstWindowCount   = 0;
+    double   minInterArrivalSec = 0.0;
+    std::set<std::string> receiverKeys;
+    std::set<std::string> receiverRoles;
     std::vector<double> arrivalTimes;
 };
 
@@ -350,6 +358,7 @@ struct ComplexityModel
     {
         switch (mode)
         {
+        case MODE_NONE:         return 0;
         case MODE_RULE_BASED:   return MF_FLOPs(tier);
         case MODE_ML_LOCAL:     return ML_FLOPs(tier);
         case MODE_FL_FEDERATED: return FL_FLOPs(tier);
@@ -433,12 +442,19 @@ class SybilDetector : public SimpleRefCount<SybilDetector>
                                      uint32_t /*proposedMethod*/)
     {
         double score = 0.0;
-        if (rec.seenMismatch) score += 0.70;
-        if (rec.outOfOrderCount > 2) score += 0.20;
+
+        // Observable evidence only.  Do not use realId != claimedId here:
+        // that relation is simulation ground truth for TP/FP/FN/TN labels,
+        // not something a deployed detector can directly know.
+        if (rec.registryMiss) score += 0.45;
+        if (rec.outOfOrderCount > 2) score += 0.15;
+        if (rec.registryMiss && rec.rapidArrivalCount > 2) score += 0.15;
+        if (rec.registryMiss && rec.burstWindowCount > 4) score += 0.15;
         if (rec.messageCount > 1)
         {
             double span = rec.lastSeenSec - rec.firstSeenSec;
-            if (span > 0.0 && (rec.messageCount / span) > 5.0) score += 0.10;
+            if (rec.registryMiss && span > 0.0 && (rec.messageCount / span) > 4.0)
+                score += 0.10;
         }
         return std::min(score, 1.0);
     }
@@ -545,12 +561,31 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         rec.realId    = realNodeId;
         if (realNodeId != claimedNodeId) rec.seenMismatch = true;
         if (rec.messageCount == 0) rec.firstSeenSec = timestampSec;
+        if (!rec.arrivalTimes.empty())
+        {
+            double iat = timestampSec - rec.arrivalTimes.back();
+            if (iat >= 0.0 && (rec.minInterArrivalSec == 0.0 || iat < rec.minInterArrivalSec))
+                rec.minInterArrivalSec = iat;
+            if (iat >= 0.0 && iat < 0.050)
+                ++rec.rapidArrivalCount;
+        }
         rec.lastSeenSec = timestampSec;
         ++rec.messageCount;
         rec.arrivalTimes.push_back(timestampSec);
+        while (!rec.arrivalTimes.empty() &&
+               timestampSec - rec.arrivalTimes.front() > 1.0)
+        {
+            rec.arrivalTimes.erase(rec.arrivalTimes.begin());
+        }
+        rec.burstWindowCount = static_cast<uint32_t>(rec.arrivalTimes.size());
         if (rec.messageCount > 1 && seqNum < rec.lastSeqNum)
             ++rec.outOfOrderCount;
         rec.lastSeqNum = seqNum;
+        rec.registryMiss = rec.registryMiss || (claimedNodeId >= m_nVehicles);
+        rec.receiverRoles.insert(receiverRole);
+        std::ostringstream receiverKey;
+        receiverKey << receiverRole << "/" << receiverId;
+        rec.receiverKeys.insert(receiverKey.str());
 
         bool isActuallySybil = (realNodeId != claimedNodeId);
         std::string tier     = RoleToTier(receiverRole);
@@ -817,6 +852,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
     {
         switch (mode)
         {
+        case MODE_NONE:         return "no_detection";
         case MODE_RULE_BASED:   return "MF_rule_based";
         case MODE_ML_LOCAL:     return "ML_local";
         case MODE_FL_FEDERATED: return "FL_federated";

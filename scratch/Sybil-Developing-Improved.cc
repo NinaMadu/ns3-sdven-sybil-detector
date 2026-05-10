@@ -54,7 +54,7 @@ bool routing_test = true;             ///< true → small 3-vehicle/2-RSU/1-SDN 
 bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
-uint32_t proposed_method = 0;         ///< Detection method: 0=rule-based 1=ML 2=FL 3=hybrid.
+uint32_t proposed_method = 0;         ///< Detection method: 0=none 1=rule-based 2=ML 3=FL 4=hybrid.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
 double rsuVehicleRecordTimeout = 3.0; ///< Seconds before an RSU forgets an unseen vehicle.
@@ -951,6 +951,10 @@ struct RsuControllerAwarenessPayload
     uint32_t observerCount    = 0;
     uint32_t reportCount      = 0;
     uint32_t suspicionFlags   = SUSPICION_NONE;
+    uint32_t rssiVerifiedCount = 0;
+    uint32_t rssiMismatchCount = 0;
+    uint32_t rssiUnverifiedCount = 0;
+    double   rssiVerifiedProbability = 0.5;
 };
 
 class RsuControllerBatchAwarenessTag : public Tag
@@ -968,10 +972,10 @@ class RsuControllerBatchAwarenessTag : public Tag
     }
     TypeId GetInstanceTypeId() const override { return GetTypeId(); }
 
-    // Each slot: 10×uint32 + 13×double (same layout as RsuControllerAwarenessTag)
+    // Each slot: 13×uint32 + 14×double.
     uint32_t GetSerializedSize() const override
     {
-        static const uint32_t perRecord = 10 * sizeof(uint32_t) + 13 * sizeof(double);
+        static const uint32_t perRecord = 13 * sizeof(uint32_t) + 14 * sizeof(double);
         return 2 * sizeof(uint32_t) + MAX_RSU2CONTROLLER_RECORDS * perRecord;
     }
 
@@ -1005,6 +1009,10 @@ class RsuControllerBatchAwarenessTag : public Tag
             i.WriteU32(r.observerCount);
             i.WriteU32(r.reportCount);
             i.WriteU32(r.suspicionFlags);
+            i.WriteU32(r.rssiVerifiedCount);
+            i.WriteU32(r.rssiMismatchCount);
+            i.WriteU32(r.rssiUnverifiedCount);
+            i.WriteDouble(r.rssiVerifiedProbability);
         }
     }
 
@@ -1040,6 +1048,10 @@ class RsuControllerBatchAwarenessTag : public Tag
             r.observerCount         = i.ReadU32();
             r.reportCount           = i.ReadU32();
             r.suspicionFlags        = i.ReadU32();
+            r.rssiVerifiedCount     = i.ReadU32();
+            r.rssiMismatchCount     = i.ReadU32();
+            r.rssiUnverifiedCount   = i.ReadU32();
+            r.rssiVerifiedProbability = i.ReadDouble();
         }
     }
 
@@ -1061,6 +1073,10 @@ class RsuControllerBatchAwarenessTag : public Tag
         r.observerCount    = rec.observerCount;
         r.reportCount      = rec.reportCount;
         r.suspicionFlags   = rec.suspicionFlags;
+        r.rssiVerifiedCount = rec.rssiVerifiedCount;
+        r.rssiMismatchCount = rec.rssiMismatchCount;
+        r.rssiUnverifiedCount = rec.rssiUnverifiedCount;
+        r.rssiVerifiedProbability = rec.rssiVerifiedProbability;
         ++m_recordCount;
         return true;
     }
@@ -1132,7 +1148,8 @@ InitializeRsuVehicleObservationCsv()
     out << "time,event,rsu_id,observed_claimed_id,row_index,row_type,reported_by_vehicle_id,"
         << "observed_real_id,report_receive_time,observation_time,bsm_x,bsm_y,bsm_z,"
         << "bsm_speed,bsm_heading,estimated_distance,received_beacon_count,"
-        << "suspicion_flags,dirty,rows_for_claimed_id,trigger_seq,status\n";
+        << "suspicion_flags,rssi_estimated_distance_m,rssi_verification_state,"
+        << "dirty,rows_for_claimed_id,trigger_seq,status\n";
 }
 
 static void
@@ -1150,7 +1167,9 @@ InitializeRsuRegionalAwarenessCsv()
     std::ofstream out(rsuRegionalAwarenessCsv.c_str(), std::ios::out);
     out << "time,event,rsu_id,claimed_vehicle_id,real_vehicle_id,first_seen_time,"
         << "last_seen_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,observer_count,"
-        << "report_count,suspicion_flags,dirty,last_reported_to_controller_time,"
+        << "report_count,suspicion_flags,rssi_verified_count,rssi_mismatch_count,"
+        << "rssi_unverified_count,rssi_verified_probability,rssi_false_data_decision,"
+        << "dirty,last_reported_to_controller_time,"
         << "regional_table_size,trigger_seq,status\n";
 }
 
@@ -1161,6 +1180,8 @@ InitializeControllerGlobalAwarenessCsv()
     out << "time,event,claimed_vehicle_id,real_vehicle_id,last_serving_rsu_id,"
         << "first_seen_time,last_seen_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,"
         << "observer_count,rsu_report_count,trust_score,suspicion_flags,"
+        << "rssi_verified_count,rssi_mismatch_count,rssi_unverified_count,"
+        << "rssi_verified_probability,rssi_false_data_decision,"
         << "global_table_size,trigger_seq,status\n";
 }
 
@@ -1329,6 +1350,8 @@ LogRsuVehicleObservationRowEvent(const std::string& event,
         << row.claimedDistance << ","
         << row.receivedBeaconCount << ","
         << row.suspicionFlags << ","
+        << row.rssiEstimatedDistance << ","
+        << row.rssiVerificationState << ","
         << (row.dirty ? 1 : 0) << ","
         << rowsForClaimedId << ","
         << triggerSeq << ","
@@ -1457,6 +1480,8 @@ UpsertRsuRegionalAwarenessSelf(uint32_t rsuIndex,
     row.claimedDistance = 0.0;
     row.receivedBeaconCount = 1;
     row.suspicionFlags = suspicionFlags;
+    row.rssiEstimatedDistance = -1.0;
+    row.rssiVerificationState = RSSI_UNVERIFIED;
     row.suspicionFlags |= GetRssiCoLocationFlags(N_Vehicles + rsuIndex,
                                                  row.observedClaimedId);
     row.suspicionFlags |= EvaluateTemporalBurstSignature(
@@ -1503,10 +1528,21 @@ UpsertRsuRegionalAwarenessSelf(uint32_t rsuIndex,
             aggregate.realVehicleId = r.observedRealId;
         }
         aggregate.suspicionFlags |= r.suspicionFlags;
+        if (r.rssiVerificationState == RSSI_VERIFIED)
+            ++aggregate.rssiVerifiedCount;
+        else if (r.rssiVerificationState == RSSI_MISMATCH)
+            ++aggregate.rssiMismatchCount;
+        else
+            ++aggregate.rssiUnverifiedCount;
     }
 
     aggregate.observerCount = uniqueReporters.size();
     aggregate.reportCount = rows.size();
+    uint32_t rssiEvidence = aggregate.rssiVerifiedCount + aggregate.rssiMismatchCount;
+    aggregate.rssiVerifiedProbability =
+        (rssiEvidence > 0)
+            ? static_cast<double>(aggregate.rssiVerifiedCount) / static_cast<double>(rssiEvidence)
+            : 0.5;
 
     bool isNewAggregate =
         g_rsuRegionalAwarenessTables[rsuIndex].find(aggregate.claimedVehicleId) ==
@@ -1550,6 +1586,8 @@ UpsertRsuRegionalAwarenessObservation(uint32_t rsuIndex,
     row.claimedDistance = observation.claimedDistance;
     row.receivedBeaconCount = observation.receivedBeaconCount;
     row.suspicionFlags = observation.suspicionFlags;
+    row.rssiEstimatedDistance = observation.rssiEstimatedDistance;
+    row.rssiVerificationState = observation.rssiVerificationState;
     row.suspicionFlags |= GetRssiCoLocationFlags(N_Vehicles + rsuIndex,
                                                  row.observedClaimedId);
     row.suspicionFlags |= EvaluateTemporalBurstSignature(
@@ -1596,10 +1634,21 @@ UpsertRsuRegionalAwarenessObservation(uint32_t rsuIndex,
             aggregate.realVehicleId = r.observedRealId;
         }
         aggregate.suspicionFlags |= r.suspicionFlags;
+        if (r.rssiVerificationState == RSSI_VERIFIED)
+            ++aggregate.rssiVerifiedCount;
+        else if (r.rssiVerificationState == RSSI_MISMATCH)
+            ++aggregate.rssiMismatchCount;
+        else
+            ++aggregate.rssiUnverifiedCount;
     }
 
     aggregate.observerCount = uniqueReporters.size();
     aggregate.reportCount = rows.size();
+    uint32_t rssiEvidence = aggregate.rssiVerifiedCount + aggregate.rssiMismatchCount;
+    aggregate.rssiVerifiedProbability =
+        (rssiEvidence > 0)
+            ? static_cast<double>(aggregate.rssiVerifiedCount) / static_cast<double>(rssiEvidence)
+            : 0.5;
 
     bool isNewAggregate =
         g_rsuRegionalAwarenessTables[rsuIndex].find(aggregate.claimedVehicleId) ==
@@ -1667,6 +1716,9 @@ LogRsuRegionalAwarenessEvent(const std::string& event,
                          : 0;
 
     std::ofstream out(rsuRegionalAwarenessCsv.c_str(), std::ios::app);
+    bool rssiFalseDataDecision =
+        record.rssiMismatchCount > 0 &&
+        record.rssiVerifiedProbability < 0.5;
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << rsuIndex << ","
@@ -1682,6 +1734,11 @@ LogRsuRegionalAwarenessEvent(const std::string& event,
         << record.observerCount << ","
         << record.reportCount << ","
         << record.suspicionFlags << ","
+        << record.rssiVerifiedCount << ","
+        << record.rssiMismatchCount << ","
+        << record.rssiUnverifiedCount << ","
+        << record.rssiVerifiedProbability << ","
+        << (rssiFalseDataDecision ? 1 : 0) << ","
         << (record.dirty ? 1 : 0) << ","
         << record.lastReportedToControllerTime << ","
         << tableSize << ","
@@ -1696,6 +1753,9 @@ LogControllerGlobalAwarenessEvent(const std::string& event,
                                   uint32_t triggerSeq = 0)
 {
     std::ofstream out(controllerGlobalAwarenessCsv.c_str(), std::ios::app);
+    bool rssiFalseDataDecision =
+        record.rssiMismatchCount > 0 &&
+        record.rssiVerifiedProbability < 0.5;
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << record.claimedVehicleId << ","
@@ -1712,6 +1772,11 @@ LogControllerGlobalAwarenessEvent(const std::string& event,
         << record.rsuReportCount << ","
         << record.trustScore << ","
         << record.suspicionFlags << ","
+        << record.rssiVerifiedCount << ","
+        << record.rssiMismatchCount << ","
+        << record.rssiUnverifiedCount << ","
+        << record.rssiVerifiedProbability << ","
+        << (rssiFalseDataDecision ? 1 : 0) << ","
         << g_controllerGlobalAwarenessTable.size() << ","
         << triggerSeq << ","
         << status << "\n";
@@ -1998,6 +2063,10 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 incoming.observerCount    = p.observerCount;
                 incoming.rsuReportCount   = p.reportCount;
                 incoming.suspicionFlags   = p.suspicionFlags;
+                incoming.rssiVerifiedCount = p.rssiVerifiedCount;
+                incoming.rssiMismatchCount = p.rssiMismatchCount;
+                incoming.rssiUnverifiedCount = p.rssiUnverifiedCount;
+                incoming.rssiVerifiedProbability = p.rssiVerifiedProbability;
                 incoming.suspicionFlags  |= EvaluateTemporalBurstSignature(
                     p.servingRsuId,
                     p.claimedVehicleId,
@@ -2023,6 +2092,16 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                         incoming.firstSeenTime   = existing->second.firstSeenTime;
                         incoming.rsuReportCount += existing->second.rsuReportCount;
                         incoming.observerCount  += existing->second.observerCount;
+                        incoming.rssiVerifiedCount += existing->second.rssiVerifiedCount;
+                        incoming.rssiMismatchCount += existing->second.rssiMismatchCount;
+                        incoming.rssiUnverifiedCount += existing->second.rssiUnverifiedCount;
+                        uint32_t rssiEvidence =
+                            incoming.rssiVerifiedCount + incoming.rssiMismatchCount;
+                        incoming.rssiVerifiedProbability =
+                            (rssiEvidence > 0)
+                                ? static_cast<double>(incoming.rssiVerifiedCount) /
+                                      static_cast<double>(rssiEvidence)
+                                : 0.5;
                         incoming.suspicionFlags |= existing->second.suspicionFlags;
                         incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
                     }
@@ -2057,6 +2136,11 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 incoming.claimedVehicleId,
                 incoming.observerCount,
                 incoming.rsuReportCount);
+            incoming.rssiVerifiedProbability =
+                (incoming.rssiVerifiedCount + incoming.rssiMismatchCount > 0)
+                    ? static_cast<double>(incoming.rssiVerifiedCount) /
+                          static_cast<double>(incoming.rssiVerifiedCount + incoming.rssiMismatchCount)
+                    : 0.5;
             incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
             auto existing = g_controllerGlobalAwarenessTable.find(incoming.claimedVehicleId);
             bool isNewRecord = (existing == g_controllerGlobalAwarenessTable.end());
@@ -2068,6 +2152,16 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                     incoming.firstSeenTime = existing->second.firstSeenTime;
                     incoming.rsuReportCount += existing->second.rsuReportCount;
                     incoming.observerCount  += existing->second.observerCount;
+                    incoming.rssiVerifiedCount += existing->second.rssiVerifiedCount;
+                    incoming.rssiMismatchCount += existing->second.rssiMismatchCount;
+                    incoming.rssiUnverifiedCount += existing->second.rssiUnverifiedCount;
+                    uint32_t rssiEvidence =
+                        incoming.rssiVerifiedCount + incoming.rssiMismatchCount;
+                    incoming.rssiVerifiedProbability =
+                        (rssiEvidence > 0)
+                            ? static_cast<double>(incoming.rssiVerifiedCount) /
+                                  static_cast<double>(rssiEvidence)
+                            : 0.5;
                     incoming.suspicionFlags |= existing->second.suspicionFlags;
                     incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
                 }
@@ -2659,10 +2753,27 @@ SendRsuControllerReport(uint32_t rsuIndex)
 
         auto& regionalTable = g_rsuRegionalAwarenessTables[rsuIndex];
         RsuControllerBatchAwarenessTag batchTag(rsuIndex);
+        auto sendBatchIfNeeded = [&]() {
+            if (batchTag.GetRecordCount() == 0)
+                return;
+
+            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                      << "[SEND] [RSU2CONTROLLER_REPORT]   "
+                      << "RSU=" << rsuIndex
+                      << " Seq=" << g_seq
+                      << " -> Controller"
+                      << " BatchSize=" << batchTag.GetRecordCount()
+                      << " (batch packet)" << std::endl;
+            SendRsuControllerBatchPacket(sock, controllerIp, batchTag, rsuIndex, g_seq++);
+            batchTag = RsuControllerBatchAwarenessTag(rsuIndex);
+        };
         for (auto it = regionalTable.begin(); it != regionalTable.end(); ++it)
         {
             if (sendSnapshot || it->second.dirty || it->second.lastSeenTime >= windowStart)
             {
+                if (batchTag.GetRecordCount() >= MAX_RSU2CONTROLLER_RECORDS)
+                    sendBatchIfNeeded();
+
                 std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                           << "[SEND] [RSU2CONTROLLER_REPORT]   "
                           << "RSU=" << rsuIndex
@@ -2671,24 +2782,26 @@ SendRsuControllerReport(uint32_t rsuIndex)
                           << " Observers=" << it->second.observerCount
                           << " SuspicionFlags=" << it->second.suspicionFlags
                           << " (batched)" << std::endl;
-                batchTag.AddRecord(it->second);
+                bool added = batchTag.AddRecord(it->second);
+                if (!added)
+                {
+                    sendBatchIfNeeded();
+                    added = batchTag.AddRecord(it->second);
+                }
+                if (!added)
+                {
+                    std::cerr << "[RSU2Controller] ERROR: failed to add awareness record "
+                              << "claimedId=" << it->second.claimedVehicleId
+                              << " after flushing batch." << std::endl;
+                    continue;
+                }
                 it->second.dirty = false;
                 it->second.lastReportedToControllerTime = now;
                 MarkRsuObservationRowsReported(rsuIndex, it->second.claimedVehicleId,
                                                windowStart, now);
             }
         }
-        if (batchTag.GetRecordCount() > 0)
-        {
-            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
-                      << "[SEND] [RSU2CONTROLLER_REPORT]   "
-                      << "RSU=" << rsuIndex
-                      << " Seq=" << g_seq
-                      << " -> Controller"
-                      << " BatchSize=" << batchTag.GetRecordCount()
-                      << " (single batch packet)" << std::endl;
-            SendRsuControllerBatchPacket(sock, controllerIp, batchTag, rsuIndex, g_seq++);
-        }
+        sendBatchIfNeeded();
 
         if (rsuIndex < g_rsuLastControllerAwarenessReportTime.size())
             g_rsuLastControllerAwarenessReportTime[rsuIndex] = now;
@@ -2968,6 +3081,101 @@ ColorAndLabelNodes(AnimationInterface& anim,
 }
 
 // ===========================================================================
+// Config file loader
+// ---------------------------------------------------------------------------
+// Reads a key = value file (INI-style).  Lines starting with '#' or ';' are
+// comments.  Inline '#' comments are also stripped.  Returns a string map.
+// ===========================================================================
+
+static std::map<std::string, std::string>
+ParseConfigFile(const std::string& path)
+{
+    std::map<std::string, std::string> cfg;
+    std::ifstream f(path);
+    if (!f.is_open())
+    {
+        std::cerr << "[config] Cannot open config file: " << path << "\n";
+        return cfg;
+    }
+    std::string line;
+    while (std::getline(f, line))
+    {
+        auto start = line.find_first_not_of(" \t");
+        if (start == std::string::npos) continue;
+        line = line.substr(start);
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+
+        auto kend = key.find_last_not_of(" \t");
+        if (kend != std::string::npos) key = key.substr(0, kend + 1);
+
+        auto vstart = val.find_first_not_of(" \t");
+        auto vend   = val.find_last_not_of(" \t\r\n");
+        val = (vstart != std::string::npos) ? val.substr(vstart, vend - vstart + 1) : "";
+
+        // Strip inline comment
+        auto comment = val.find('#');
+        if (comment != std::string::npos)
+        {
+            val = val.substr(0, comment);
+            auto ve = val.find_last_not_of(" \t");
+            val = (ve != std::string::npos) ? val.substr(0, ve + 1) : "";
+        }
+
+        if (!key.empty()) cfg[key] = val;
+    }
+    std::cout << "[config] Loaded " << cfg.size() << " keys from: " << path << "\n";
+    return cfg;
+}
+
+static void
+ApplyConfigFile(const std::map<std::string, std::string>& cfg)
+{
+    auto getUint = [&](const std::string& k, uint32_t& v) {
+        auto it = cfg.find(k);
+        if (it != cfg.end()) v = static_cast<uint32_t>(std::stoul(it->second));
+    };
+    auto getDouble = [&](const std::string& k, double& v) {
+        auto it = cfg.find(k);
+        if (it != cfg.end()) v = std::stod(it->second);
+    };
+    auto getBool = [&](const std::string& k, bool& v) {
+        auto it = cfg.find(k);
+        if (it != cfg.end()) {
+            const std::string& s = it->second;
+            v = (s == "1" || s == "true" || s == "yes");
+        }
+    };
+
+    getUint  ("N_Vehicles",                      N_Vehicles);
+    getUint  ("N_RSUs",                          N_RSUs);
+    getDouble("simTime",                         simTime);
+    getBool  ("routing_test",                    routing_test);
+    getDouble("beaconInterval",                  beaconInterval);
+    getDouble("rsuReportInterval",               rsuReportInterval);
+    getBool  ("sybil_attack_enabled",            sybil_attack_enabled);
+    getUint  ("sybil_attack_type",               sybil_attack_type);
+    getUint  ("sybil_attack_percentage",         sybil_attack_percentage);
+    getBool  ("controller_malicious_assumption", controller_malicious_assumption);
+    getUint  ("proposed_method",                 proposed_method);
+    getDouble("rsuCoverageRange",                rsuCoverageRange);
+    getDouble("rsuVehicleRecordTimeout",         rsuVehicleRecordTimeout);
+    getDouble("rsuVehicleTableSnapshotInterval", rsuVehicleTableSnapshotInterval);
+    getBool  ("awarenessSnapshotSharingEnabled", awarenessSnapshotSharingEnabled);
+    getUint  ("vehicleSnapshotEveryNReports",    vehicleSnapshotEveryNReports);
+    getUint  ("rsuSnapshotEveryNReports",        rsuSnapshotEveryNReports);
+    getDouble("awarenessReportOverlap",          awarenessReportOverlap);
+    getDouble("vehicleNeighborTimeout",          vehicleNeighborTimeout);
+    getDouble("rsuAwarenessTimeout",             rsuAwarenessTimeout);
+    getDouble("controllerAwarenessTimeout",      controllerAwarenessTimeout);
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 
@@ -2976,7 +3184,24 @@ main(int argc, char* argv[])
 {
     CreateProjectDirectories();
 
+    // -----------------------------------------------------------------------
+    // Config file: pre-scan argv for --config=<path> before CommandLine::Parse
+    // so that command-line args can still override individual config values.
+    // -----------------------------------------------------------------------
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg(argv[i]);
+        const std::string prefix = "--config=";
+        if (arg.rfind(prefix, 0) == 0)
+        {
+            ApplyConfigFile(ParseConfigFile(arg.substr(prefix.size())));
+            break;
+        }
+    }
+
+    std::string configFile = "";  // consumed above; listed here so --help shows it
     CommandLine cmd;
+    cmd.AddValue("config",                     "Path to .cfg scenario file (key=value)",  configFile);
     cmd.AddValue("N_Vehicles",                 "Number of vehicle nodes",                N_Vehicles);
     cmd.AddValue("N_RSUs",                     "Number of RSU edge nodes",               N_RSUs);
     cmd.AddValue("simTime",                    "Simulation time in seconds",             simTime);
@@ -2987,7 +3212,7 @@ main(int argc, char* argv[])
     cmd.AddValue("sybil_attack_type",          "Attack variant 0-6 (see sybil_attacks.h)",sybil_attack_type);
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
-    cmd.AddValue("proposed_method",            "Detection method 0=rule 1=ML 2=FL 3=hybrid",proposed_method);
+    cmd.AddValue("proposed_method",            "Detection method 0=none 1=rule 2=ML 3=FL 4=hybrid",proposed_method);
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
     cmd.AddValue("rsuVehicleRecordTimeout",    "Seconds before an RSU forgets a vehicle",rsuVehicleRecordTimeout);
     cmd.AddValue("rsuVehicleTableSnapshotInterval","Seconds between RSU table CSV snapshots",rsuVehicleTableSnapshotInterval);

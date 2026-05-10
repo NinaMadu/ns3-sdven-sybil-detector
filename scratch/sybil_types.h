@@ -179,6 +179,10 @@ struct RsuRegionalAwarenessRecord
     uint32_t observerCount      = 0;
     uint32_t reportCount        = 0;
     uint32_t suspicionFlags     = SUSPICION_NONE;
+    uint32_t rssiVerifiedCount  = 0;
+    uint32_t rssiMismatchCount  = 0;
+    uint32_t rssiUnverifiedCount = 0;
+    double   rssiVerifiedProbability = 0.5;
     double   lastReportedToControllerTime = -1.0;
     bool     dirty               = true;
 };
@@ -195,6 +199,8 @@ struct RsuVehicleObservationRow
     double   claimedDistance   = 0.0;
     uint32_t receivedBeaconCount = 0;
     uint32_t suspicionFlags      = SUSPICION_NONE;
+    double   rssiEstimatedDistance = -1.0;
+    uint32_t rssiVerificationState = RSSI_UNVERIFIED;
     bool     dirty               = true;  ///< changed since the last RSU→controller export
 };
 
@@ -210,6 +216,10 @@ struct ControllerGlobalAwarenessRecord
     uint32_t rsuReportCount     = 0;
     double   trustScore         = 1.0;
     uint32_t suspicionFlags     = SUSPICION_NONE;
+    uint32_t rssiVerifiedCount  = 0;
+    uint32_t rssiMismatchCount  = 0;
+    uint32_t rssiUnverifiedCount = 0;
+    double   rssiVerifiedProbability = 0.5;
 };
 
 class BsmCoreDataTag : public Tag
