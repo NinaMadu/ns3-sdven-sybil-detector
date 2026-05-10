@@ -90,6 +90,43 @@ Ipv4InterfaceContainer   g_wiredInterfaces;
 uint32_t                 g_seq = 0;
 std::vector<uint32_t>    g_rsuReportCount;   // sized to N_RSUs in main()
 
+// Vehicle ECDSA key material — loaded from vehicle_keys.csv before Simulator::Run().
+std::vector<std::vector<uint8_t>> g_vehiclePrivKeys;  // 32 bytes per vehicle
+std::vector<std::vector<uint8_t>> g_vehiclePubKeys;   // 64 bytes per vehicle
+
+// RSU ECDSA key material + CA-signed certificates — loaded from rsu_keys.csv / ca_keys.csv.
+std::vector<std::vector<uint8_t>> g_rsuPrivKeys;   // 32 bytes per RSU
+std::vector<std::vector<uint8_t>> g_rsuPubKeys;    // 64 bytes per RSU
+std::vector<std::vector<uint8_t>> g_rsuCertSigs;   // 64 bytes per RSU (CA sig)
+std::vector<uint8_t>              g_caPubKey;       // 64 bytes
+
+// Per-vehicle secure-channel state (handshake in progress → established session key).
+std::vector<VehicleChannelState>  g_vehicleChannelState;
+
+// Per-RSU session keys:  g_rsuSessionKeys[rsu_id][vehicle_id] → 32-byte AES-GCM key.
+std::vector<std::map<uint32_t, std::vector<uint8_t>>> g_rsuSessionKeys;
+
+// RSU↔Controller pre-shared symmetric keys — one per RSU, 32 bytes each.
+// Derived offline: SHA-256( ECDH(controller_priv, rsu_pub) ).
+// Used for AES-256-GCM encryption of RSU→Controller reports and
+// Controller→RSU commands (backhaul infrastructure link).
+std::vector<std::vector<uint8_t>> g_rsuCtrlSharedKeys;
+
+// Per-direction replay-protection counters for the RSU↔Controller channel.
+std::vector<uint32_t> g_rsuCtrlTxSeqNums;   // RSU→Controller, per RSU
+std::vector<uint32_t> g_ctrlRsuTxSeqNums;   // Controller→RSU, per RSU
+
+// Registration / token infrastructure globals.
+std::vector<uint8_t>                                          g_tokenMasterKey;
+std::map<uint64_t, uint32_t>                                  g_validVins;
+std::map<uint32_t, std::vector<uint8_t>>                      g_controllerTokenStore;
+std::map<uint32_t, std::vector<uint8_t>>                      g_globalTokenStore;
+std::vector<uint64_t>                                         g_vehicleVins;
+std::vector<std::vector<uint8_t>>                             g_vehicleTokens;
+std::vector<std::map<uint32_t, std::vector<uint8_t>>>         g_vehiclePendingRegNonces;
+std::vector<std::map<uint32_t, std::vector<uint8_t>>>         g_rsuPendingChallenges;
+std::vector<std::map<uint32_t, uint32_t>>                     g_rsuVehicleTxSeqNums;
+
 struct RsuVehicleRecord
 {
     uint32_t realVehicleId;
@@ -1082,15 +1119,391 @@ NS_OBJECT_ENSURE_REGISTERED(RsuControllerRecordTag);
 NS_OBJECT_ENSURE_REGISTERED(RsuControllerAwarenessTag);
 NS_OBJECT_ENSURE_REGISTERED(ControllerRsuCommandTag);
 NS_OBJECT_ENSURE_REGISTERED(RsuControllerBatchAwarenessTag);
+NS_OBJECT_ENSURE_REGISTERED(CtrlSecureTag);
+NS_OBJECT_ENSURE_REGISTERED(RsuVehicleSecureTag);
+NS_OBJECT_ENSURE_REGISTERED(RegChallengeTag);
+NS_OBJECT_ENSURE_REGISTERED(RegRequestTag);
+NS_OBJECT_ENSURE_REGISTERED(RegForwardTag);
+NS_OBJECT_ENSURE_REGISTERED(RegResponseTag);
+NS_OBJECT_ENSURE_REGISTERED(RegConfirmTag);
 
 // ---------------------------------------------------------------------------
 // Filesystem setup
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// EnsureKeyFilesExist — auto-generate CSV key/VIN files when missing or when
+// the recorded node count does not match N_Vehicles / N_RSUs.
+//
+// Called after CommandLine::Parse() so N_Vehicles and N_RSUs are finalised.
+// Uses system() to invoke the Python scripts exactly as documented.
+// ---------------------------------------------------------------------------
+
+static uint32_t
+CountCsvDataLines(const std::string& path)
+{
+    std::ifstream f(path);
+    if (!f.is_open()) return 0;
+    uint32_t lines = 0;
+    std::string line;
+    std::getline(f, line); // skip header
+    while (std::getline(f, line))
+        if (!line.empty()) ++lines;
+    return lines;
+}
+
+static void
+EnsureKeyFilesExist()
+{
+    bool needVehicleKeys = CountCsvDataLines("sybil-attack/inputs/vehicle_keys.csv") < N_Vehicles;
+    bool needRsuKeys     = CountCsvDataLines("sybil-attack/inputs/rsu_keys.csv")     < N_RSUs;
+    bool needVins        = CountCsvDataLines("sybil-attack/inputs/vehicle_vins.csv") < N_Vehicles;
+
+    if (needVehicleKeys)
+    {
+        std::cout << "[Setup] vehicle_keys.csv missing or outdated — generating...\n";
+        std::string cmd = "python3 sybil-attack/security/generate_vehicle_keys.py"
+                          " --vehicles " + std::to_string(N_Vehicles);
+        int ret = system(cmd.c_str());
+        if (ret != 0)
+            std::cerr << "[Setup] WARNING: generate_vehicle_keys.py exited with code " << ret << "\n";
+    }
+
+    if (needRsuKeys)
+    {
+        std::cout << "[Setup] rsu_keys.csv / ca_keys.csv missing or outdated — generating...\n";
+        std::string cmd = "python3 sybil-attack/security/generate_ca_rsu_keys.py"
+                          " --rsus " + std::to_string(N_RSUs);
+        int ret = system(cmd.c_str());
+        if (ret != 0)
+            std::cerr << "[Setup] WARNING: generate_ca_rsu_keys.py exited with code " << ret << "\n";
+    }
+
+    if (needVins)
+    {
+        std::cout << "[Setup] vehicle_vins.csv / token_master_key.csv missing or outdated"
+                     " — generating...\n";
+        std::string cmd = "python3 sybil-attack/security/generate_vehicle_vins.py"
+                          " --vehicles " + std::to_string(N_Vehicles);
+        int ret = system(cmd.c_str());
+        if (ret != 0)
+            std::cerr << "[Setup] WARNING: generate_vehicle_vins.py exited with code " << ret << "\n";
+    }
+
+    if (!needVehicleKeys && !needRsuKeys && !needVins)
+        std::cout << "[Setup] All key/VIN CSV files present and up-to-date.\n";
+}
+
 static void
 CreateProjectDirectories()
 {
     system("mkdir -p sybil-attack/inputs sybil-attack/outputs");
+}
+
+// ---------------------------------------------------------------------------
+// LoadVehicleKeys — reads sybil-attack/inputs/vehicle_keys.csv generated by
+// sybil-attack/security/generate_vehicle_keys.py and populates
+// g_vehiclePrivKeys[v] (32 bytes) and g_vehiclePubKeys[v] (64 bytes).
+// Must be called after N_Vehicles is known and before Simulator::Run().
+// ---------------------------------------------------------------------------
+
+static void
+LoadVehicleKeys()
+{
+    const std::string csvPath = "sybil-attack/inputs/vehicle_keys.csv";
+    std::ifstream file(csvPath);
+    if (!file.is_open())
+    {
+        std::cerr << "[Security] WARNING: " << csvPath
+                  << " not found. V2V signatures disabled.\n"
+                  << "  Run: python3 sybil-attack/security/generate_vehicle_keys.py"
+                  << " --vehicles " << N_Vehicles << "\n";
+        g_vehiclePrivKeys.assign(N_Vehicles, {});
+        g_vehiclePubKeys.assign(N_Vehicles, {});
+        return;
+    }
+
+    g_vehiclePrivKeys.assign(N_Vehicles, {});
+    g_vehiclePubKeys.assign(N_Vehicles, {});
+
+    // Strip trailing whitespace / \r from a string
+    auto trim = [](std::string s) -> std::string {
+        while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' '))
+            s.pop_back();
+        return s;
+    };
+
+    std::string line;
+    std::getline(file, line);  // skip header
+    while (std::getline(file, line))
+    {
+        line = trim(line);
+        if (line.empty()) continue;
+
+        std::istringstream ss(line);
+        std::string token;
+        std::vector<std::string> fields;
+        while (std::getline(ss, token, ','))
+            fields.push_back(trim(token));
+        if (fields.size() < 3) continue;
+
+        uint32_t vId = static_cast<uint32_t>(std::stoul(fields[0]));
+        if (vId >= N_Vehicles) continue;
+
+        auto pub  = CryptoHexToBytes(fields[1]);  // 64 bytes
+        auto priv = CryptoHexToBytes(fields[2]);  // 32 bytes
+        if (pub.size() == 64 && priv.size() == 32)
+        {
+            g_vehiclePubKeys[vId]  = pub;
+            g_vehiclePrivKeys[vId] = priv;
+        }
+        else
+        {
+            std::cerr << "[Security] Bad key length for vehicle " << vId
+                      << " (pub=" << pub.size() << " priv=" << priv.size() << ")\n";
+        }
+    }
+
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < N_Vehicles; ++i)
+        if (!g_vehiclePrivKeys[i].empty()) ++loaded;
+
+    std::cout << "[Security] Loaded ECDSA keys for " << loaded
+              << "/" << N_Vehicles << " vehicles.\n";
+}
+
+// ---------------------------------------------------------------------------
+// LoadCaAndRsuKeys — reads ca_keys.csv and rsu_keys.csv generated by
+// generate_ca_rsu_keys.py.  Populates g_caPubKey, g_rsuPrivKeys,
+// g_rsuPubKeys, g_rsuCertSigs, and initialises g_vehicleChannelState /
+// g_rsuSessionKeys to the right size.
+// ---------------------------------------------------------------------------
+
+static void
+LoadCaAndRsuKeys()
+{
+    auto trim = [](std::string s) -> std::string {
+        while (!s.empty() &&
+               (s.back() == '\r' || s.back() == '\n' || s.back() == ' '))
+            s.pop_back();
+        return s;
+    };
+
+    // ── CA public key ─────────────────────────────────────────────────────
+    {
+        std::ifstream f("sybil-attack/inputs/ca_keys.csv");
+        if (!f.is_open())
+        {
+            std::cerr << "[Security] ERROR: cannot open sybil-attack/inputs/ca_keys.csv\n";
+        }
+        else
+        {
+            std::string line;
+            std::getline(f, line);  // skip header
+            if (std::getline(f, line))
+            {
+                line = trim(line);
+                std::istringstream ss(line);
+                std::string pubHex, privHex;
+                std::getline(ss, pubHex,  ',');
+                std::getline(ss, privHex, ',');
+                g_caPubKey = CryptoHexToBytes(trim(pubHex));
+                if (g_caPubKey.size() != 64)
+                {
+                    std::cerr << "[Security] Bad CA public key length: "
+                              << g_caPubKey.size() << "\n";
+                    g_caPubKey.clear();
+                }
+                else
+                {
+                    std::cout << "[Security] CA public key loaded (64 bytes).\n";
+                }
+            }
+        }
+    }
+
+    // ── RSU keypairs + certificates + Controller shared keys ──────────────
+    g_rsuPrivKeys    .assign(N_RSUs, {});
+    g_rsuPubKeys     .assign(N_RSUs, {});
+    g_rsuCertSigs    .assign(N_RSUs, {});
+    g_rsuCtrlSharedKeys.assign(N_RSUs, {});
+
+    {
+        std::ifstream f("sybil-attack/inputs/rsu_keys.csv");
+        if (!f.is_open())
+        {
+            std::cerr << "[Security] ERROR: cannot open sybil-attack/inputs/rsu_keys.csv\n";
+        }
+        else
+        {
+            std::string line;
+            std::getline(f, line);  // skip header
+            while (std::getline(f, line))
+            {
+                line = trim(line);
+                if (line.empty()) continue;
+                std::istringstream ss(line);
+                std::string idStr, pubHex, privHex, certHex, ctrlKeyHex;
+                std::getline(ss, idStr,      ',');
+                std::getline(ss, pubHex,     ',');
+                std::getline(ss, privHex,    ',');
+                std::getline(ss, certHex,    ',');
+                std::getline(ss, ctrlKeyHex, ',');
+
+                uint32_t rId = static_cast<uint32_t>(std::stoul(trim(idStr)));
+                if (rId >= N_RSUs) continue;
+
+                auto pub     = CryptoHexToBytes(trim(pubHex));
+                auto priv    = CryptoHexToBytes(trim(privHex));
+                auto cert    = CryptoHexToBytes(trim(certHex));
+                auto ctrlKey = CryptoHexToBytes(trim(ctrlKeyHex));
+
+                if (pub.size() == 64 && priv.size() == 32 &&
+                    cert.size() == 64 && ctrlKey.size() == 32)
+                {
+                    g_rsuPubKeys      [rId] = pub;
+                    g_rsuPrivKeys     [rId] = priv;
+                    g_rsuCertSigs     [rId] = cert;
+                    g_rsuCtrlSharedKeys[rId] = ctrlKey;
+                }
+                else
+                {
+                    std::cerr << "[Security] Bad key length for RSU " << rId
+                              << " (pub=" << pub.size()
+                              << " priv=" << priv.size()
+                              << " cert=" << cert.size()
+                              << " ctrlKey=" << ctrlKey.size() << ")\n";
+                }
+            }
+        }
+    }
+
+    uint32_t loaded = 0;
+    uint32_t ctrlLoaded = 0;
+    for (uint32_t i = 0; i < N_RSUs; ++i)
+    {
+        if (!g_rsuPrivKeys[i].empty())     ++loaded;
+        if (!g_rsuCtrlSharedKeys[i].empty()) ++ctrlLoaded;
+    }
+    std::cout << "[Security] Loaded RSU keys for " << loaded
+              << "/" << N_RSUs << " RSUs.\n";
+    std::cout << "[Security] Loaded RSU↔Controller shared keys for " << ctrlLoaded
+              << "/" << N_RSUs << " RSUs.\n";
+
+    // ── Initialise per-vehicle and per-RSU channel state ──────────────────
+    g_vehicleChannelState.assign(N_Vehicles, VehicleChannelState{});
+    g_rsuSessionKeys.assign(N_RSUs, std::map<uint32_t, std::vector<uint8_t>>{});
+
+    // ── Initialise RSU↔Controller sequence counters ───────────────────────
+    g_rsuCtrlTxSeqNums.assign(N_RSUs, 0u);
+    g_ctrlRsuTxSeqNums.assign(N_RSUs, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// LoadVinData — reads vehicle_vins.csv, valid_vins.csv, token_master_key.csv
+// and initialises registration / token globals.
+// Must be called after N_Vehicles and N_RSUs are known.
+// ---------------------------------------------------------------------------
+
+static void
+LoadVinData()
+{
+    auto trim = [](std::string s) -> std::string {
+        while (!s.empty() &&
+               (s.back() == '\r' || s.back() == '\n' || s.back() == ' '))
+            s.pop_back();
+        return s;
+    };
+
+    // ── Vehicle VINs ──────────────────────────────────────────────────────
+    g_vehicleVins.assign(N_Vehicles, 0ULL);
+    {
+        std::ifstream f("sybil-attack/inputs/vehicle_vins.csv");
+        if (!f.is_open())
+        {
+            std::cerr << "[Security] WARNING: vehicle_vins.csv not found. VINs will be 0.\n"
+                      << "  Run: python3 sybil-attack/security/generate_vehicle_vins.py"
+                      << " --vehicles " << N_Vehicles << "\n";
+        }
+        else
+        {
+            std::string line;
+            std::getline(f, line);  // skip header
+            while (std::getline(f, line))
+            {
+                line = trim(line);
+                if (line.empty()) continue;
+                std::istringstream ss(line);
+                std::string vidStr, vinHex;
+                std::getline(ss, vidStr, ',');
+                std::getline(ss, vinHex, ',');
+                uint32_t vid = static_cast<uint32_t>(std::stoul(trim(vidStr)));
+                if (vid < N_Vehicles)
+                    g_vehicleVins[vid] = std::stoull(trim(vinHex), nullptr, 16);
+            }
+            std::cout << "[Security] Vehicle VINs loaded for " << N_Vehicles << " vehicles.\n";
+        }
+    }
+
+    // ── Valid VIN whitelist ───────────────────────────────────────────────
+    {
+        std::ifstream f("sybil-attack/inputs/valid_vins.csv");
+        if (!f.is_open())
+        {
+            std::cerr << "[Security] WARNING: valid_vins.csv not found.\n";
+        }
+        else
+        {
+            std::string line;
+            std::getline(f, line);  // skip header
+            while (std::getline(f, line))
+            {
+                line = trim(line);
+                if (line.empty()) continue;
+                std::istringstream ss(line);
+                std::string vidStr, vinHex;
+                std::getline(ss, vidStr, ',');
+                std::getline(ss, vinHex, ',');
+                uint32_t vid = static_cast<uint32_t>(std::stoul(trim(vidStr)));
+                uint64_t vin = std::stoull(trim(vinHex), nullptr, 16);
+                g_validVins[vin] = vid;
+            }
+            std::cout << "[Security] Valid VIN whitelist loaded (" << g_validVins.size() << " entries).\n";
+        }
+    }
+
+    // ── Token master key ─────────────────────────────────────────────────
+    {
+        std::ifstream f("sybil-attack/inputs/token_master_key.csv");
+        if (!f.is_open())
+        {
+            std::cerr << "[Security] WARNING: token_master_key.csv not found.\n";
+        }
+        else
+        {
+            std::string line;
+            std::getline(f, line);  // skip header
+            if (std::getline(f, line))
+            {
+                line = trim(line);
+                g_tokenMasterKey = CryptoHexToBytes(line);
+                if (g_tokenMasterKey.size() == 32)
+                    std::cout << "[Security] Token master key loaded (32 bytes).\n";
+                else
+                {
+                    std::cerr << "[Security] Bad token master key length: "
+                              << g_tokenMasterKey.size() << "\n";
+                    g_tokenMasterKey.clear();
+                }
+            }
+        }
+    }
+
+    // ── Per-vehicle and per-RSU runtime state ─────────────────────────────
+    g_vehicleTokens.assign(N_Vehicles, {});
+    g_vehiclePendingRegNonces.assign(N_Vehicles, {});
+    g_rsuPendingChallenges.assign(N_RSUs, {});
+    g_rsuVehicleTxSeqNums.assign(N_RSUs, {});
 }
 
 static void
@@ -1918,6 +2331,46 @@ PurgeStaleControllerGlobalAwarenessRecords()
     }
 }
 
+// ---------------------------------------------------------------------------
+// BuildCtrlAad — 12-byte AAD for the RSU↔Controller AES-256-GCM channel.
+//   rsuId:     RSU endpoint identifier (big-endian 4 bytes)
+//   direction: 0 = RSU→Controller, 1 = Controller→RSU (big-endian 4 bytes)
+//   seqNum:    per-direction replay-protection counter (big-endian 4 bytes)
+// Declared here (before both handler functions that call it).
+// The identical definition placed after BuildV2RsuAad is removed in favour of this one.
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t>
+BuildCtrlAad(uint32_t rsuId, uint32_t direction, uint32_t seqNum)
+{
+    std::vector<uint8_t> aad(12);
+    aad[0]  = (rsuId     >> 24) & 0xFF; aad[1]  = (rsuId     >> 16) & 0xFF;
+    aad[2]  = (rsuId     >>  8) & 0xFF; aad[3]  =  rsuId            & 0xFF;
+    aad[4]  = (direction >> 24) & 0xFF; aad[5]  = (direction >> 16) & 0xFF;
+    aad[6]  = (direction >>  8) & 0xFF; aad[7]  =  direction        & 0xFF;
+    aad[8]  = (seqNum    >> 24) & 0xFF; aad[9]  = (seqNum    >> 16) & 0xFF;
+    aad[10] = (seqNum    >>  8) & 0xFF; aad[11] =  seqNum           & 0xFF;
+    return aad;
+}
+
+// ---------------------------------------------------------------------------
+// BuildRsuVehicleAad — 12-byte AAD for the RSU→Vehicle AES-256-GCM channel.
+// rsuId-first order (opposite of BuildV2RsuAad) prevents cross-direction replay.
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t>
+BuildRsuVehicleAad(uint32_t rsuId, uint32_t vehicleId, uint32_t seqNum)
+{
+    std::vector<uint8_t> aad(12);
+    aad[0]  = (rsuId     >> 24) & 0xFF; aad[1]  = (rsuId     >> 16) & 0xFF;
+    aad[2]  = (rsuId     >>  8) & 0xFF; aad[3]  =  rsuId            & 0xFF;
+    aad[4]  = (vehicleId >> 24) & 0xFF; aad[5]  = (vehicleId >> 16) & 0xFF;
+    aad[6]  = (vehicleId >>  8) & 0xFF; aad[7]  =  vehicleId        & 0xFF;
+    aad[8]  = (seqNum    >> 24) & 0xFF; aad[9]  = (seqNum    >> 16) & 0xFF;
+    aad[10] = (seqNum    >>  8) & 0xFF; aad[11] =  seqNum           & 0xFF;
+    return aad;
+}
+
 static bool
 SelectControllerTargetForRsu(uint32_t rsuIndex, ControllerVehicleRecord& target)
 {
@@ -1935,6 +2388,33 @@ SelectControllerTargetForRsu(uint32_t rsuIndex, ControllerVehicleRecord& target)
             target = record;
             newest = record.lastSeenTime;
             found = true;
+        }
+    }
+
+    // Fallback to global awareness table — this is the primary source when the
+    // batch-awareness RSU report path is active (which populates the global table
+    // rather than the legacy single-record vehicle table).
+    if (!found)
+    {
+        for (auto it = g_controllerGlobalAwarenessTable.begin();
+             it != g_controllerGlobalAwarenessTable.end(); ++it)
+        {
+            const ControllerGlobalAwarenessRecord& rec = it->second;
+            if (rec.lastServingRsuId == rsuIndex &&
+                rec.realVehicleId < g_vehicleNodes.GetN() &&
+                (!found || rec.lastSeenTime > newest))
+            {
+                target.realVehicleId    = rec.realVehicleId;
+                target.claimedVehicleId = rec.claimedVehicleId;
+                target.servingRsuId     = rec.lastServingRsuId;
+                target.lastSeenTime     = rec.lastSeenTime;
+                target.lastPosition     = Vector(rec.lastBsm.positionX,
+                                                 rec.lastBsm.positionY,
+                                                 rec.lastBsm.positionZ);
+                target.distanceToRsu    = 0.0;
+                newest                  = rec.lastSeenTime;
+                found = true;
+            }
         }
     }
 
@@ -1967,6 +2447,332 @@ SelectControllerTargetForRsu(uint32_t rsuIndex, ControllerVehicleRecord& target)
     return found;
 }
 
+// ---------------------------------------------------------------------------
+// Registration protocol — forward declarations (functions call each other)
+// ---------------------------------------------------------------------------
+static void SendRegChallenge(uint32_t rsuIndex,  uint32_t vehicleIndex);
+static void SendRegRequest  (uint32_t vehicleIndex, uint32_t rsuIndex, const std::vector<uint8_t>& nonce);
+static void SendRegForward  (uint32_t rsuIndex,  uint32_t vehicleId, uint64_t vin,
+                             double gpsX, double gpsY, double ts);
+static void SendRegResponse (uint32_t originRsuIndex, uint32_t vehicleId,
+                             const std::vector<uint8_t>& token);
+static void SendRegConfirm  (uint32_t rsuIndex,  uint32_t vehicleIndex,
+                             const std::vector<uint8_t>& token);
+
+// ---------------------------------------------------------------------------
+// SendRegChallenge — RSU sends a 32-byte nonce to vehicle, encrypted with
+// RsuVehicleSecureTag (RSU→Vehicle AES-256-GCM channel).
+// ---------------------------------------------------------------------------
+static void
+SendRegChallenge(uint32_t rsuIndex, uint32_t vehicleIndex)
+{
+    if (rsuIndex >= N_RSUs || vehicleIndex >= N_Vehicles) return;
+    if (rsuIndex >= g_rsuSessionKeys.size()) return;
+
+    auto it = g_rsuSessionKeys[rsuIndex].find(vehicleIndex);
+    if (it == g_rsuSessionKeys[rsuIndex].end() || it->second.empty())
+    {
+        std::cout << "[Reg] RSU " << rsuIndex << " has no session key for vehicle "
+                  << vehicleIndex << " — cannot send REG_CHALLENGE\n";
+        return;
+    }
+    const std::vector<uint8_t>& sessionKey = it->second;
+
+    // Build challenge payload and encrypt.
+    RegChallengeTag challengeTag;
+    std::vector<uint8_t> nonce = CryptoRandBytes(32);
+    std::memcpy(challengeTag.nonce, nonce.data(), 32);
+
+    // Store nonce so RSU can verify it later.
+    g_rsuPendingChallenges[rsuIndex][vehicleIndex] = nonce;
+
+    // Serialize tag into plaintext.
+    uint32_t ptSz = challengeTag.GetSerializedSize();
+    std::vector<uint8_t> plaintext(ptSz);
+    TagBuffer tb(plaintext.data(), plaintext.data() + ptSz);
+    challengeTag.Serialize(tb);
+
+    // Envelope: RsuVehicleSecureTag.
+    uint32_t seq = g_rsuVehicleTxSeqNums[rsuIndex][vehicleIndex]++;
+    std::vector<uint8_t> iv = CryptoRandBytes(12);
+    std::vector<uint8_t> aad = BuildRsuVehicleAad(rsuIndex, vehicleIndex, seq);
+    std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(sessionKey, iv, plaintext, aad);
+    if (ciphertext.empty()) { std::cerr << "[Reg] REG_CHALLENGE encrypt failed\n"; return; }
+
+    RsuVehicleSecureTag envTag;
+    envTag.rsuId     = rsuIndex;
+    envTag.vehicleId = vehicleIndex;
+    envTag.seqNum    = seq;
+    std::memcpy(envTag.iv, iv.data(), 12);
+
+    Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
+    pkt->AddPacketTag(envTag);
+    SybilPacketTag sybTag(rsuIndex, rsuIndex, vehicleIndex,
+                          static_cast<uint32_t>(REG_CHALLENGE), ++g_seq,
+                          0.0, 0.0, 0.0, rsuIndex);
+    pkt->AddPacketTag(sybTag);
+
+    Ipv4Address vAddr = g_wirelessInterfaces.GetAddress(vehicleIndex);
+    Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
+    sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
+    MetricsOnTransmit(1);
+
+    std::cout << "[Reg] RSU " << rsuIndex << " → Vehicle " << vehicleIndex
+              << "  REG_CHALLENGE sent\n";
+}
+
+// ---------------------------------------------------------------------------
+// SendRegRequest — Vehicle sends VIN+GPS+timestamp+nonce to RSU, encrypted
+// with the V2RSU session key (SecureChannelTag).
+// ---------------------------------------------------------------------------
+static void
+SendRegRequest(uint32_t vehicleIndex, uint32_t rsuIndex, const std::vector<uint8_t>& nonce)
+{
+    if (vehicleIndex >= N_Vehicles || rsuIndex >= N_RSUs) return;
+    if (vehicleIndex >= g_vehicleChannelState.size()) return;
+
+    auto& state = g_vehicleChannelState[vehicleIndex];
+    auto it = state.sessionKeys.find(rsuIndex);
+    if (it == state.sessionKeys.end() || it->second.empty())
+    {
+        std::cout << "[Reg] Vehicle " << vehicleIndex << " has no session key with RSU "
+                  << rsuIndex << " — cannot send REG_REQUEST\n";
+        return;
+    }
+    const std::vector<uint8_t>& sessionKey = it->second;
+
+    // Gather position.
+    double gpsX = 0.0, gpsY = 0.0;
+    if (vehicleIndex < g_vehicleNodes.GetN())
+    {
+        Ptr<MobilityModel> mob = g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>();
+        if (mob) { Vector p = mob->GetPosition(); gpsX = p.x; gpsY = p.y; }
+    }
+
+    RegRequestTag reqTag;
+    reqTag.vehicleId = vehicleIndex;
+    reqTag.SetVin(vehicleIndex < g_vehicleVins.size() ? g_vehicleVins[vehicleIndex] : 0ULL);
+    reqTag.gpsX      = gpsX;
+    reqTag.gpsY      = gpsY;
+    reqTag.timestamp = Simulator::Now().GetSeconds();
+    std::memcpy(reqTag.nonce, nonce.data(), 32);
+
+    // Store nonce so we recognise the challenge source RSU.
+    g_vehiclePendingRegNonces[vehicleIndex][rsuIndex] = nonce;
+
+    uint32_t ptSz = reqTag.GetSerializedSize();
+    std::vector<uint8_t> plaintext(ptSz);
+    TagBuffer tb(plaintext.data(), plaintext.data() + ptSz);
+    reqTag.Serialize(tb);
+
+    // Reuse the V2RSU SecureChannelTag envelope.
+    uint32_t seq = state.txSeqNums[rsuIndex]++;
+    std::vector<uint8_t> iv = CryptoRandBytes(12);
+
+    // BuildV2RsuAad is defined later in the file — include its logic inline.
+    std::vector<uint8_t> aad(12);
+    aad[0]=(vehicleIndex>>24)&0xFF; aad[1]=(vehicleIndex>>16)&0xFF;
+    aad[2]=(vehicleIndex>> 8)&0xFF; aad[3]= vehicleIndex     &0xFF;
+    aad[4]=(rsuIndex    >>24)&0xFF; aad[5]=(rsuIndex    >>16)&0xFF;
+    aad[6]=(rsuIndex    >> 8)&0xFF; aad[7]= rsuIndex         &0xFF;
+    aad[8]=(seq         >>24)&0xFF; aad[9]=(seq         >>16)&0xFF;
+    aad[10]=(seq        >> 8)&0xFF; aad[11]=seq              &0xFF;
+
+    std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(sessionKey, iv, plaintext, aad);
+    if (ciphertext.empty()) { std::cerr << "[Reg] REG_REQUEST encrypt failed\n"; return; }
+
+    SecureChannelTag scTag;
+    scTag.vehicleId = vehicleIndex;
+    scTag.rsuId     = rsuIndex;
+    scTag.seqNum    = seq;
+    std::memcpy(scTag.iv, iv.data(), 12);
+
+    Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
+    pkt->AddPacketTag(scTag);
+    SybilPacketTag sybTag(vehicleIndex, vehicleIndex, rsuIndex,
+                          static_cast<uint32_t>(REG_REQUEST), ++g_seq,
+                          0.0, 0.0, 0.0, vehicleIndex);
+    pkt->AddPacketTag(sybTag);
+
+    // Send to RSU's wireless interface (same subnet as vehicles).
+    uint32_t rsuWirelessIdx = g_vehicleNodes.GetN() + rsuIndex;
+    Ipv4Address rsuAddr = g_wirelessInterfaces.GetAddress(rsuWirelessIdx);
+    Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
+    sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
+    MetricsOnTransmit(1);
+
+    std::cout << "[Reg] Vehicle " << vehicleIndex << " → RSU " << rsuIndex
+              << "  REG_REQUEST sent\n";
+}
+
+// ---------------------------------------------------------------------------
+// SendRegForward — RSU forwards registration info to controller via the
+// encrypted RSU→Controller backhaul (CtrlSecureTag, direction=0).
+// ---------------------------------------------------------------------------
+static void
+SendRegForward(uint32_t rsuIndex, uint32_t vehicleId, uint64_t vin,
+               double gpsX, double gpsY, double ts)
+{
+    if (rsuIndex >= N_RSUs) return;
+    if (rsuIndex >= g_rsuCtrlSharedKeys.size() || g_rsuCtrlSharedKeys[rsuIndex].empty())
+    {
+        std::cerr << "[Reg] RSU " << rsuIndex << " has no ctrl shared key\n"; return;
+    }
+    const std::vector<uint8_t>& key = g_rsuCtrlSharedKeys[rsuIndex];
+
+    RegForwardTag fwdTag;
+    fwdTag.vehicleId = vehicleId;
+    fwdTag.rsuId     = rsuIndex;
+    fwdTag.SetVin(vin);
+    fwdTag.gpsX      = gpsX;
+    fwdTag.gpsY      = gpsY;
+    fwdTag.timestamp = ts;
+
+    uint32_t ptSz = fwdTag.GetSerializedSize();
+    std::vector<uint8_t> plaintext(ptSz);
+    TagBuffer tb(plaintext.data(), plaintext.data() + ptSz);
+    fwdTag.Serialize(tb);
+
+    uint32_t seq = g_rsuCtrlTxSeqNums[rsuIndex]++;
+    std::vector<uint8_t> iv  = CryptoRandBytes(12);
+    std::vector<uint8_t> aad = BuildCtrlAad(rsuIndex, 0, seq);
+    std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(key, iv, plaintext, aad);
+    if (ciphertext.empty()) { std::cerr << "[Reg] REG_FORWARD encrypt failed\n"; return; }
+
+    CtrlSecureTag csTag;
+    csTag.rsuId     = rsuIndex;
+    csTag.direction = 0;
+    csTag.seqNum    = seq;
+    std::memcpy(csTag.iv, iv.data(), 12);
+
+    Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
+    pkt->AddPacketTag(csTag);
+    SybilPacketTag sybTag(rsuIndex, rsuIndex, N_Vehicles + N_RSUs,
+                          static_cast<uint32_t>(REG_FORWARD), ++g_seq,
+                          0.0, 0.0, 0.0, rsuIndex);
+    pkt->AddPacketTag(sybTag);
+
+    Ipv4Address ctrlAddr = g_wiredInterfaces.GetAddress(N_RSUs);
+    Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
+    sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
+    MetricsOnTransmit(1);
+
+    std::cout << "[Reg] RSU " << rsuIndex << " → Controller  REG_FORWARD vehicle="
+              << vehicleId << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// SendRegResponse — Controller sends token back to the originating RSU via
+// the encrypted Controller→RSU backhaul (CtrlSecureTag, direction=1).
+// ---------------------------------------------------------------------------
+static void
+SendRegResponse(uint32_t originRsuIndex, uint32_t vehicleId,
+                const std::vector<uint8_t>& token)
+{
+    if (originRsuIndex >= N_RSUs) return;
+    if (originRsuIndex >= g_rsuCtrlSharedKeys.size() ||
+        g_rsuCtrlSharedKeys[originRsuIndex].empty())
+    {
+        std::cerr << "[Reg] Controller has no ctrl shared key for RSU " << originRsuIndex << "\n";
+        return;
+    }
+    const std::vector<uint8_t>& key = g_rsuCtrlSharedKeys[originRsuIndex];
+
+    RegResponseTag respTag;
+    respTag.vehicleId   = vehicleId;
+    respTag.originRsuId = originRsuIndex;
+    std::memcpy(respTag.token, token.data(), 32);
+
+    uint32_t ptSz = respTag.GetSerializedSize();
+    std::vector<uint8_t> plaintext(ptSz);
+    TagBuffer tb(plaintext.data(), plaintext.data() + ptSz);
+    respTag.Serialize(tb);
+
+    uint32_t seq = g_ctrlRsuTxSeqNums[originRsuIndex]++;
+    std::vector<uint8_t> iv  = CryptoRandBytes(12);
+    std::vector<uint8_t> aad = BuildCtrlAad(originRsuIndex, 1, seq);
+    std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(key, iv, plaintext, aad);
+    if (ciphertext.empty()) { std::cerr << "[Reg] REG_RESPONSE encrypt failed\n"; return; }
+
+    CtrlSecureTag csTag;
+    csTag.rsuId     = originRsuIndex;
+    csTag.direction = 1;
+    csTag.seqNum    = seq;
+    std::memcpy(csTag.iv, iv.data(), 12);
+
+    Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
+    pkt->AddPacketTag(csTag);
+    SybilPacketTag sybTag(N_Vehicles + N_RSUs, N_Vehicles + N_RSUs, originRsuIndex,
+                          static_cast<uint32_t>(REG_RESPONSE), ++g_seq,
+                          0.0, 0.0, 0.0, N_Vehicles + N_RSUs);
+    pkt->AddPacketTag(sybTag);
+
+    Ipv4Address rsuAddr = g_wiredInterfaces.GetAddress(originRsuIndex);
+    Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
+    sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
+    MetricsOnTransmit(1);
+
+    std::cout << "[Reg] Controller → RSU " << originRsuIndex
+              << "  REG_RESPONSE vehicle=" << vehicleId << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// SendRegConfirm — RSU delivers token to vehicle, encrypted with
+// RsuVehicleSecureTag (RSU→Vehicle AES-256-GCM channel).
+// ---------------------------------------------------------------------------
+static void
+SendRegConfirm(uint32_t rsuIndex, uint32_t vehicleIndex,
+               const std::vector<uint8_t>& token)
+{
+    if (rsuIndex >= N_RSUs || vehicleIndex >= N_Vehicles) return;
+    if (rsuIndex >= g_rsuSessionKeys.size()) return;
+
+    auto it = g_rsuSessionKeys[rsuIndex].find(vehicleIndex);
+    if (it == g_rsuSessionKeys[rsuIndex].end() || it->second.empty())
+    {
+        std::cout << "[Reg] RSU " << rsuIndex << " has no session key for vehicle "
+                  << vehicleIndex << " — cannot send REG_CONFIRM\n";
+        return;
+    }
+    const std::vector<uint8_t>& sessionKey = it->second;
+
+    RegConfirmTag confirmTag;
+    confirmTag.vehicleId = vehicleIndex;
+    std::memcpy(confirmTag.token, token.data(), 32);
+
+    uint32_t ptSz = confirmTag.GetSerializedSize();
+    std::vector<uint8_t> plaintext(ptSz);
+    TagBuffer tb(plaintext.data(), plaintext.data() + ptSz);
+    confirmTag.Serialize(tb);
+
+    uint32_t seq = g_rsuVehicleTxSeqNums[rsuIndex][vehicleIndex]++;
+    std::vector<uint8_t> iv = CryptoRandBytes(12);
+    std::vector<uint8_t> aad = BuildRsuVehicleAad(rsuIndex, vehicleIndex, seq);
+    std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(sessionKey, iv, plaintext, aad);
+    if (ciphertext.empty()) { std::cerr << "[Reg] REG_CONFIRM encrypt failed\n"; return; }
+
+    RsuVehicleSecureTag envTag;
+    envTag.rsuId     = rsuIndex;
+    envTag.vehicleId = vehicleIndex;
+    envTag.seqNum    = seq;
+    std::memcpy(envTag.iv, iv.data(), 12);
+
+    Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
+    pkt->AddPacketTag(envTag);
+    SybilPacketTag sybTag(rsuIndex, rsuIndex, vehicleIndex,
+                          static_cast<uint32_t>(REG_CONFIRM), ++g_seq,
+                          0.0, 0.0, 0.0, rsuIndex);
+    pkt->AddPacketTag(sybTag);
+
+    Ipv4Address vAddr = g_wirelessInterfaces.GetAddress(vehicleIndex);
+    Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
+    sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
+    MetricsOnTransmit(1);
+
+    std::cout << "[Reg] RSU " << rsuIndex << " → Vehicle " << vehicleIndex
+              << "  REG_CONFIRM (token delivered)\n";
+}
+
 static void
 HandleRsuControllerRecordPayload(const std::string& receiverRole,
                                  Ptr<const Packet> packet,
@@ -1980,6 +2786,81 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
 
     if (msgType == static_cast<uint32_t>(RSU2CONTROLLER_REPORT))
     {
+        // ── Encrypted path: CtrlSecureTag present (direction == 0 = RSU→CTRL) ──
+        CtrlSecureTag inCsTag;
+        if (packet->PeekPacketTag(inCsTag) && inCsTag.direction == 0)
+        {
+            uint32_t rIdx = inCsTag.rsuId;
+            if (rIdx >= g_rsuCtrlSharedKeys.size() || g_rsuCtrlSharedKeys[rIdx].empty())
+            {
+                std::cerr << "[Security] RSU2CTRL: no ctrl key for RSU=" << rIdx << "\n";
+                return;
+            }
+            std::vector<uint8_t> iv(inCsTag.iv, inCsTag.iv + 12);
+            std::vector<uint8_t> aad = BuildCtrlAad(rIdx, 0, inCsTag.seqNum);
+
+            uint32_t pktSz = packet->GetSize();
+            std::vector<uint8_t> enc(pktSz);
+            packet->CopyData(enc.data(), pktSz);
+
+            std::vector<uint8_t> plain =
+                CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
+            if (plain.empty())
+            {
+                std::cerr << "[Security] RSU2CTRL GCM auth FAILED RSU=" << rIdx << "\n";
+                return;
+            }
+
+            RsuControllerBatchAwarenessTag batchTag;
+            TagBuffer dtb(plain.data(), plain.data() + plain.size());
+            batchTag.Deserialize(dtb);
+            std::cout << "[Security] RSU2CTRL decrypted OK RSU=" << rIdx
+                      << " records=" << batchTag.GetRecordCount() << "\n";
+
+            PurgeStaleControllerGlobalAwarenessRecords();
+            for (uint32_t n = 0; n < batchTag.GetRecordCount(); ++n)
+            {
+                const auto& p = batchTag.GetRecord(n);
+                ControllerGlobalAwarenessRecord incoming;
+                incoming.claimedVehicleId = p.claimedVehicleId;
+                incoming.realVehicleId    = p.realVehicleId;
+                incoming.lastServingRsuId = p.servingRsuId;
+                incoming.firstSeenTime    = p.firstSeenTime;
+                incoming.lastSeenTime     = p.lastSeenTime;
+                incoming.lastBsm          = p.lastBsm;
+                incoming.observerCount    = p.observerCount;
+                incoming.rsuReportCount   = p.reportCount;
+                incoming.suspicionFlags   = p.suspicionFlags;
+                incoming.suspicionFlags  |= EvaluateTemporalBurstSignature(
+                    p.servingRsuId, p.claimedVehicleId, p.lastSeenTime,
+                    p.lastBsm.positionX, p.lastBsm.positionY,
+                    g_sdnFirstSeenClaimedIdsByRsu, g_sdnTemporalNewIdEventsByRsu, "SDN");
+                incoming.suspicionFlags  |= EvaluateUncorroboratedRsuApproval(
+                    p.servingRsuId, p.claimedVehicleId, p.observerCount, p.reportCount);
+                incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
+
+                auto existing = g_controllerGlobalAwarenessTable.find(incoming.claimedVehicleId);
+                bool isNew    = (existing == g_controllerGlobalAwarenessTable.end());
+                if (isNew || incoming.lastSeenTime >= existing->second.lastSeenTime)
+                {
+                    if (!isNew)
+                    {
+                        incoming.firstSeenTime   = existing->second.firstSeenTime;
+                        incoming.rsuReportCount += existing->second.rsuReportCount;
+                        incoming.observerCount  += existing->second.observerCount;
+                        incoming.suspicionFlags |= existing->second.suspicionFlags;
+                        incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
+                    }
+                    g_controllerGlobalAwarenessTable[incoming.claimedVehicleId] = incoming;
+                    LogControllerGlobalAwarenessEvent(
+                        isNew ? "global_awareness_learned" : "global_awareness_updated",
+                        g_controllerGlobalAwarenessTable[incoming.claimedVehicleId],
+                        "rsu_batch_awareness_payload_encrypted", triggerSeq);
+                }
+            }
+            return;
+        }
+
         // Primary path: batch awareness tag (all vehicle records in one packet).
         RsuControllerBatchAwarenessTag batchTag;
         if (packet->PeekPacketTag(batchTag))
@@ -2123,6 +3004,94 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                                            phantom, false, "phantom_from_malicious_rsu");
         }
     }
+    else if (msgType == static_cast<uint32_t>(REG_FORWARD))
+    {
+        // Controller receives REG_FORWARD from an RSU: decrypt, verify VIN,
+        // generate token, write to g_globalTokenStore, send REG_RESPONSE.
+        CtrlSecureTag inCsTag;
+        if (!packet->PeekPacketTag(inCsTag) || inCsTag.direction != 0)
+        {
+            std::cerr << "[Reg] REG_FORWARD: missing or wrong CtrlSecureTag\n"; return;
+        }
+        uint32_t rIdx = inCsTag.rsuId;
+        if (rIdx >= g_rsuCtrlSharedKeys.size() || g_rsuCtrlSharedKeys[rIdx].empty())
+        {
+            std::cerr << "[Reg] REG_FORWARD: no ctrl key for RSU=" << rIdx << "\n"; return;
+        }
+        std::vector<uint8_t> iv(inCsTag.iv, inCsTag.iv + 12);
+        std::vector<uint8_t> aad = BuildCtrlAad(rIdx, 0, inCsTag.seqNum);
+
+        uint32_t pktSz = packet->GetSize();
+        std::vector<uint8_t> enc(pktSz);
+        packet->CopyData(enc.data(), pktSz);
+
+        std::vector<uint8_t> plain =
+            CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
+        if (plain.empty())
+        {
+            std::cerr << "[Reg] REG_FORWARD GCM auth FAILED RSU=" << rIdx << "\n"; return;
+        }
+
+        RegForwardTag fwdTag;
+        if (plain.size() < fwdTag.GetSerializedSize())
+        {
+            std::cerr << "[Reg] REG_FORWARD: plaintext too short\n"; return;
+        }
+        TagBuffer dtb(plain.data(), plain.data() + fwdTag.GetSerializedSize());
+        fwdTag.Deserialize(dtb);
+
+        uint32_t vId = fwdTag.vehicleId;
+        uint64_t vin = fwdTag.GetVin();
+
+        // Verify VIN in whitelist.
+        auto vinIt = g_validVins.find(vin);
+        if (vinIt == g_validVins.end())
+        {
+            std::cout << "[Reg] Controller: REG_FORWARD vehicle=" << vId
+                      << " VIN NOT in whitelist — registration denied\n";
+            return;
+        }
+
+        // Verify GPS bounds (simulation area 0..500 x 0..500).
+        if (fwdTag.gpsX < 0.0 || fwdTag.gpsX > 500.0 ||
+            fwdTag.gpsY < 0.0 || fwdTag.gpsY > 500.0)
+        {
+            std::cout << "[Reg] Controller: REG_FORWARD vehicle=" << vId
+                      << " GPS out of bounds — registration denied\n";
+            return;
+        }
+
+        // Verify timestamp freshness (within 10 seconds of now).
+        double now = Simulator::Now().GetSeconds();
+        if (std::abs(now - fwdTag.timestamp) > 10.0)
+        {
+            std::cout << "[Reg] Controller: REG_FORWARD vehicle=" << vId
+                      << " timestamp too stale — registration denied\n";
+            return;
+        }
+
+        // Generate token = SHA-256(tokenMasterKey || vehicleId[4B big-endian]).
+        if (g_tokenMasterKey.size() != 32)
+        {
+            std::cerr << "[Reg] Controller: token master key not loaded\n"; return;
+        }
+        std::vector<uint8_t> tokenInput = g_tokenMasterKey;
+        tokenInput.push_back((vId >> 24) & 0xFF);
+        tokenInput.push_back((vId >> 16) & 0xFF);
+        tokenInput.push_back((vId >>  8) & 0xFF);
+        tokenInput.push_back( vId        & 0xFF);
+        std::vector<uint8_t> token = CryptoSha256(tokenInput);
+
+        // Write to global store (all RSUs can read without network messages).
+        g_globalTokenStore[vId]     = token;
+        g_controllerTokenStore[vId] = token;
+
+        std::cout << "[Reg] Controller: token generated for vehicle=" << vId
+                  << " (VIN verified) → g_globalTokenStore updated\n";
+
+        // Send token back to originating RSU so it can deliver REG_CONFIRM.
+        SendRegResponse(fwdTag.rsuId, vId, token);
+    }
 }
 
 static void
@@ -2132,16 +3101,105 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
                                   const SybilPacketTag& tag,
                                   bool hasTag)
 {
-    if (!hasTag ||
-        tag.GetMessageType() != static_cast<uint32_t>(CONTROLLER2RSU_COMMAND) ||
-        receiverRole != "rsu_edge" ||
+    if (!hasTag || receiverRole != "rsu_edge") return;
+
+    uint32_t msgType = tag.GetMessageType();
+
+    // ── REG_RESPONSE: controller delivers token to originating RSU ────────
+    if (msgType == static_cast<uint32_t>(REG_RESPONSE))
+    {
+        CtrlSecureTag inCsTag;
+        if (!packet->PeekPacketTag(inCsTag) || inCsTag.direction != 1)
+        {
+            std::cerr << "[Reg] REG_RESPONSE: missing or wrong CtrlSecureTag\n"; return;
+        }
+        uint32_t rIdx = inCsTag.rsuId;
+        if (rIdx >= g_rsuCtrlSharedKeys.size() || g_rsuCtrlSharedKeys[rIdx].empty())
+        {
+            std::cerr << "[Reg] REG_RESPONSE: no ctrl key for RSU=" << rIdx << "\n"; return;
+        }
+        std::vector<uint8_t> iv(inCsTag.iv, inCsTag.iv + 12);
+        std::vector<uint8_t> aad = BuildCtrlAad(rIdx, 1, inCsTag.seqNum);
+
+        uint32_t pktSz = packet->GetSize();
+        std::vector<uint8_t> enc(pktSz);
+        packet->CopyData(enc.data(), pktSz);
+
+        std::vector<uint8_t> plain =
+            CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
+        if (plain.empty())
+        {
+            std::cerr << "[Reg] REG_RESPONSE GCM auth FAILED RSU=" << rIdx << "\n"; return;
+        }
+
+        RegResponseTag respTag;
+        if (plain.size() < respTag.GetSerializedSize())
+        {
+            std::cerr << "[Reg] REG_RESPONSE: plaintext too short\n"; return;
+        }
+        TagBuffer dtb(plain.data(), plain.data() + respTag.GetSerializedSize());
+        respTag.Deserialize(dtb);
+
+        uint32_t vId = respTag.vehicleId;
+        std::vector<uint8_t> token(respTag.token, respTag.token + 32);
+
+        // Write token to g_globalTokenStore so all RSUs can authenticate it.
+        g_globalTokenStore[vId] = token;
+        std::cout << "[Reg] RSU " << rIdx << ": REG_RESPONSE received, token stored for vehicle="
+                  << vId << " → g_globalTokenStore updated\n";
+
+        // If this RSU is the originating one, deliver REG_CONFIRM to vehicle.
+        if (receiverId == respTag.originRsuId && vId < N_Vehicles)
+        {
+            SendRegConfirm(receiverId, vId, token);
+        }
+        return;
+    }
+
+    // ── CONTROLLER2RSU_COMMAND path ───────────────────────────────────────
+    if (msgType != static_cast<uint32_t>(CONTROLLER2RSU_COMMAND) ||
         receiverId >= g_controllerCommandTargets.size())
     {
         return;
     }
 
     ControllerRsuCommandTag commandTag;
-    if (!packet->PeekPacketTag(commandTag)) return;
+
+    // ── Encrypted path: CtrlSecureTag present (direction == 1 = CTRL→RSU) ──
+    CtrlSecureTag inCsTag;
+    if (packet->PeekPacketTag(inCsTag) && inCsTag.direction == 1)
+    {
+        uint32_t rIdx = inCsTag.rsuId;
+        if (rIdx >= g_rsuCtrlSharedKeys.size() || g_rsuCtrlSharedKeys[rIdx].empty())
+        {
+            std::cerr << "[Security] CTRL2RSU: no ctrl key for RSU=" << rIdx << "\n";
+            return;
+        }
+        std::vector<uint8_t> iv(inCsTag.iv, inCsTag.iv + 12);
+        std::vector<uint8_t> aad = BuildCtrlAad(rIdx, 1, inCsTag.seqNum);
+
+        uint32_t pktSz = packet->GetSize();
+        std::vector<uint8_t> enc(pktSz);
+        packet->CopyData(enc.data(), pktSz);
+
+        std::vector<uint8_t> plain =
+            CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
+        if (plain.empty())
+        {
+            std::cerr << "[Security] CTRL2RSU GCM auth FAILED RSU=" << rIdx << "\n";
+            return;
+        }
+
+        TagBuffer dtb(plain.data(), plain.data() + plain.size());
+        commandTag.Deserialize(dtb);
+        std::cout << "[Security] CTRL2RSU decrypted OK RSU=" << rIdx
+                  << " target=" << commandTag.GetRealVehicleId() << "\n";
+    }
+    else
+    {
+        // Legacy unencrypted path
+        if (!packet->PeekPacketTag(commandTag)) return;
+    }
 
     g_controllerCommandTargets[receiverId].valid = true;
     g_controllerCommandTargets[receiverId].realVehicleId = commandTag.GetRealVehicleId();
@@ -2352,6 +3410,240 @@ UpdateVehicleNeighborRecord(uint32_t observerVehicleId,
 }
 
 // ---------------------------------------------------------------------------
+// AAD helper — 12-byte additional authenticated data for AES-GCM V2RSU packets.
+// Binds ciphertext to the specific vehicle → RSU channel and sequence number.
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t>
+BuildV2RsuAad(uint32_t vehicleId, uint32_t rsuId, uint32_t seqNum)
+{
+    std::vector<uint8_t> aad(12);
+    aad[0]  = (vehicleId >> 24) & 0xFF; aad[1]  = (vehicleId >> 16) & 0xFF;
+    aad[2]  = (vehicleId >>  8) & 0xFF; aad[3]  =  vehicleId        & 0xFF;
+    aad[4]  = (rsuId     >> 24) & 0xFF; aad[5]  = (rsuId     >> 16) & 0xFF;
+    aad[6]  = (rsuId     >>  8) & 0xFF; aad[7]  =  rsuId            & 0xFF;
+    aad[8]  = (seqNum    >> 24) & 0xFF; aad[9]  = (seqNum    >> 16) & 0xFF;
+    aad[10] = (seqNum    >>  8) & 0xFF; aad[11] =  seqNum           & 0xFF;
+    return aad;
+}
+
+// ---------------------------------------------------------------------------
+// HandleChanHello — called at RSU when a CHAN_HELLO arrives.
+//
+// Generates an ephemeral RSU keypair and nonce, computes the ECDH session key,
+// stores it, signs the transcript, then sends CHAN_ACK back to the vehicle.
+// ---------------------------------------------------------------------------
+
+static void
+HandleChanHello(uint32_t rsuIndex, const ChanHelloTag& hello)
+{
+    if (rsuIndex >= g_rsuPrivKeys.size() || g_rsuPrivKeys[rsuIndex].empty())
+    {
+        std::cerr << "[Security] HandleChanHello: RSU " << rsuIndex
+                  << " has no private key\n";
+        return;
+    }
+
+    uint32_t vehicleId = hello.vehicleId;
+
+    std::vector<uint8_t> ecdhPubV(hello.ecdhPub, hello.ecdhPub + 64);
+    std::vector<uint8_t> nonceV  (hello.nonceV,  hello.nonceV  + 32);
+
+    // Generate RSU ephemeral keypair and nonce
+    auto keys = CryptoEcdhKeygen();
+    std::vector<uint8_t>& ephPrivR = keys.first;
+    std::vector<uint8_t>& ephPubR  = keys.second;
+    if (ephPrivR.empty()) return;
+
+    std::vector<uint8_t> nonceR = CryptoRandBytes(32);
+
+    // ECDH → session key: SHA256(shared || nonce_V || nonce_R)
+    std::vector<uint8_t> shared = CryptoEcdhCompute(ephPrivR, ecdhPubV);
+    if (shared.empty()) return;
+
+    std::vector<uint8_t> keyMaterial;
+    keyMaterial.insert(keyMaterial.end(), shared.begin(),  shared.end());
+    keyMaterial.insert(keyMaterial.end(), nonceV.begin(),  nonceV.end());
+    keyMaterial.insert(keyMaterial.end(), nonceR.begin(),  nonceR.end());
+    std::vector<uint8_t> sessionKey = CryptoSha256(keyMaterial);
+
+    g_rsuSessionKeys[rsuIndex][vehicleId] = sessionKey;
+
+    // Handshake signature: Sig_RSU( SHA256(ecdh_V || ecdh_R || nonce_V || nonce_R) )
+    std::vector<uint8_t> sigData;
+    sigData.insert(sigData.end(), ecdhPubV.begin(), ecdhPubV.end());
+    sigData.insert(sigData.end(), ephPubR.begin(),  ephPubR.end());
+    sigData.insert(sigData.end(), nonceV.begin(),   nonceV.end());
+    sigData.insert(sigData.end(), nonceR.begin(),   nonceR.end());
+    std::vector<uint8_t> sigHash     = CryptoSha256(sigData);
+    std::vector<uint8_t> handshakeSig = CryptoEcdsaSign(g_rsuPrivKeys[rsuIndex], sigHash);
+    if (handshakeSig.empty()) return;
+
+    // Build and send CHAN_ACK
+    ChanAckTag ackTag;
+    ackTag.rsuId = rsuIndex;
+    std::memcpy(ackTag.ecdhPub,      ephPubR.data(),              64);
+    std::memcpy(ackTag.nonceR,       nonceR.data(),               32);
+    std::memcpy(ackTag.rsuLtPub,     g_rsuPubKeys[rsuIndex].data(), 64);
+    std::memcpy(ackTag.certSig,      g_rsuCertSigs[rsuIndex].data(), 64);
+    std::memcpy(ackTag.handshakeSig, handshakeSig.data(),          64);
+
+    Ptr<Packet> ackPkt = Create<Packet>(0);
+    SybilPacketTag metaTag(rsuIndex, rsuIndex, vehicleId,
+                           static_cast<uint32_t>(CHAN_ACK), g_seq++);
+    ackPkt->AddPacketTag(metaTag);
+    ackPkt->AddPacketTag(ackTag);
+
+    Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
+
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [CHAN_ACK]                  "
+              << "RSU=" << rsuIndex
+              << " -> Vehicle=" << vehicleId
+              << "  session_key_stored" << std::endl;
+
+    sock->SendTo(ackPkt, 0,
+                 InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleId),
+                                   VEHICLE_PORT));
+}
+
+// ---------------------------------------------------------------------------
+// HandleChanAck — called at Vehicle when a CHAN_ACK arrives.
+//
+// 1. Verifies the RSU certificate against g_caPubKey.
+// 2. Verifies the RSU handshake signature using the certified public key.
+// 3. Computes ECDH and derives the session key.
+// 4. Stores session key; clears ephemeral material (forward secrecy).
+// ---------------------------------------------------------------------------
+
+static void
+HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
+{
+    if (vehicleIndex >= g_vehicleChannelState.size()) return;
+
+    auto&    state = g_vehicleChannelState[vehicleIndex];
+    uint32_t rsuId = ack.rsuId;
+
+    // Ignore ACK if we have no pending handshake for this RSU
+    auto it = state.pending.find(rsuId);
+    if (it == state.pending.end()) return;
+    VehicleChannelState::PendingHandshake& hs = it->second;
+
+    // Step 1: Verify RSU certificate
+    // CA signed SHA256( rsu_id(4B big-endian) || rsu_lt_pub(64B) )
+    std::vector<uint8_t> certData;
+    certData.push_back((rsuId >> 24) & 0xFF);
+    certData.push_back((rsuId >> 16) & 0xFF);
+    certData.push_back((rsuId >>  8) & 0xFF);
+    certData.push_back( rsuId        & 0xFF);
+    certData.insert(certData.end(), ack.rsuLtPub, ack.rsuLtPub + 64);
+    std::vector<uint8_t> certHash = CryptoSha256(certData);
+    std::vector<uint8_t> certSig (ack.certSig, ack.certSig + 64);
+
+    if (g_caPubKey.size() != 64 ||
+        !CryptoEcdsaVerify(g_caPubKey, certHash, certSig))
+    {
+        std::cout << "[Security] CHAN_ACK: RSU certificate INVALID"
+                  << "  Vehicle=" << vehicleIndex
+                  << "  RSU=" << rsuId << std::endl;
+        state.pending.erase(it);
+        return;
+    }
+
+    // Step 2: Verify RSU handshake signature
+    // RSU signed SHA256( ecdh_V || ecdh_R || nonce_V || nonce_R )
+    std::vector<uint8_t> rsuLtPub(ack.rsuLtPub, ack.rsuLtPub + 64);
+    std::vector<uint8_t> sigData;
+    sigData.insert(sigData.end(), hs.ephPub.begin(), hs.ephPub.end());
+    sigData.insert(sigData.end(), ack.ecdhPub, ack.ecdhPub + 64);
+    sigData.insert(sigData.end(), hs.nonceV.begin(), hs.nonceV.end());
+    sigData.insert(sigData.end(), ack.nonceR, ack.nonceR + 32);
+    std::vector<uint8_t> sigHash      = CryptoSha256(sigData);
+    std::vector<uint8_t> handshakeSig(ack.handshakeSig, ack.handshakeSig + 64);
+
+    if (!CryptoEcdsaVerify(rsuLtPub, sigHash, handshakeSig))
+    {
+        std::cout << "[Security] CHAN_ACK: handshake signature INVALID"
+                  << "  Vehicle=" << vehicleIndex
+                  << "  RSU=" << rsuId << std::endl;
+        state.pending.erase(it);
+        return;
+    }
+
+    // Step 3: Compute ECDH session key: SHA256(shared || nonce_V || nonce_R)
+    std::vector<uint8_t> ecdhPubR(ack.ecdhPub, ack.ecdhPub + 64);
+    std::vector<uint8_t> nonceR  (ack.nonceR,  ack.nonceR  + 32);
+    std::vector<uint8_t> shared = CryptoEcdhCompute(hs.ephPriv, ecdhPubR);
+    if (shared.empty()) { state.pending.erase(it); return; }
+
+    std::vector<uint8_t> keyMaterial;
+    keyMaterial.insert(keyMaterial.end(), shared.begin(),    shared.end());
+    keyMaterial.insert(keyMaterial.end(), hs.nonceV.begin(), hs.nonceV.end());
+    keyMaterial.insert(keyMaterial.end(), nonceR.begin(),    nonceR.end());
+    std::vector<uint8_t> sessionKey = CryptoSha256(keyMaterial);
+
+    // Step 4: Store session key; remove pending entry (ephemeral key gone)
+    state.sessionKeys[rsuId] = sessionKey;
+    state.pending.erase(it);  // forward secrecy — ephemeral material discarded
+
+    std::cout << "[Security] Secure channel established"
+              << "  Vehicle=" << vehicleIndex
+              << "  RSU=" << rsuId
+              << "  (cert OK, sig OK)" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// SendChanHello — Vehicle initiates the channel handshake with its nearest RSU.
+// Generates a fresh ephemeral keypair and nonce, stores the state, then sends
+// CHAN_HELLO to the RSU.
+// ---------------------------------------------------------------------------
+
+// SendChanHello — send CHAN_HELLO from vehicleIndex to a specific rsuIndex.
+static void
+SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
+{
+    if (vehicleIndex >= g_vehicleChannelState.size()) return;
+    if (rsuIndex     >= g_rsuPubKeys.size())          return;
+
+    auto keys = CryptoEcdhKeygen();
+    std::vector<uint8_t>& ephPriv = keys.first;
+    std::vector<uint8_t>& ephPub  = keys.second;
+    if (ephPriv.empty()) return;
+
+    std::vector<uint8_t> nonceV = CryptoRandBytes(32);
+
+    // Store per-RSU pending handshake
+    VehicleChannelState::PendingHandshake hs;
+    hs.ephPriv = ephPriv;
+    hs.ephPub  = ephPub;
+    hs.nonceV  = nonceV;
+    g_vehicleChannelState[vehicleIndex].pending[rsuIndex] = hs;
+
+    ChanHelloTag helloTag;
+    helloTag.vehicleId = vehicleIndex;
+    std::memcpy(helloTag.ecdhPub, ephPub.data(), 64);
+    std::memcpy(helloTag.nonceV,  nonceV.data(), 32);
+
+    Ptr<Packet> pkt = Create<Packet>(0);
+    SybilPacketTag metaTag(vehicleIndex, vehicleIndex, rsuIndex,
+                           static_cast<uint32_t>(CHAN_HELLO), g_seq++);
+    pkt->AddPacketTag(metaTag);
+    pkt->AddPacketTag(helloTag);
+
+    Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
+    uint32_t rsuWirelessIdx = g_vehicleNodes.GetN() + rsuIndex;
+
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [CHAN_HELLO]                "
+              << "Vehicle=" << vehicleIndex
+              << " -> RSU=" << rsuIndex << std::endl;
+
+    sock->SendTo(pkt, 0,
+                 InetSocketAddress(g_wirelessInterfaces.GetAddress(rsuWirelessIdx),
+                                   RSU_PORT));
+}
+
+// ---------------------------------------------------------------------------
 // Packet reception and CSV logging
 // ---------------------------------------------------------------------------
 
@@ -2365,6 +3657,337 @@ LogReceivedPacket(const std::string& receiverRole,
 {
     uint32_t triggerSeq = hasTag ? tag.GetSequenceNumber() : 0;
 
+    // --- CHAN_HELLO handler (at RSU) ---
+    if (hasTag &&
+        tag.GetMessageType() == static_cast<uint32_t>(CHAN_HELLO) &&
+        receiverRole == "rsu_edge")
+    {
+        ChanHelloTag helloTag;
+        if (packet->PeekPacketTag(helloTag))
+            HandleChanHello(receiverId, helloTag);
+    }
+
+    // --- CHAN_ACK handler (at Vehicle) ---
+    if (hasTag &&
+        tag.GetMessageType() == static_cast<uint32_t>(CHAN_ACK) &&
+        receiverRole == "vehicle")
+    {
+        ChanAckTag ackTag;
+        if (packet->PeekPacketTag(ackTag))
+            HandleChanAck(receiverId, ackTag);
+    }
+
+    // --- REG_CHALLENGE handler (at Vehicle) ---
+    if (hasTag &&
+        tag.GetMessageType() == static_cast<uint32_t>(REG_CHALLENGE) &&
+        receiverRole == "vehicle")
+    {
+        RsuVehicleSecureTag envTag;
+        if (packet->PeekPacketTag(envTag))
+        {
+            uint32_t rId = envTag.rsuId;
+            uint32_t vId = envTag.vehicleId;
+            if (vId == receiverId && vId < g_vehicleChannelState.size())
+            {
+                auto& state = g_vehicleChannelState[vId];
+                auto it = state.sessionKeys.find(rId);
+                if (it != state.sessionKeys.end() && !it->second.empty())
+                {
+                    std::vector<uint8_t> iv(envTag.iv, envTag.iv + 12);
+                    std::vector<uint8_t> aad = BuildRsuVehicleAad(rId, vId, envTag.seqNum);
+
+                    uint32_t pktSz = packet->GetSize();
+                    std::vector<uint8_t> enc(pktSz);
+                    packet->CopyData(enc.data(), pktSz);
+
+                    std::vector<uint8_t> plain =
+                        CryptoAesGcmDecrypt(it->second, iv, enc, aad);
+
+                    RegChallengeTag challengeTag;
+                    if (!plain.empty() && plain.size() >= challengeTag.GetSerializedSize())
+                    {
+                        TagBuffer dtb(plain.data(), plain.data() + challengeTag.GetSerializedSize());
+                        challengeTag.Deserialize(dtb);
+                        std::vector<uint8_t> nonce(challengeTag.nonce, challengeTag.nonce + 32);
+                        std::cout << "[Reg] Vehicle " << vId
+                                  << ": REG_CHALLENGE received from RSU " << rId
+                                  << " — sending REG_REQUEST\n";
+                        SendRegRequest(vId, rId, nonce);
+                    }
+                    else
+                    {
+                        std::cerr << "[Reg] REG_CHALLENGE decrypt FAILED vehicle=" << vId << "\n";
+                    }
+                }
+            }
+        }
+    }
+
+    // --- REG_REQUEST handler (at RSU) ---
+    if (hasTag &&
+        tag.GetMessageType() == static_cast<uint32_t>(REG_REQUEST) &&
+        receiverRole == "rsu_edge")
+    {
+        SecureChannelTag scTag;
+        if (packet->PeekPacketTag(scTag))
+        {
+            uint32_t vId = scTag.vehicleId;
+            uint32_t rId = scTag.rsuId;
+            if (rId == receiverId && rId < g_rsuSessionKeys.size())
+            {
+                auto it = g_rsuSessionKeys[rId].find(vId);
+                if (it != g_rsuSessionKeys[rId].end() && !it->second.empty())
+                {
+                    std::vector<uint8_t> iv(scTag.iv, scTag.iv + 12);
+                    // Build AAD matching SendRegRequest (vehicleId-first).
+                    std::vector<uint8_t> aad(12);
+                    aad[0]=(vId>>24)&0xFF; aad[1]=(vId>>16)&0xFF;
+                    aad[2]=(vId>> 8)&0xFF; aad[3]= vId     &0xFF;
+                    aad[4]=(rId>>24)&0xFF; aad[5]=(rId>>16)&0xFF;
+                    aad[6]=(rId>> 8)&0xFF; aad[7]= rId     &0xFF;
+                    uint32_t seq = scTag.seqNum;
+                    aad[8]=(seq>>24)&0xFF; aad[9]=(seq>>16)&0xFF;
+                    aad[10]=(seq>>8)&0xFF; aad[11]=seq     &0xFF;
+
+                    uint32_t pktSz = packet->GetSize();
+                    std::vector<uint8_t> enc(pktSz);
+                    packet->CopyData(enc.data(), pktSz);
+
+                    std::vector<uint8_t> plain =
+                        CryptoAesGcmDecrypt(it->second, iv, enc, aad);
+
+                    RegRequestTag reqTag;
+                    if (!plain.empty() && plain.size() >= reqTag.GetSerializedSize())
+                    {
+                        TagBuffer dtb(plain.data(), plain.data() + reqTag.GetSerializedSize());
+                        reqTag.Deserialize(dtb);
+
+                        // Verify nonce matches what RSU sent.
+                        bool nonceOk = false;
+                        auto& pending = g_rsuPendingChallenges[rId];
+                        auto pit = pending.find(vId);
+                        if (pit != pending.end())
+                        {
+                            const auto& expected = pit->second;
+                            nonceOk = (expected.size() == 32 &&
+                                       std::memcmp(reqTag.nonce, expected.data(), 32) == 0);
+                            if (nonceOk) pending.erase(pit);
+                        }
+
+                        if (nonceOk)
+                        {
+                            std::cout << "[Reg] RSU " << rId
+                                      << ": REG_REQUEST from vehicle=" << vId
+                                      << " nonce OK — forwarding to controller\n";
+                            SendRegForward(rId, vId, reqTag.GetVin(),
+                                           reqTag.gpsX, reqTag.gpsY, reqTag.timestamp);
+                        }
+                        else
+                        {
+                            std::cerr << "[Reg] RSU " << rId
+                                      << ": REG_REQUEST nonce MISMATCH vehicle=" << vId << "\n";
+                        }
+                    }
+                    else
+                    {
+                        std::cerr << "[Reg] REG_REQUEST decrypt FAILED RSU=" << rId << "\n";
+                    }
+                }
+            }
+        }
+    }
+
+    // --- REG_CONFIRM handler (at Vehicle) ---
+    if (hasTag &&
+        tag.GetMessageType() == static_cast<uint32_t>(REG_CONFIRM) &&
+        receiverRole == "vehicle")
+    {
+        RsuVehicleSecureTag envTag;
+        if (packet->PeekPacketTag(envTag))
+        {
+            uint32_t rId = envTag.rsuId;
+            uint32_t vId = envTag.vehicleId;
+            if (vId == receiverId && vId < g_vehicleChannelState.size())
+            {
+                auto& state = g_vehicleChannelState[vId];
+                auto it = state.sessionKeys.find(rId);
+                if (it != state.sessionKeys.end() && !it->second.empty())
+                {
+                    std::vector<uint8_t> iv(envTag.iv, envTag.iv + 12);
+                    std::vector<uint8_t> aad = BuildRsuVehicleAad(rId, vId, envTag.seqNum);
+
+                    uint32_t pktSz = packet->GetSize();
+                    std::vector<uint8_t> enc(pktSz);
+                    packet->CopyData(enc.data(), pktSz);
+
+                    std::vector<uint8_t> plain =
+                        CryptoAesGcmDecrypt(it->second, iv, enc, aad);
+
+                    RegConfirmTag confirmTag;
+                    if (!plain.empty() && plain.size() >= confirmTag.GetSerializedSize())
+                    {
+                        TagBuffer dtb(plain.data(), plain.data() + confirmTag.GetSerializedSize());
+                        confirmTag.Deserialize(dtb);
+                        if (confirmTag.vehicleId == vId)
+                        {
+                            g_vehicleTokens[vId].assign(confirmTag.token, confirmTag.token + 32);
+                            std::cout << "[Reg] Vehicle " << vId
+                                      << ": REG_CONFIRM received — token stored! "
+                                      << "Will include token in future V2RSU reports.\n";
+                        }
+                    }
+                    else
+                    {
+                        std::cerr << "[Reg] REG_CONFIRM decrypt FAILED vehicle=" << vId << "\n";
+                    }
+                }
+            }
+        }
+    }
+
+    // --- RSU2VEHICLE_COMMAND handler (at Vehicle) — decrypt and verify ----
+    if (hasTag &&
+        tag.GetMessageType() == static_cast<uint32_t>(RSU2VEHICLE_COMMAND) &&
+        receiverRole == "vehicle")
+    {
+        RsuVehicleSecureTag envTag;
+        if (packet->PeekPacketTag(envTag))
+        {
+            uint32_t rId = envTag.rsuId;
+            uint32_t vId = envTag.vehicleId;
+            if (vId == receiverId && vId < g_vehicleChannelState.size())
+            {
+                auto& state = g_vehicleChannelState[vId];
+                auto it = state.sessionKeys.find(rId);
+                if (it != state.sessionKeys.end() && !it->second.empty())
+                {
+                    std::vector<uint8_t> iv(envTag.iv, envTag.iv + 12);
+                    std::vector<uint8_t> aad = BuildRsuVehicleAad(rId, vId, envTag.seqNum);
+
+                    uint32_t pktSz = packet->GetSize();
+                    std::vector<uint8_t> enc(pktSz);
+                    packet->CopyData(enc.data(), pktSz);
+
+                    std::vector<uint8_t> plain =
+                        CryptoAesGcmDecrypt(it->second, iv, enc, aad);
+
+                    if (!plain.empty() && plain.size() >= 12)
+                    {
+                        uint32_t cmdTarget = (uint32_t(plain[0]) << 24) |
+                                             (uint32_t(plain[1]) << 16) |
+                                             (uint32_t(plain[2]) <<  8) |
+                                              uint32_t(plain[3]);
+                        std::cout << "[Security] RSU2VEH decrypted OK"
+                                  << "  Vehicle=" << vId
+                                  << "  RSU=" << rId
+                                  << "  TargetVehicle=" << cmdTarget
+                                  << "  Seq=" << envTag.seqNum << std::endl;
+                    }
+                    else
+                    {
+                        std::cerr << "[Security] RSU2VEH DECRYPTION FAILED"
+                                  << "  Vehicle=" << vId
+                                  << "  RSU=" << rId << std::endl;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Early decryption pass for encrypted V2RSU reports ---
+    // Plaintext layout: hasToken(1B) + token(32B) + report(reportSz).
+    V2RsuAwarenessReportTag decryptedReport;
+    bool hasDecryptedReport = false;
+    if (hasTag &&
+        tag.GetMessageType() == static_cast<uint32_t>(V2RSU_REPORT) &&
+        receiverRole == "rsu_edge")
+    {
+        SecureChannelTag scTag;
+        if (packet->PeekPacketTag(scTag))
+        {
+            uint32_t vId = scTag.vehicleId;
+            uint32_t rId = scTag.rsuId;
+            if (rId < g_rsuSessionKeys.size())
+            {
+                auto it = g_rsuSessionKeys[rId].find(vId);
+                if (it != g_rsuSessionKeys[rId].end())
+                {
+                    const std::vector<uint8_t>& skey = it->second;
+                    std::vector<uint8_t> iv(scTag.iv, scTag.iv + 12);
+                    std::vector<uint8_t> aad = BuildV2RsuAad(vId, rId, scTag.seqNum);
+
+                    uint32_t payloadSz = packet->GetSize();
+                    std::vector<uint8_t> ciphertext(payloadSz);
+                    packet->CopyData(ciphertext.data(), payloadSz);
+
+                    std::vector<uint8_t> plaintext =
+                        CryptoAesGcmDecrypt(skey, iv, ciphertext, aad);
+
+                    uint32_t reportSz = decryptedReport.GetSerializedSize();
+                    if (!plaintext.empty() &&
+                        plaintext.size() == 33 + reportSz)
+                    {
+                        // Parse token header.
+                        bool hasToken = (plaintext[0] != 0);
+                        if (hasToken)
+                        {
+                            std::vector<uint8_t> recvTok(plaintext.begin() + 1,
+                                                         plaintext.begin() + 33);
+                            // Authenticate token against g_globalTokenStore.
+                            auto tokenIt = g_globalTokenStore.find(vId);
+                            if (tokenIt != g_globalTokenStore.end() &&
+                                tokenIt->second == recvTok)
+                            {
+                                std::cout << "[Reg] RSU " << rId << ": V2RSU token VALID"
+                                          << " vehicle=" << vId << "\n";
+                            }
+                            else
+                            {
+                                std::cout << "[Reg] RSU " << rId << ": V2RSU token INVALID"
+                                          << " vehicle=" << vId << " — challenging\n";
+                                // Invalid token: re-challenge.
+                                if (rId < g_rsuPendingChallenges.size() &&
+                                    g_rsuPendingChallenges[rId].find(vId) ==
+                                    g_rsuPendingChallenges[rId].end())
+                                {
+                                    SendRegChallenge(rId, vId);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // No token: issue challenge if not already pending.
+                            std::cout << "[Reg] RSU " << rId << ": V2RSU no token"
+                                      << " vehicle=" << vId << " — challenging\n";
+                            if (rId < g_rsuPendingChallenges.size() &&
+                                g_rsuPendingChallenges[rId].find(vId) ==
+                                g_rsuPendingChallenges[rId].end())
+                            {
+                                SendRegChallenge(rId, vId);
+                            }
+                        }
+
+                        // Deserialize report from offset 33.
+                        TagBuffer tb(plaintext.data() + 33,
+                                     plaintext.data() + 33 + reportSz);
+                        decryptedReport.Deserialize(tb);
+                        hasDecryptedReport = true;
+                        std::cout << "[Security] V2RSU decrypted OK"
+                                  << "  RSU=" << rId
+                                  << "  Vehicle=" << vId
+                                  << "  Seq=" << scTag.seqNum << std::endl;
+                    }
+                    else
+                    {
+                        std::cout << "[Security] V2RSU DECRYPTION FAILED"
+                                  << "  RSU=" << rId
+                                  << "  Vehicle=" << vId << std::endl;
+                    }
+                }
+            }
+        }
+    }
+
     // Edge aggregation: count V2RSU_REPORTs reaching each RSU.
     if (hasTag &&
         tag.GetMessageType() == static_cast<uint32_t>(V2RSU_REPORT) &&
@@ -2373,9 +3996,14 @@ LogReceivedPacket(const std::string& receiverRole,
         if (receiverId < g_rsuReportCount.size())
             g_rsuReportCount[receiverId]++;
         UpdateRsuVehicleRecord(receiverId, tag, triggerSeq);
-        V2RsuAwarenessReportTag v2rsuReport;
-        if (packet->PeekPacketTag(v2rsuReport))
-            UpdateRsuRegionalAwareness(receiverId, v2rsuReport, triggerSeq);
+        if (hasDecryptedReport)
+            UpdateRsuRegionalAwareness(receiverId, decryptedReport, triggerSeq);
+        else
+        {
+            V2RsuAwarenessReportTag v2rsuReport;
+            if (packet->PeekPacketTag(v2rsuReport))
+                UpdateRsuRegionalAwareness(receiverId, v2rsuReport, triggerSeq);
+        }
     }
     HandleRsuControllerRecordPayload(receiverRole, packet, tag, hasTag, triggerSeq);
     HandleControllerRsuCommandPayload(receiverRole, receiverId, packet, tag, hasTag);
@@ -2392,16 +4020,65 @@ LogReceivedPacket(const std::string& receiverRole,
     bool hasBsm = packet->PeekPacketTag(bsmTag);
     BsmCoreData bsm = hasBsm ? bsmTag.GetBsm() : BsmCoreData();
     V2RsuAwarenessReportTag v2rsuReportTag;
-    bool hasV2RsuAwareness = packet->PeekPacketTag(v2rsuReportTag);
+    bool hasV2RsuAwareness;
+    if (hasDecryptedReport)
+    {
+        v2rsuReportTag     = decryptedReport;
+        hasV2RsuAwareness  = true;
+    }
+    else
+    {
+        hasV2RsuAwareness = packet->PeekPacketTag(v2rsuReportTag);
+    }
     RsuControllerAwarenessTag rsuCtrlTag;
     bool hasRsuCtrlAwareness = packet->PeekPacketTag(rsuCtrlTag);
     ControllerGlobalAwarenessRecord rsuCtrlRecord;
     if (hasRsuCtrlAwareness) rsuCtrlRecord = rsuCtrlTag.ToGlobalRecord();
+    // --- V2V Signature Verification ---
+    // Verify the ECDSA signature on every incoming V2V beacon before accepting
+    // it into the neighbor table.  The sender's public key is embedded in the
+    // V2VSignatureTag so no prior key lookup is needed.
+    bool v2vSigValid = true;  // default: accept if no signature tag (keys not loaded yet)
+    if (hasTag &&
+        hasBsm &&
+        receiverRole == "vehicle" &&
+        messageType == static_cast<uint32_t>(V2V_BEACON))
+    {
+        V2VSignatureTag sigTag;
+        if (packet->PeekPacketTag(sigTag))
+        {
+            std::vector<uint8_t> payload  = SerializeBsmForSigning(bsm);
+            std::vector<uint8_t> hash     = CryptoSha256(payload);
+            std::vector<uint8_t> pubKey(sigTag.pub_key, sigTag.pub_key + 64);
+            std::vector<uint8_t> sigBytes(sigTag.sig,   sigTag.sig     + 64);
+            v2vSigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
+
+            if (v2vSigValid)
+            {
+                std::cout << "[Security] V2V beacon sig VALID"
+                          << "  Receiver=vehicle/" << receiverId
+                          << "  From=vehicle/" << tag.GetRealNodeId()
+                          << "  Seq=" << tag.GetSequenceNumber()
+                          << std::endl;
+            }
+            else
+            {
+                std::cout << "[Security] V2V beacon sig INVALID *** DROP ***"
+                          << "  Receiver=vehicle/" << receiverId
+                          << "  FromReal="  << tag.GetRealNodeId()
+                          << "  Claimed="   << tag.GetClaimedNodeId()
+                          << "  Seq="       << tag.GetSequenceNumber()
+                          << std::endl;
+            }
+        }
+    }
+
     if (hasTag &&
         hasBsm &&
         receiverRole == "vehicle" &&
         messageType == static_cast<uint32_t>(V2V_BEACON) &&
-        receiverId != tag.GetRealNodeId())
+        receiverId != tag.GetRealNodeId() &&
+        v2vSigValid)
     {
         UpdateVehicleNeighborRecord(receiverId, tag, bsm, triggerSeq);
     }
@@ -2506,12 +4183,54 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
                               uint32_t rsuIndex,
                               uint32_t sequenceNumber)
 {
-    Ptr<Packet> packet = Create<Packet>(260 + batchTag.GetRecordCount() * 144);
     SybilPacketTag baseTag(rsuIndex,
                            rsuIndex,
                            0,
                            static_cast<uint32_t>(RSU2CONTROLLER_REPORT),
                            sequenceNumber);
+
+    // ── Encrypted path: pre-shared key established ────────────────────────
+    if (rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
+    {
+        uint32_t tagSz = batchTag.GetSerializedSize();
+        std::vector<uint8_t> plaintext(tagSz, 0);
+        TagBuffer tb(plaintext.data(), plaintext.data() + tagSz);
+        const_cast<RsuControllerBatchAwarenessTag&>(batchTag).Serialize(tb);
+
+        uint32_t seq = g_rsuCtrlTxSeqNums[rsuIndex]++;
+        std::vector<uint8_t> iv  = CryptoRandBytes(12);
+        std::vector<uint8_t> aad = BuildCtrlAad(rsuIndex, 0, seq);
+
+        std::vector<uint8_t> ciphertext =
+            CryptoAesGcmEncrypt(g_rsuCtrlSharedKeys[rsuIndex], iv, plaintext, aad);
+
+        if (ciphertext.empty())
+        {
+            std::cerr << "[Security] RSU2CTRL AES-GCM encrypt failed RSU="
+                      << rsuIndex << "\n";
+            return;
+        }
+
+        Ptr<Packet> packet = Create<Packet>(ciphertext.data(), ciphertext.size());
+        CtrlSecureTag csTag;
+        csTag.rsuId     = rsuIndex;
+        csTag.direction = 0;
+        csTag.seqNum    = seq;
+        std::memcpy(csTag.iv, iv.data(), 12);
+        packet->AddPacketTag(baseTag);
+        packet->AddPacketTag(csTag);
+        socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
+        MetricsOnTransmit(1);
+        std::cout << "[Security] RSU2CTRL encrypted OK RSU=" << rsuIndex
+                  << " records=" << batchTag.GetRecordCount()
+                  << " ctBytes=" << ciphertext.size() << "\n";
+        return;
+    }
+
+    // ── Fallback: no key loaded — send plaintext with warning ─────────────
+    std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
+              << "; sending unencrypted RSU→Controller report.\n";
+    Ptr<Packet> packet = Create<Packet>(260 + batchTag.GetRecordCount() * 144);
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(batchTag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
@@ -2525,7 +4244,6 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
                                const ControllerVehicleRecord& target,
                                uint32_t sequenceNumber)
 {
-    Ptr<Packet> packet = Create<Packet>(140);
     SybilPacketTag baseTag(0,
                            0,
                            rsuIndex,
@@ -2534,6 +4252,48 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
     ControllerRsuCommandTag commandTag(target.realVehicleId,
                                        target.claimedVehicleId,
                                        Simulator::Now().GetSeconds());
+
+    // ── Encrypted path ─────────────────────────────────────────────────────
+    if (rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
+    {
+        uint32_t tagSz = commandTag.GetSerializedSize();
+        std::vector<uint8_t> plaintext(tagSz, 0);
+        TagBuffer tb(plaintext.data(), plaintext.data() + tagSz);
+        commandTag.Serialize(tb);
+
+        uint32_t seq = g_ctrlRsuTxSeqNums[rsuIndex]++;
+        std::vector<uint8_t> iv  = CryptoRandBytes(12);
+        std::vector<uint8_t> aad = BuildCtrlAad(rsuIndex, 1, seq);
+
+        std::vector<uint8_t> ciphertext =
+            CryptoAesGcmEncrypt(g_rsuCtrlSharedKeys[rsuIndex], iv, plaintext, aad);
+
+        if (ciphertext.empty())
+        {
+            std::cerr << "[Security] CTRL2RSU AES-GCM encrypt failed RSU="
+                      << rsuIndex << "\n";
+            return;
+        }
+
+        Ptr<Packet> packet = Create<Packet>(ciphertext.data(), ciphertext.size());
+        CtrlSecureTag csTag;
+        csTag.rsuId     = rsuIndex;
+        csTag.direction = 1;
+        csTag.seqNum    = seq;
+        std::memcpy(csTag.iv, iv.data(), 12);
+        packet->AddPacketTag(baseTag);
+        packet->AddPacketTag(csTag);
+        socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
+        MetricsOnTransmit(1);
+        std::cout << "[Security] CTRL2RSU encrypted OK RSU=" << rsuIndex
+                  << " target=" << target.realVehicleId << "\n";
+        return;
+    }
+
+    // ── Fallback: no key loaded — send plaintext with warning ─────────────
+    std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
+              << "; sending unencrypted Controller→RSU command.\n";
+    Ptr<Packet> packet = Create<Packet>(140);
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(commandTag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
@@ -2558,16 +4318,63 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
     if (sybil_attack_enabled)
         InjectSybilObservationsIntoReport(vehicleIndex, report);
 
+    SybilPacketTag tag(vehicleIndex, claimedId, rsuIndex,
+                       static_cast<uint32_t>(V2RSU_REPORT), sequenceNumber,
+                       position.x, position.y, position.z);
+
+    // ── Encrypted path: session key is established ────────────────────────
+    auto& chanState = g_vehicleChannelState[vehicleIndex];
+    if (chanState.HasSession(rsuIndex))
+    {
+        // Plaintext: 1-byte hasToken flag + 32-byte token + serialized report.
+        uint32_t reportSz = report.GetSerializedSize();
+        std::vector<uint8_t> plaintext(33 + reportSz, 0);
+
+        bool haveToken = (vehicleIndex < g_vehicleTokens.size() &&
+                          !g_vehicleTokens[vehicleIndex].empty());
+        plaintext[0] = haveToken ? 1u : 0u;
+        if (haveToken)
+            std::memcpy(plaintext.data() + 1, g_vehicleTokens[vehicleIndex].data(), 32);
+
+        TagBuffer tb(plaintext.data() + 33, plaintext.data() + 33 + reportSz);
+        report.Serialize(tb);
+
+        uint32_t seqNum = chanState.NextSeqNum(rsuIndex);
+        std::vector<uint8_t> iv  = CryptoRandBytes(12);
+        std::vector<uint8_t> aad = BuildV2RsuAad(vehicleIndex, rsuIndex, seqNum);
+
+        std::vector<uint8_t> ciphertext =
+            CryptoAesGcmEncrypt(chanState.GetSessionKey(rsuIndex), iv, plaintext, aad);
+
+        if (ciphertext.empty())
+        {
+            std::cerr << "[Security] AES-GCM encryption failed for V="
+                      << vehicleIndex << std::endl;
+            return;
+        }
+
+        // Payload = ciphertext || 16-byte auth tag (already appended by encrypt)
+        Ptr<Packet> packet = Create<Packet>(ciphertext.data(), ciphertext.size());
+        packet->AddPacketTag(tag);
+        packet->AddPacketTag(BsmCoreDataTag(report.GetSelfBsm()));
+
+        SecureChannelTag scTag;
+        scTag.vehicleId = vehicleIndex;
+        scTag.rsuId     = rsuIndex;
+        scTag.seqNum    = seqNum;
+        std::memcpy(scTag.iv, iv.data(), 12);
+        packet->AddPacketTag(scTag);
+
+        socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
+        MetricsOnTransmit(1);
+        return;
+    }
+
+    // ── Fallback: no session yet — send plaintext with a warning ──────────
+    std::cout << "[Security] WARNING: No session V=" << vehicleIndex
+              << "->RSU=" << rsuIndex << "; sending unencrypted report." << std::endl;
     uint32_t packetSize = 220 + 96 * report.GetNeighborCount();
     Ptr<Packet> packet = Create<Packet>(packetSize);
-    SybilPacketTag tag(vehicleIndex,
-                       claimedId,
-                       rsuIndex,
-                       static_cast<uint32_t>(V2RSU_REPORT),
-                       sequenceNumber,
-                       position.x,
-                       position.y,
-                       position.z);
     packet->AddPacketTag(tag);
     packet->AddPacketTag(BsmCoreDataTag(report.GetSelfBsm()));
     packet->AddPacketTag(report);
@@ -2881,14 +4688,70 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
                                        "rsu_forwarded_to_vehicle");
     }
 
+    std::string source = selectedFromController ? "controller-directed"
+                         : (selectedFromTable ? "rsu-table" : "fallback");
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [RSU2VEHICLE_COMMAND]     "
               << "RSU=" << rsuIndex
               << " Seq=" << tx->sequenceNumber
               << " -> Vehicle=" << vehicleIndex
-              << " Source=" << (selectedFromController ? "controller-directed"
-                               : (selectedFromTable    ? "rsu-table"
-                                                       : "fallback")) << std::endl;
+              << " Source=" << source << std::endl;
+
+    // ── Encrypted path: use session key if established ────────────────────
+    if (rsuIndex < g_rsuSessionKeys.size())
+    {
+        auto keyIt = g_rsuSessionKeys[rsuIndex].find(vehicleIndex);
+        if (keyIt != g_rsuSessionKeys[rsuIndex].end() && !keyIt->second.empty())
+        {
+            // Payload: targetVehicleId(4B) + timestamp(8B) = 12 bytes.
+            std::vector<uint8_t> plaintext(12, 0);
+            plaintext[0] = (vehicleIndex >> 24) & 0xFF;
+            plaintext[1] = (vehicleIndex >> 16) & 0xFF;
+            plaintext[2] = (vehicleIndex >>  8) & 0xFF;
+            plaintext[3] =  vehicleIndex        & 0xFF;
+            double ts = Simulator::Now().GetSeconds();
+            uint64_t tsBits;
+            std::memcpy(&tsBits, &ts, 8);
+            plaintext[4]  = (tsBits >> 56) & 0xFF; plaintext[5]  = (tsBits >> 48) & 0xFF;
+            plaintext[6]  = (tsBits >> 40) & 0xFF; plaintext[7]  = (tsBits >> 32) & 0xFF;
+            plaintext[8]  = (tsBits >> 24) & 0xFF; plaintext[9]  = (tsBits >> 16) & 0xFF;
+            plaintext[10] = (tsBits >>  8) & 0xFF; plaintext[11] =  tsBits        & 0xFF;
+
+            uint32_t seq = g_rsuVehicleTxSeqNums[rsuIndex][vehicleIndex]++;
+            std::vector<uint8_t> iv  = CryptoRandBytes(12);
+            std::vector<uint8_t> aad = BuildRsuVehicleAad(rsuIndex, vehicleIndex, seq);
+            std::vector<uint8_t> ct  =
+                CryptoAesGcmEncrypt(keyIt->second, iv, plaintext, aad);
+
+            if (!ct.empty())
+            {
+                RsuVehicleSecureTag envTag;
+                envTag.rsuId     = rsuIndex;
+                envTag.vehicleId = vehicleIndex;
+                envTag.seqNum    = seq;
+                std::memcpy(envTag.iv, iv.data(), 12);
+
+                SybilPacketTag sybTag(rsuIndex, rsuIndex, vehicleIndex,
+                                      static_cast<uint32_t>(RSU2VEHICLE_COMMAND),
+                                      tx->sequenceNumber, 0.0, 0.0, 0.0, rsuIndex);
+                Ptr<Packet> encPkt = Create<Packet>(ct.data(), ct.size());
+                encPkt->AddPacketTag(envTag);
+                encPkt->AddPacketTag(sybTag);
+
+                sock->SendTo(encPkt, 0,
+                             InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleIndex),
+                                               VEHICLE_PORT));
+                MetricsOnTransmit(1);
+                std::cout << "[Security] RSU2VEH encrypted OK RSU=" << rsuIndex
+                          << " Vehicle=" << vehicleIndex << "\n";
+                return;
+            }
+        }
+    }
+
+    // ── Fallback: no session key — send plaintext with warning ────────────
+    std::cout << "[Security] RSU2VEH WARNING: no session key RSU=" << rsuIndex
+              << " Vehicle=" << vehicleIndex << " — sending plaintext command\n";
     SendTaggedPacket(sock,
                      g_wirelessInterfaces.GetAddress(vehicleIndex),
                      VEHICLE_PORT,
@@ -3012,6 +4875,20 @@ main(int argc, char* argv[])
     g_controllerCommandTargets.assign(N_RSUs, ControllerCommandTarget());
     g_rsuReportCount.assign(N_RSUs, 0u);
     ResetAwarenessTables();
+
+    // Auto-generate key/VIN CSV files if missing or if node counts changed.
+    EnsureKeyFilesExist();
+
+    // Load ECDSA vehicle keys from CSV (generated by generate_vehicle_keys.py).
+    // Must run after N_Vehicles is finalised.
+    LoadVehicleKeys();
+    // Load CA public key and RSU keypairs + certificates.
+    // Must run after N_Vehicles and N_RSUs are finalised.
+    LoadCaAndRsuKeys();
+    // Load vehicle VINs, VIN whitelist, and token master key.
+    LoadVinData();
+
+
 
     // Resolve attack type and populate per-node attacker flags.
     // Must run after routing_test / N_RSUs adjustments.
@@ -3330,6 +5207,23 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Normal traffic scheduling
     // -----------------------------------------------------------------------
+
+    // Secure channel handshake: each vehicle sends CHAN_HELLO to its nearest
+    // RSU at t=0.5s (staggered by 0.05s per vehicle).  The RSU responds with
+    // CHAN_ACK immediately, establishing the session key.  This completes well
+    // before the first V2RSU report at t≈1.1s.
+    // Each vehicle establishes a session with every RSU so reports are always
+    // encrypted regardless of which RSU the vehicle is nearest to at report time.
+    for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+    {
+        if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
+            continue;
+        for (uint32_t r = 0; r < g_rsuNodes.GetN(); ++r)
+        {
+            double t_hello = 0.5 + 0.04 * (i * g_rsuNodes.GetN() + r);
+            Simulator::Schedule(Seconds(t_hello), &SendChanHello, i, r);
+        }
+    }
 
     // Tier 1: V2V broadcast beacons + V2RSU reports
     for (double t = 1.0; t < simTime - 1.0; t += beaconInterval)

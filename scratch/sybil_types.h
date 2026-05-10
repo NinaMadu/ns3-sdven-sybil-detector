@@ -19,9 +19,12 @@
 #include "ns3/network-module.h"
 #include "ns3/wifi-module.h"
 #include "sybil_metrics.h"    // brings in MetricsOnTransmit used by SendTaggedPacket
+#include "sybil_crypto.h"     // ECDSA P-256 sign / verify / SHA-256
 
 #include <array>
 #include <cmath>
+#include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -47,7 +50,14 @@ enum MessageType
     RSU2CONTROLLER_REPORT   = 3,   ///< RSU-to-controller aggregated report
     CONTROLLER2RSU_COMMAND  = 4,   ///< SDN controller command to RSU
     RSU2VEHICLE_COMMAND     = 5,   ///< RSU command downlink to vehicle
-    SYBIL_INJECTION         = 6    ///< Fabricated record injected by malicious RSU/controller
+    SYBIL_INJECTION         = 6,   ///< Fabricated record injected by malicious RSU/controller
+    CHAN_HELLO              = 7,   ///< Vehicle→RSU: initiate secure channel (ECDH ephemeral pub + nonce)
+    CHAN_ACK                = 8,   ///< RSU→Vehicle: complete handshake (cert + ECDH pub + sig)
+    REG_CHALLENGE           = 9,   ///< RSU→Vehicle: registration challenge nonce
+    REG_REQUEST             = 10,  ///< Vehicle→RSU: VIN + GPS + timestamp + nonce
+    REG_FORWARD             = 11,  ///< RSU→Controller: forward registration request
+    REG_RESPONSE            = 12,  ///< Controller→RSU: token for registered vehicle
+    REG_CONFIRM             = 13   ///< RSU→Vehicle: deliver token
 };
 
 inline std::string
@@ -61,6 +71,13 @@ MessageTypeToString(uint32_t messageType)
     case CONTROLLER2RSU_COMMAND: return "controller2rsu_command";
     case RSU2VEHICLE_COMMAND:    return "rsu2vehicle_command";
     case SYBIL_INJECTION:        return "sybil_injection";
+    case CHAN_HELLO:             return "chan_hello";
+    case CHAN_ACK:               return "chan_ack";
+    case REG_CHALLENGE:          return "reg_challenge";
+    case REG_REQUEST:            return "reg_request";
+    case REG_FORWARD:            return "reg_forward";
+    case REG_RESPONSE:           return "reg_response";
+    case REG_CONFIRM:            return "reg_confirm";
     default:                     return "unknown";
     }
 }
@@ -103,7 +120,8 @@ enum SdvenSuspicionFlags
     SUSPICION_RSSI_COLOCATION   = 1u << 5,
     SUSPICION_TRAJECTORY_SHADOWING = 1u << 6,
     SUSPICION_UNCORROBORATED_RSU_APPROVAL = 1u << 7,
-    SUSPICION_RSSI_DISTANCE_MISMATCH      = 1u << 8  ///< Claimed BSM position inconsistent with RSSI-estimated distance
+    SUSPICION_RSSI_DISTANCE_MISMATCH      = 1u << 8,  ///< Claimed BSM position inconsistent with RSSI-estimated distance
+    SUSPICION_INVALID_V2V_SIGNATURE       = 1u << 9   ///< V2V beacon ECDSA signature failed verification
 };
 
 // RSSI-based position verification result stored per neighbor observation.
@@ -286,6 +304,560 @@ class BsmCoreDataTag : public Tag
 
   private:
     BsmCoreData m_bsm;
+};
+
+// ---------------------------------------------------------------------------
+// Serialize the safety-critical BSM fields into a byte vector for signing.
+// Both sender and receiver must use this exact same serialization.
+// Fields covered: temporaryId, timestamp, position (x,y,z), speed, heading.
+// ---------------------------------------------------------------------------
+
+inline std::vector<uint8_t>
+SerializeBsmForSigning(const BsmCoreData& bsm)
+{
+    std::vector<uint8_t> bytes;
+    bytes.reserve(4 + 6 * 8);  // 1 uint32 + 6 doubles
+
+    auto appendU32 = [&](uint32_t v) {
+        bytes.push_back((v >> 24) & 0xFF);
+        bytes.push_back((v >> 16) & 0xFF);
+        bytes.push_back((v >>  8) & 0xFF);
+        bytes.push_back( v        & 0xFF);
+    };
+    auto appendDouble = [&](double v) {
+        uint8_t buf[8];
+        std::memcpy(buf, &v, 8);
+        bytes.insert(bytes.end(), buf, buf + 8);
+    };
+
+    appendU32(bsm.temporaryId);
+    appendDouble(bsm.timestamp);
+    appendDouble(bsm.positionX);
+    appendDouble(bsm.positionY);
+    appendDouble(bsm.positionZ);
+    appendDouble(bsm.speed);
+    appendDouble(bsm.heading);
+
+    return bytes;
+}
+
+// ---------------------------------------------------------------------------
+// V2VSignatureTag — attached to every V2V beacon.
+//
+// Carries the sender's ECDSA P-256 public key (64 bytes: x||y) and the
+// signature (64 bytes: r||s) over SHA-256(serialized BSM fields).
+// Receivers use the embedded public key to verify without prior key lookup.
+// ---------------------------------------------------------------------------
+
+class V2VSignatureTag : public Tag
+{
+  public:
+    static constexpr uint32_t KEY_BYTES = 64;  // P-256 uncompressed x||y
+    static constexpr uint32_t SIG_BYTES = 64;  // ECDSA raw r||s
+
+    V2VSignatureTag()
+    {
+        std::memset(pub_key, 0, KEY_BYTES);
+        std::memset(sig,     0, SIG_BYTES);
+    }
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::V2VSignatureTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<V2VSignatureTag>();
+        return tid;
+    }
+    TypeId GetInstanceTypeId() const override { return V2VSignatureTag::GetTypeId(); }
+
+    uint32_t GetSerializedSize() const override { return KEY_BYTES + SIG_BYTES; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.Write(pub_key, KEY_BYTES);
+        i.Write(sig,     SIG_BYTES);
+    }
+
+    void Deserialize(TagBuffer i) override
+    {
+        i.Read(pub_key, KEY_BYTES);
+        i.Read(sig,     SIG_BYTES);
+    }
+
+    void Print(std::ostream& os) const override { os << "V2VSignatureTag"; }
+
+    uint8_t pub_key[KEY_BYTES];
+    uint8_t sig    [SIG_BYTES];
+};
+
+// ---------------------------------------------------------------------------
+// ChanHelloTag — Vehicle → RSU (100 bytes)
+//
+// Carries the vehicle's ephemeral ECDH public key and a random nonce.
+// The RSU uses these to compute the session key and build the CHAN_ACK.
+// ---------------------------------------------------------------------------
+
+class ChanHelloTag : public Tag
+{
+  public:
+    static constexpr uint32_t ECDH_BYTES  = 64;  // P-256 ephemeral pub x||y
+    static constexpr uint32_t NONCE_BYTES = 32;
+
+    uint32_t vehicleId = 0;
+    uint8_t  ecdhPub[ECDH_BYTES]   = {};
+    uint8_t  nonceV [NONCE_BYTES]  = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::ChanHelloTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<ChanHelloTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return ChanHelloTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + ECDH_BYTES + NONCE_BYTES; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(vehicleId);
+        i.Write(ecdhPub, ECDH_BYTES);
+        i.Write(nonceV,  NONCE_BYTES);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        vehicleId = i.ReadU32();
+        i.Read(ecdhPub, ECDH_BYTES);
+        i.Read(nonceV,  NONCE_BYTES);
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "ChanHelloTag vehicleId=" << vehicleId;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// ChanAckTag — RSU → Vehicle (292 bytes)
+//
+// Carries:
+//   ecdhPub      — RSU's ephemeral ECDH public key (64 B)
+//   nonceR       — RSU's random nonce (32 B)
+//   rsuLtPub     — RSU's long-term public key extracted from its certificate (64 B)
+//   certSig      — CA signature over SHA256(rsu_id(4B)||rsu_lt_pub(64B)) (64 B)
+//   handshakeSig — RSU signature over SHA256(ecdh_V||ecdh_R||nonce_V||nonce_R) (64 B)
+//
+// Vehicle verifies certSig using g_caPubKey, then verifies handshakeSig using
+// rsuLtPub.  After both checks pass it runs ECDH and derives the session key.
+// ---------------------------------------------------------------------------
+
+class ChanAckTag : public Tag
+{
+  public:
+    static constexpr uint32_t ECDH_BYTES  = 64;
+    static constexpr uint32_t NONCE_BYTES = 32;
+    static constexpr uint32_t SIG_BYTES   = 64;
+
+    uint32_t rsuId = 0;
+    uint8_t  ecdhPub      [ECDH_BYTES]  = {};  // RSU ephemeral pub
+    uint8_t  nonceR       [NONCE_BYTES] = {};  // RSU nonce
+    uint8_t  rsuLtPub     [ECDH_BYTES]  = {};  // RSU long-term pub (from cert)
+    uint8_t  certSig      [SIG_BYTES]   = {};  // CA sig over (rsu_id||rsuLtPub)
+    uint8_t  handshakeSig [SIG_BYTES]   = {};  // RSU sig over (ecdh_V||ecdh_R||nV||nR)
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::ChanAckTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<ChanAckTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return ChanAckTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override
+    {
+        return 4 + ECDH_BYTES + NONCE_BYTES + ECDH_BYTES + SIG_BYTES + SIG_BYTES;
+    }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(rsuId);
+        i.Write(ecdhPub,      ECDH_BYTES);
+        i.Write(nonceR,       NONCE_BYTES);
+        i.Write(rsuLtPub,     ECDH_BYTES);
+        i.Write(certSig,      SIG_BYTES);
+        i.Write(handshakeSig, SIG_BYTES);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        rsuId = i.ReadU32();
+        i.Read(ecdhPub,      ECDH_BYTES);
+        i.Read(nonceR,       NONCE_BYTES);
+        i.Read(rsuLtPub,     ECDH_BYTES);
+        i.Read(certSig,      SIG_BYTES);
+        i.Read(handshakeSig, SIG_BYTES);
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "ChanAckTag rsuId=" << rsuId;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// SecureChannelTag — attached to encrypted V2RSU_REPORT packets (24 bytes)
+//
+// The packet payload is: AES-256-GCM( sessionKey, iv, serialized_report, aad )
+// where the last 16 bytes of the payload are the GCM auth tag.
+// This metadata tag tells the RSU which session key to use for decryption.
+// ---------------------------------------------------------------------------
+
+class SecureChannelTag : public Tag
+{
+  public:
+    static constexpr uint32_t IV_BYTES = 12;
+
+    uint32_t vehicleId = 0;
+    uint32_t rsuId     = 0;
+    uint32_t seqNum    = 0;
+    uint8_t  iv[IV_BYTES] = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::SecureChannelTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<SecureChannelTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return SecureChannelTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + 4 + 4 + IV_BYTES; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(vehicleId);
+        i.WriteU32(rsuId);
+        i.WriteU32(seqNum);
+        i.Write(iv, IV_BYTES);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        vehicleId = i.ReadU32();
+        rsuId     = i.ReadU32();
+        seqNum    = i.ReadU32();
+        i.Read(iv, IV_BYTES);
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "SecureChannelTag v=" << vehicleId << " r=" << rsuId << " seq=" << seqNum;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// CtrlSecureTag — 24 bytes, attached to every encrypted RSU↔Controller packet.
+//
+// Fields:
+//   rsuId     — identifies which RSU is on the backhaul link
+//   direction — 0 = RSU→Controller, 1 = Controller→RSU
+//   seqNum    — per-direction monotonic counter (replay protection)
+//   iv[12]    — AES-256-GCM nonce (fresh random for every packet)
+// ---------------------------------------------------------------------------
+
+class CtrlSecureTag : public Tag
+{
+  public:
+    static constexpr uint32_t IV_BYTES = 12;
+
+    uint32_t rsuId     = 0;
+    uint32_t direction = 0;  // 0 = RSU→CTRL, 1 = CTRL→RSU
+    uint32_t seqNum    = 0;
+    uint8_t  iv[IV_BYTES] = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::CtrlSecureTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<CtrlSecureTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return CtrlSecureTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + 4 + 4 + IV_BYTES; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(rsuId);
+        i.WriteU32(direction);
+        i.WriteU32(seqNum);
+        i.Write(iv, IV_BYTES);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        rsuId     = i.ReadU32();
+        direction = i.ReadU32();
+        seqNum    = i.ReadU32();
+        i.Read(iv, IV_BYTES);
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "CtrlSecureTag rsu=" << rsuId << " dir=" << direction << " seq=" << seqNum;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// RsuVehicleSecureTag — 24 bytes — envelope for RSU→Vehicle encrypted packets.
+//   rsuId(4) + vehicleId(4) + seqNum(4) + iv[12]
+// ---------------------------------------------------------------------------
+
+class RsuVehicleSecureTag : public Tag
+{
+  public:
+    static constexpr uint32_t IV_BYTES = 12;
+
+    uint32_t rsuId     = 0;
+    uint32_t vehicleId = 0;
+    uint32_t seqNum    = 0;
+    uint8_t  iv[IV_BYTES] = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::RsuVehicleSecureTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<RsuVehicleSecureTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return RsuVehicleSecureTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + 4 + 4 + IV_BYTES; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(rsuId);
+        i.WriteU32(vehicleId);
+        i.WriteU32(seqNum);
+        i.Write(iv, IV_BYTES);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        rsuId     = i.ReadU32();
+        vehicleId = i.ReadU32();
+        seqNum    = i.ReadU32();
+        i.Read(iv, IV_BYTES);
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "RsuVehicleSecureTag rsu=" << rsuId << " v=" << vehicleId << " seq=" << seqNum;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// RegChallengeTag — 32 bytes — RSU→Vehicle: registration challenge nonce.
+// ---------------------------------------------------------------------------
+
+class RegChallengeTag : public Tag
+{
+  public:
+    uint8_t nonce[32] = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::RegChallengeTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<RegChallengeTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return RegChallengeTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 32; }
+
+    void Serialize(TagBuffer i)   const override { i.Write(nonce, 32); }
+    void Deserialize(TagBuffer i) override       { i.Read(nonce, 32); }
+    void Print(std::ostream& os)  const override { os << "RegChallengeTag"; }
+};
+
+// ---------------------------------------------------------------------------
+// RegRequestTag — 68 bytes — Vehicle→RSU: VIN + GPS + timestamp + nonce.
+//   vehicleId(4) + vin_hi(4) + vin_lo(4) + gpsX(8) + gpsY(8) + timestamp(8) + nonce(32)
+// ---------------------------------------------------------------------------
+
+class RegRequestTag : public Tag
+{
+  public:
+    uint32_t vehicleId = 0;
+    uint32_t vin_hi    = 0;
+    uint32_t vin_lo    = 0;
+    double   gpsX      = 0.0;
+    double   gpsY      = 0.0;
+    double   timestamp = 0.0;
+    uint8_t  nonce[32] = {};
+
+    uint64_t GetVin() const { return (uint64_t(vin_hi) << 32) | vin_lo; }
+    void SetVin(uint64_t v) { vin_hi = uint32_t(v >> 32); vin_lo = uint32_t(v & 0xFFFFFFFFULL); }
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::RegRequestTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<RegRequestTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return RegRequestTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + 4 + 4 + 8 + 8 + 8 + 32; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(vehicleId); i.WriteU32(vin_hi); i.WriteU32(vin_lo);
+        i.WriteDouble(gpsX); i.WriteDouble(gpsY); i.WriteDouble(timestamp);
+        i.Write(nonce, 32);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        vehicleId = i.ReadU32(); vin_hi = i.ReadU32(); vin_lo = i.ReadU32();
+        gpsX = i.ReadDouble(); gpsY = i.ReadDouble(); timestamp = i.ReadDouble();
+        i.Read(nonce, 32);
+    }
+    void Print(std::ostream& os) const override { os << "RegRequestTag v=" << vehicleId; }
+};
+
+// ---------------------------------------------------------------------------
+// RegForwardTag — 40 bytes — RSU→Controller: registration forwarding.
+//   vehicleId(4) + rsuId(4) + vin_hi(4) + vin_lo(4) + gpsX(8) + gpsY(8) + timestamp(8)
+// ---------------------------------------------------------------------------
+
+class RegForwardTag : public Tag
+{
+  public:
+    uint32_t vehicleId = 0;
+    uint32_t rsuId     = 0;
+    uint32_t vin_hi    = 0;
+    uint32_t vin_lo    = 0;
+    double   gpsX      = 0.0;
+    double   gpsY      = 0.0;
+    double   timestamp = 0.0;
+
+    uint64_t GetVin() const { return (uint64_t(vin_hi) << 32) | vin_lo; }
+    void SetVin(uint64_t v) { vin_hi = uint32_t(v >> 32); vin_lo = uint32_t(v & 0xFFFFFFFFULL); }
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::RegForwardTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<RegForwardTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return RegForwardTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + 4 + 4 + 4 + 8 + 8 + 8; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(vehicleId); i.WriteU32(rsuId); i.WriteU32(vin_hi); i.WriteU32(vin_lo);
+        i.WriteDouble(gpsX); i.WriteDouble(gpsY); i.WriteDouble(timestamp);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        vehicleId = i.ReadU32(); rsuId = i.ReadU32(); vin_hi = i.ReadU32(); vin_lo = i.ReadU32();
+        gpsX = i.ReadDouble(); gpsY = i.ReadDouble(); timestamp = i.ReadDouble();
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "RegForwardTag v=" << vehicleId << " rsu=" << rsuId;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// RegResponseTag — 40 bytes — Controller→RSU: token for registered vehicle.
+//   vehicleId(4) + originRsuId(4) + token(32)
+// ---------------------------------------------------------------------------
+
+class RegResponseTag : public Tag
+{
+  public:
+    uint32_t vehicleId   = 0;
+    uint32_t originRsuId = 0;
+    uint8_t  token[32]   = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::RegResponseTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<RegResponseTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return RegResponseTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + 4 + 32; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(vehicleId); i.WriteU32(originRsuId); i.Write(token, 32);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        vehicleId = i.ReadU32(); originRsuId = i.ReadU32(); i.Read(token, 32);
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "RegResponseTag v=" << vehicleId << " originRsu=" << originRsuId;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// RegConfirmTag — 36 bytes — RSU→Vehicle: token delivery.
+//   vehicleId(4) + token(32)
+// ---------------------------------------------------------------------------
+
+class RegConfirmTag : public Tag
+{
+  public:
+    uint32_t vehicleId = 0;
+    uint8_t  token[32] = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::RegConfirmTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<RegConfirmTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return RegConfirmTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + 32; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(vehicleId); i.Write(token, 32);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        vehicleId = i.ReadU32(); i.Read(token, 32);
+    }
+    void Print(std::ostream& os) const override { os << "RegConfirmTag v=" << vehicleId; }
+};
+
+// ---------------------------------------------------------------------------
+// VehicleChannelState — per-vehicle secure channel state
+//
+// Tracks the in-flight handshake (ephemeral key + nonces) and, once the
+// CHAN_ACK is verified, the derived session key used to encrypt V2RSU reports.
+// ---------------------------------------------------------------------------
+
+struct VehicleChannelState
+{
+    // Per-RSU handshake state (keyed by rsu_id): ephemeral key + nonce while
+    // the CHAN_HELLO is in flight and we are waiting for the CHAN_ACK.
+    struct PendingHandshake
+    {
+        std::vector<uint8_t> ephPriv;  // 32 bytes
+        std::vector<uint8_t> ephPub;   // 64 bytes
+        std::vector<uint8_t> nonceV;   // 32 bytes
+    };
+    std::map<uint32_t, PendingHandshake>       pending;     // rsu_id → in-flight state
+    // Once the CHAN_ACK is verified the session key is moved here.
+    std::map<uint32_t, std::vector<uint8_t>>   sessionKeys; // rsu_id → 32-byte key
+    std::map<uint32_t, uint32_t>               txSeqNums;   // rsu_id → next seq num
+
+    bool HasSession(uint32_t rsuId) const
+    {
+        return sessionKeys.count(rsuId) != 0;
+    }
+    const std::vector<uint8_t>& GetSessionKey(uint32_t rsuId) const
+    {
+        return sessionKeys.at(rsuId);
+    }
+    uint32_t NextSeqNum(uint32_t rsuId)
+    {
+        return txSeqNums[rsuId]++;
+    }
 };
 
 struct V2RsuNeighborObservationPayload
@@ -643,6 +1215,55 @@ extern Ipv4InterfaceContainer   g_wiredInterfaces;
 extern uint32_t                 g_seq;
 extern std::vector<uint32_t>    g_rsuReportCount;
 
+// Vehicle ECDSA key material — DEFINED in Sybil-Developing-Improved.cc,
+// populated by LoadVehicleKeys() before Simulator::Run().
+extern std::vector<std::vector<uint8_t>> g_vehiclePrivKeys;  // 32 bytes each
+extern std::vector<std::vector<uint8_t>> g_vehiclePubKeys;   // 64 bytes each
+
+// RSU ECDSA key material + CA-signed certificates.
+// Populated by LoadCaAndRsuKeys() before Simulator::Run().
+extern std::vector<std::vector<uint8_t>> g_rsuPrivKeys;    // 32 bytes each
+extern std::vector<std::vector<uint8_t>> g_rsuPubKeys;     // 64 bytes each
+extern std::vector<std::vector<uint8_t>> g_rsuCertSigs;    // 64 bytes each (CA sig)
+extern std::vector<uint8_t>              g_caPubKey;        // 64 bytes (pre-installed on vehicles)
+
+// Per-vehicle channel state — indexed by vehicle index.
+// Tracks in-flight handshake and, once established, the AES-GCM session key.
+extern std::vector<VehicleChannelState> g_vehicleChannelState;
+
+// Per-RSU session keys — g_rsuSessionKeys[rsu_id][vehicle_id] → 32-byte key.
+extern std::vector<std::map<uint32_t, std::vector<uint8_t>>> g_rsuSessionKeys;
+
+// RSU↔Controller pre-shared keys — one 32-byte AES key per RSU, derived offline
+// via ECDH(controller_priv, rsu_pub) → SHA-256.  Indexed by RSU index.
+extern std::vector<std::vector<uint8_t>> g_rsuCtrlSharedKeys;
+
+// Per-direction monotonic sequence counters for RSU↔Controller replay protection.
+// g_rsuCtrlTxSeqNums[rsu_id] — next seq for RSU→Controller packets.
+// g_ctrlRsuTxSeqNums[rsu_id] — next seq for Controller→RSU packets.
+extern std::vector<uint32_t> g_rsuCtrlTxSeqNums;
+extern std::vector<uint32_t> g_ctrlRsuTxSeqNums;
+
+// Vehicle registration and token infrastructure.
+// g_tokenMasterKey        — 32-byte secret shared by controller + all RSUs.
+// g_validVins             — VIN whitelist: vin(uint64) → vehicle_id.
+// g_controllerTokenStore  — controller's copy: vehicleId → 32-byte token.
+// g_globalTokenStore      — shared map written by controller, read by all RSUs: vehicleId → token.
+// g_vehicleVins           — per-vehicle VIN: g_vehicleVins[vehicleIndex] = vin.
+// g_vehicleTokens         — per-vehicle held token: g_vehicleTokens[vehicleIndex] = token (empty if none).
+// g_vehiclePendingRegNonces — g_vehiclePendingRegNonces[vIdx][rsuId] = nonce sent in REG_REQUEST.
+// g_rsuPendingChallenges  — g_rsuPendingChallenges[rsuIdx][vehicleId] = nonce issued in REG_CHALLENGE.
+// g_rsuVehicleTxSeqNums   — g_rsuVehicleTxSeqNums[rsuIdx][vehicleId] = next seq (RSU→Vehicle).
+extern std::vector<uint8_t>                                          g_tokenMasterKey;
+extern std::map<uint64_t, uint32_t>                                  g_validVins;
+extern std::map<uint32_t, std::vector<uint8_t>>                      g_controllerTokenStore;
+extern std::map<uint32_t, std::vector<uint8_t>>                      g_globalTokenStore;
+extern std::vector<uint64_t>                                         g_vehicleVins;
+extern std::vector<std::vector<uint8_t>>                             g_vehicleTokens;
+extern std::vector<std::map<uint32_t, std::vector<uint8_t>>>         g_vehiclePendingRegNonces;
+extern std::vector<std::map<uint32_t, std::vector<uint8_t>>>         g_rsuPendingChallenges;
+extern std::vector<std::map<uint32_t, uint32_t>>                     g_rsuVehicleTxSeqNums;
+
 // ---------------------------------------------------------------------------
 // Packet transmission utilities
 // ---------------------------------------------------------------------------
@@ -721,6 +1342,25 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
             bsm.positionZ = tx->claimedZ;
         }
         packet->AddPacketTag(BsmCoreDataTag(bsm));
+
+        // --- V2V Signature ---
+        // Sign the BSM with the sender's private key so receivers can verify
+        // data integrity and sender authenticity without a prior key lookup.
+        uint32_t senderIdx = tx->realNodeId;
+        if (senderIdx < g_vehiclePrivKeys.size() && !g_vehiclePrivKeys[senderIdx].empty())
+        {
+            std::vector<uint8_t> payload = SerializeBsmForSigning(bsm);
+            std::vector<uint8_t> hash    = CryptoSha256(payload);
+            std::vector<uint8_t> sigBytes = CryptoEcdsaSign(g_vehiclePrivKeys[senderIdx], hash);
+
+            if (!sigBytes.empty())
+            {
+                V2VSignatureTag sigTag;
+                std::memcpy(sigTag.pub_key, g_vehiclePubKeys[senderIdx].data(), 64);
+                std::memcpy(sigTag.sig,     sigBytes.data(),                     64);
+                packet->AddPacketTag(sigTag);
+            }
+        }
     }
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
 
