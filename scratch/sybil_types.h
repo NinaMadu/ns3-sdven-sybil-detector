@@ -57,7 +57,9 @@ enum MessageType
     REG_REQUEST             = 10,  ///< Vehicle→RSU: VIN + GPS + timestamp + nonce
     REG_FORWARD             = 11,  ///< RSU→Controller: forward registration request
     REG_RESPONSE            = 12,  ///< Controller→RSU: token for registered vehicle
-    REG_CONFIRM             = 13   ///< RSU→Vehicle: deliver token
+    REG_CONFIRM             = 13,  ///< RSU→Vehicle: deliver token
+    V2CTRL_HELLO            = 14,  ///< Vehicle→RSU→Controller: initiate V-Ctrl E2E channel
+    CTRL2V_ACK              = 15   ///< Controller→RSU→Vehicle: complete V-Ctrl handshake
 };
 
 inline std::string
@@ -78,6 +80,8 @@ MessageTypeToString(uint32_t messageType)
     case REG_FORWARD:            return "reg_forward";
     case REG_RESPONSE:           return "reg_response";
     case REG_CONFIRM:            return "reg_confirm";
+    case V2CTRL_HELLO:           return "v2ctrl_hello";
+    case CTRL2V_ACK:             return "ctrl2v_ack";
     default:                     return "unknown";
     }
 }
@@ -825,6 +829,151 @@ class RegConfirmTag : public Tag
 };
 
 // ---------------------------------------------------------------------------
+// V2CtrlHelloTag — 292 bytes — Vehicle→RSU→Controller: initiate V-Ctrl channel.
+//
+// Carries the vehicle's long-term signing public key, its CA-signed certificate,
+// and an ephemeral ECDH public key + nonce for session-key derivation.
+// The controller verifies the certificate using the pre-installed g_caPubKey,
+// then generates its own ephemeral ECDH keypair and responds with CTRL2V_ACK.
+//
+// Fields:
+//   vehicleId     (4B)  — identifies the sender
+//   vehicleLtPub  (64B) — vehicle's long-term ECDSA signing public key
+//   vehicleCertSig(64B) — CA sig over SHA256(vehicleId(4B)||vehicleLtPub(64B))
+//   ecdhPubV      (64B) — vehicle ephemeral ECDH public key (x||y)
+//   nonceV        (32B) — vehicle random nonce
+//   handshakeSig  (64B) — vehicle sig over SHA256(vehicleId||ecdhPubV||nonceV)
+// ---------------------------------------------------------------------------
+
+class V2CtrlHelloTag : public Tag
+{
+  public:
+    static constexpr uint32_t ECDH_BYTES  = 64;
+    static constexpr uint32_t SIG_BYTES   = 64;
+    static constexpr uint32_t NONCE_BYTES = 32;
+
+    uint32_t vehicleId = 0;
+    uint8_t  vehicleLtPub  [ECDH_BYTES]  = {};
+    uint8_t  vehicleCertSig[SIG_BYTES]   = {};
+    uint8_t  ecdhPubV      [ECDH_BYTES]  = {};
+    uint8_t  nonceV        [NONCE_BYTES] = {};
+    uint8_t  handshakeSig  [SIG_BYTES]   = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::V2CtrlHelloTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<V2CtrlHelloTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return V2CtrlHelloTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override
+    {
+        return 4 + ECDH_BYTES + SIG_BYTES + ECDH_BYTES + NONCE_BYTES + SIG_BYTES;
+    }
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(vehicleId);
+        i.Write(vehicleLtPub,   ECDH_BYTES);
+        i.Write(vehicleCertSig, SIG_BYTES);
+        i.Write(ecdhPubV,       ECDH_BYTES);
+        i.Write(nonceV,         NONCE_BYTES);
+        i.Write(handshakeSig,   SIG_BYTES);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        vehicleId = i.ReadU32();
+        i.Read(vehicleLtPub,   ECDH_BYTES);
+        i.Read(vehicleCertSig, SIG_BYTES);
+        i.Read(ecdhPubV,       ECDH_BYTES);
+        i.Read(nonceV,         NONCE_BYTES);
+        i.Read(handshakeSig,   SIG_BYTES);
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "V2CtrlHelloTag vehicleId=" << vehicleId;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Ctrl2VehicleAckTag — 288 bytes — Controller→RSU→Vehicle: complete V-Ctrl handshake.
+//
+// Carries the controller's long-term signing public key (NOT pre-installed on
+// vehicles — sent here for first-time verification), its CA-signed certificate,
+// an ephemeral ECDH key + nonce, and a handshake signature binding all ephemeral
+// keys and nonces together.
+//
+// Vehicle verification steps:
+//   1. Verify CA cert: CryptoEcdsaVerify(caPub, SHA256("ctrl"||ctrlLtPub), ctrlCertSig)
+//   2. Verify handshake sig: CryptoEcdsaVerify(ctrlLtPub, SHA256(ecdhV||ecdhC||nV||nC), sig)
+//   3. Derive session key: SHA256(ECDH(ecdhPrivV, ecdhPubC) || nonceV || nonceC)
+//
+// Fields:
+//   ctrlLtPub    (64B) — controller long-term signing public key
+//   ctrlCertSig  (64B) — CA sig over SHA256(b"ctrl" || ctrlLtPub(64B))
+//   ecdhPubC     (64B) — controller ephemeral ECDH public key (x||y)
+//   nonceC       (32B) — controller random nonce
+//   handshakeSig (64B) — controller sig over SHA256(ecdhPubV||ecdhPubC||nonceV||nonceC)
+// ---------------------------------------------------------------------------
+
+class Ctrl2VehicleAckTag : public Tag
+{
+  public:
+    static constexpr uint32_t ECDH_BYTES  = 64;
+    static constexpr uint32_t SIG_BYTES   = 64;
+    static constexpr uint32_t NONCE_BYTES = 32;
+
+    uint8_t  ctrlLtPub    [ECDH_BYTES]  = {};
+    uint8_t  ctrlCertSig  [SIG_BYTES]   = {};
+    uint8_t  ecdhPubC     [ECDH_BYTES]  = {};
+    uint8_t  nonceC       [NONCE_BYTES] = {};
+    uint8_t  handshakeSig [SIG_BYTES]   = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::Ctrl2VehicleAckTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<Ctrl2VehicleAckTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return Ctrl2VehicleAckTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override
+    {
+        return ECDH_BYTES + SIG_BYTES + ECDH_BYTES + NONCE_BYTES + SIG_BYTES;
+    }
+    void Serialize(TagBuffer i) const override
+    {
+        i.Write(ctrlLtPub,    ECDH_BYTES);
+        i.Write(ctrlCertSig,  SIG_BYTES);
+        i.Write(ecdhPubC,     ECDH_BYTES);
+        i.Write(nonceC,       NONCE_BYTES);
+        i.Write(handshakeSig, SIG_BYTES);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        i.Read(ctrlLtPub,    ECDH_BYTES);
+        i.Read(ctrlCertSig,  SIG_BYTES);
+        i.Read(ecdhPubC,     ECDH_BYTES);
+        i.Read(nonceC,       NONCE_BYTES);
+        i.Read(handshakeSig, SIG_BYTES);
+    }
+    void Print(std::ostream& os) const override { os << "Ctrl2VehicleAckTag"; }
+};
+
+// ---------------------------------------------------------------------------
+// VehicleCtrlPendingHandshake — ephemeral state while V2CTRL_HELLO is in-flight.
+// Cleared once CTRL2V_ACK is verified and the session key is stored.
+// ---------------------------------------------------------------------------
+
+struct VehicleCtrlPendingHandshake
+{
+    bool                   active  = false;
+    std::vector<uint8_t>   ephPriv;   // 32 bytes
+    std::vector<uint8_t>   ephPub;    // 64 bytes
+    std::vector<uint8_t>   nonceV;    // 32 bytes
+};
+
+// ---------------------------------------------------------------------------
 // VehicleChannelState — per-vehicle secure channel state
 //
 // Tracks the in-flight handshake (ephemeral key + nonces) and, once the
@@ -1263,6 +1412,26 @@ extern std::vector<std::vector<uint8_t>>                             g_vehicleTo
 extern std::vector<std::map<uint32_t, std::vector<uint8_t>>>         g_vehiclePendingRegNonces;
 extern std::vector<std::map<uint32_t, std::vector<uint8_t>>>         g_rsuPendingChallenges;
 extern std::vector<std::map<uint32_t, uint32_t>>                     g_rsuVehicleTxSeqNums;
+
+// Vehicle↔Controller E2E session key infrastructure.
+// g_vehicleCertSigs        — per-vehicle CA-signed certificate (64B each).
+// g_ctrlSignPrivKey        — controller's long-term ECDSA signing private key (32B).
+// g_ctrlSignPubKey         — controller's long-term ECDSA signing public key (64B).
+// g_ctrlCertSig            — CA signature over SHA256("ctrl"||ctrlSignPub) (64B).
+// g_vehicleCtrlSessionKeys — per-vehicle V-Ctrl session key (32B); empty until established.
+// g_ctrlVehicleSessionKeys — controller side: vehicleId → 32B V-Ctrl session key.
+// g_vehicleCtrlTxSeqNums   — per-vehicle next-seq for V→Ctrl encrypted messages.
+// g_ctrlVehicleTxSeqNums   — per-vehicleId next-seq for Ctrl→V encrypted messages.
+// g_vehicleCtrlPending     — per-vehicle in-flight V2CTRL_HELLO ephemeral state.
+extern std::vector<std::vector<uint8_t>>         g_vehicleCertSigs;
+extern std::vector<uint8_t>                       g_ctrlSignPrivKey;
+extern std::vector<uint8_t>                       g_ctrlSignPubKey;
+extern std::vector<uint8_t>                       g_ctrlCertSig;
+extern std::vector<std::vector<uint8_t>>          g_vehicleCtrlSessionKeys;
+extern std::map<uint32_t, std::vector<uint8_t>>   g_ctrlVehicleSessionKeys;
+extern std::vector<uint32_t>                       g_vehicleCtrlTxSeqNums;
+extern std::map<uint32_t, uint32_t>               g_ctrlVehicleTxSeqNums;
+extern std::vector<VehicleCtrlPendingHandshake>   g_vehicleCtrlPending;
 
 // ---------------------------------------------------------------------------
 // Packet transmission utilities
