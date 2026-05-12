@@ -1724,6 +1724,7 @@ FindNearestRsu(uint32_t vehicleIndex)
     uint32_t nearest = 0;
     for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
     {
+        // Euclidean Distance
         double d = vMob->GetDistanceFrom(
             g_rsuNodes.Get(i)->GetObject<MobilityModel>());
         if (d < minDist) { minDist = d; nearest = i; }
@@ -2579,6 +2580,8 @@ SelectControllerTargetForRsu(uint32_t rsuIndex, ControllerVehicleRecord& target)
 // Vehicle↔Controller E2E channel — forward declarations
 // ---------------------------------------------------------------------------
 static void SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex);
+static void SendV2CtrlHelloForward(uint32_t rsuIndex, uint32_t vehicleId,
+                                   const V2CtrlHelloTag& helloTag);
 static void HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
                                      const V2CtrlHelloTag& helloTag);
 static void HandleCtrl2VehicleAck(uint32_t vehicleIndex, const Ctrl2VehicleAckTag& ackTag);
@@ -2713,6 +2716,74 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     std::cout << "[V-Ctrl] Vehicle " << vehicleIndex
               << ": V2CTRL_HELLO sent to RSU " << rsuIndex
               << " (V-Ctrl E2E channel initiation)\n";
+}
+
+// ---------------------------------------------------------------------------
+// SendV2CtrlHelloForward — RSU forwards the vehicle's V2CTRL_HELLO to the
+// controller over the encrypted RSU↔Controller backhaul.
+//
+// Vehicle→RSU confidentiality/integrity was already provided by the V-RSU
+// session key.  This function re-encrypts the deserialized V2CtrlHelloTag with
+// the RSU-controller shared key so the controller receives it through the real
+// network packet path, not through a direct function shortcut.
+// ---------------------------------------------------------------------------
+static void
+SendV2CtrlHelloForward(uint32_t rsuIndex, uint32_t vehicleId,
+                       const V2CtrlHelloTag& helloTag)
+{
+    if (rsuIndex >= N_RSUs) return;
+    if (helloTag.vehicleId != vehicleId)
+    {
+        std::cerr << "[V-Ctrl] RSU " << rsuIndex
+                  << ": V2CTRL_HELLO vehicle-id mismatch tag=" << helloTag.vehicleId
+                  << " relay=" << vehicleId << "\n";
+        return;
+    }
+    if (rsuIndex >= g_rsuCtrlSharedKeys.size() || g_rsuCtrlSharedKeys[rsuIndex].empty())
+    {
+        std::cerr << "[V-Ctrl] RSU " << rsuIndex
+                  << " has no ctrl shared key — cannot forward V2CTRL_HELLO\n";
+        return;
+    }
+
+    uint32_t ptSz = helloTag.GetSerializedSize();
+    std::vector<uint8_t> plaintext(ptSz);
+    TagBuffer tb(plaintext.data(), plaintext.data() + plaintext.size());
+    helloTag.Serialize(tb);
+
+    uint32_t seq = g_rsuCtrlTxSeqNums[rsuIndex]++;
+    std::vector<uint8_t> iv  = CryptoRandBytes(12);
+    std::vector<uint8_t> aad = BuildCtrlAad(rsuIndex, 0, seq);
+    std::vector<uint8_t> ciphertext =
+        CryptoAesGcmEncrypt(g_rsuCtrlSharedKeys[rsuIndex], iv, plaintext, aad);
+    if (ciphertext.empty())
+    {
+        std::cerr << "[V-Ctrl] RSU " << rsuIndex
+                  << ": V2CTRL_HELLO forward encrypt failed\n";
+        return;
+    }
+
+    CtrlSecureTag csTag;
+    csTag.rsuId     = rsuIndex;
+    csTag.direction = 0;  // RSU→Controller
+    csTag.seqNum    = seq;
+    std::memcpy(csTag.iv, iv.data(), 12);
+
+    Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
+    pkt->AddPacketTag(csTag);
+    SybilPacketTag sybTag(rsuIndex, rsuIndex, N_Vehicles + N_RSUs,
+                          static_cast<uint32_t>(V2CTRL_HELLO), ++g_seq,
+                          0.0, 0.0, 0.0, rsuIndex);
+    pkt->AddPacketTag(sybTag);
+
+    Ipv4Address ctrlAddr = g_wiredInterfaces.GetAddress(N_RSUs);
+    Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
+    sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
+    MetricsOnTransmit(1);
+
+    std::cout << "[V-Ctrl] RSU " << rsuIndex
+              << " → Controller  V2CTRL_HELLO forward vehicle=" << vehicleId
+              << " (RSU-Ctrl encrypted)\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -4784,7 +4855,7 @@ LogReceivedPacket(const std::string& receiverRole,
                         std::cout << "[V-Ctrl] RSU " << rId
                                   << ": V2CTRL_HELLO from vehicle=" << vId
                                   << " — relaying to controller\n";
-                        HandleRelayedV2CtrlHello(rId, vId, helloTag);
+                        SendV2CtrlHelloForward(rId, vId, helloTag);
                     }
                     else
                     {
