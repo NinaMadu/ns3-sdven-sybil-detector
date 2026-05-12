@@ -49,6 +49,7 @@ uint32_t N_Vehicles = 8;              ///< Number of vehicle nodes.
 uint32_t N_RSUs = 2;                  ///< Number of RSU edge nodes.
 double simTime = 12.0;                ///< Total simulation time (seconds).
 double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
+double beaconJitterMax = 0.02;        ///< Maximum random V2V beacon timing jitter (seconds).
 double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
 bool routing_test = true;             ///< true → small 3-vehicle/2-RSU/1-SDN test network.
 bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
@@ -57,6 +58,7 @@ bool controller_malicious_assumption = false; ///< Force controller to be malici
 uint32_t proposed_method = 0;         ///< Detection method: 0=none 1=rule-based 2=ML 3=FL 4=hybrid.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
+double v2vReliableRange = 100.0;      ///< Reliable local V2V beacon evaluation radius (metres).
 double rsuVehicleRecordTimeout = 3.0; ///< Seconds before an RSU forgets an unseen vehicle.
 double rsuVehicleTableSnapshotInterval = 1.0; ///< Periodic RSU table CSV snapshot interval.
 bool awarenessSnapshotSharingEnabled = true; ///< Periodically send full awareness snapshots.
@@ -66,6 +68,18 @@ double awarenessReportOverlap = 0.25;        ///< Seconds of overlap for delta r
 double vehicleNeighborTimeout = 3.0;         ///< Expire vehicle neighbor records after silence.
 double rsuAwarenessTimeout = 5.0;            ///< Expire RSU awareness rows/aggregates after silence.
 double controllerAwarenessTimeout = 8.0;     ///< Expire SDN global awareness records after silence.
+double channelHandshakeTimeout = 1.0;        ///< Retry V2RSU CHAN_HELLO after pending timeout.
+bool boundedRoadMobility = true;             ///< Keep vehicles inside a bounded road corridor.
+double roadStartX = 20.0;                    ///< Road corridor start x-coordinate.
+double roadLength = 800.0;                   ///< Road corridor length in metres.
+double roadBaseY = 40.0;                     ///< Centre y-coordinate of the road corridor.
+uint32_t roadLaneCount = 2;                  ///< Number of synthetic lanes.
+double laneSpacing = 4.0;                    ///< Spacing between lane centre lines.
+double rsuOffsetY = 60.0;                    ///< RSU offset from road centre line in metres.
+double vehicleSpacing = 35.0;                ///< Initial spacing between vehicles.
+double minVehicleSpeed = 8.0;                ///< Slowest vehicle speed in m/s.
+double maxVehicleSpeed = 16.0;               ///< Fastest vehicle speed in m/s.
+double mobilityUpdateInterval = 0.5;         ///< Seconds between bounded-road wrap checks.
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
 std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_table_log.csv";
@@ -1665,6 +1679,93 @@ DistanceBetween(const Vector& a, const Vector& b)
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+static double
+RoadEndX()
+{
+    return roadStartX + std::max(roadLength, vehicleSpacing);
+}
+
+static double
+VehicleLaneY(uint32_t vehicleIndex)
+{
+    uint32_t lanes = std::max(1u, roadLaneCount);
+    uint32_t lane = vehicleIndex % lanes;
+    double centre = (static_cast<double>(lanes) - 1.0) / 2.0;
+    return roadBaseY + (static_cast<double>(lane) - centre) * laneSpacing;
+}
+
+static double
+VehicleSpeed(uint32_t vehicleIndex)
+{
+    if (maxVehicleSpeed <= minVehicleSpeed)
+        return minVehicleSpeed;
+
+    uint32_t lanes = std::max(1u, roadLaneCount);
+    uint32_t classIndex = (vehicleIndex / lanes) % 5u;
+    double fraction = static_cast<double>(classIndex) / 4.0;
+    return minVehicleSpeed + fraction * (maxVehicleSpeed - minVehicleSpeed);
+}
+
+static Vector
+InitialVehiclePosition(uint32_t vehicleIndex)
+{
+    double length = std::max(roadLength, vehicleSpacing);
+    double x = roadStartX + std::fmod(static_cast<double>(vehicleIndex) * vehicleSpacing,
+                                      length);
+    return Vector(x, VehicleLaneY(vehicleIndex), 0.0);
+}
+
+static Vector
+InitialRsuPosition(uint32_t rsuIndex)
+{
+    uint32_t rsuCount = std::max(1u, N_RSUs);
+    double usableLength = std::max(roadLength, vehicleSpacing);
+    double spacing = usableLength / static_cast<double>(rsuCount);
+    double x = roadStartX + spacing * (static_cast<double>(rsuIndex) + 0.5);
+    return Vector(x, roadBaseY + rsuOffsetY, 0.0);
+}
+
+static void
+ApplyBoundedRoadVehicleState(uint32_t vehicleIndex)
+{
+    if (vehicleIndex >= g_vehicleNodes.GetN())
+        return;
+
+    Ptr<ConstantVelocityMobilityModel> mob =
+        g_vehicleNodes.Get(vehicleIndex)->GetObject<ConstantVelocityMobilityModel>();
+    if (!mob)
+        return;
+
+    Vector pos = mob->GetPosition();
+    double startX = roadStartX;
+    double endX = RoadEndX();
+    double length = std::max(endX - startX, vehicleSpacing);
+
+    while (pos.x > endX)
+        pos.x -= length;
+    while (pos.x < startX)
+        pos.x += length;
+
+    pos.y = VehicleLaneY(vehicleIndex);
+    pos.z = 0.0;
+    mob->SetPosition(pos);
+    mob->SetVelocity(Vector(VehicleSpeed(vehicleIndex), 0.0, 0.0));
+}
+
+static void
+UpdateBoundedRoadMobility()
+{
+    if (!boundedRoadMobility)
+        return;
+
+    for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+        ApplyBoundedRoadVehicleState(i);
+
+    double next = Simulator::Now().GetSeconds() + mobilityUpdateInterval;
+    if (mobilityUpdateInterval > 0.0 && next < simTime)
+        Simulator::Schedule(Seconds(mobilityUpdateInterval), &UpdateBoundedRoadMobility);
+}
+
 static void
 LogRsuVehicleTableEvent(const std::string& event,
                         uint32_t rsuIndex,
@@ -2580,7 +2681,7 @@ SendRegChallenge(uint32_t rsuIndex, uint32_t vehicleIndex)
     Ipv4Address vAddr = g_wirelessInterfaces.GetAddress(vehicleIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_CHALLENGE), 1);
 
     std::cout << "[Reg] RSU " << rsuIndex << " → Vehicle " << vehicleIndex
               << "  REG_CHALLENGE sent\n";
@@ -2664,7 +2765,7 @@ SendRegRequest(uint32_t vehicleIndex, uint32_t rsuIndex, const std::vector<uint8
     Ipv4Address rsuAddr = g_wirelessInterfaces.GetAddress(rsuWirelessIdx);
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_REQUEST), 1);
 
     std::cout << "[Reg] Vehicle " << vehicleIndex << " → RSU " << rsuIndex
               << "  REG_REQUEST sent\n";
@@ -2720,7 +2821,7 @@ SendRegForward(uint32_t rsuIndex, uint32_t vehicleId, uint64_t vin,
     Ipv4Address ctrlAddr = g_wiredInterfaces.GetAddress(N_RSUs);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_FORWARD), 1);
 
     std::cout << "[Reg] RSU " << rsuIndex << " → Controller  REG_FORWARD vehicle="
               << vehicleId << "\n";
@@ -2775,7 +2876,7 @@ SendRegResponse(uint32_t originRsuIndex, uint32_t vehicleId,
     Ipv4Address rsuAddr = g_wiredInterfaces.GetAddress(originRsuIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_RESPONSE), 1);
 
     std::cout << "[Reg] Controller → RSU " << originRsuIndex
               << "  REG_RESPONSE vehicle=" << vehicleId << "\n";
@@ -2832,7 +2933,7 @@ SendRegConfirm(uint32_t rsuIndex, uint32_t vehicleIndex,
     Ipv4Address vAddr = g_wirelessInterfaces.GetAddress(vehicleIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_CONFIRM), 1);
 
     std::cout << "[Reg] RSU " << rsuIndex << " → Vehicle " << vehicleIndex
               << "  REG_CONFIRM (token delivered)\n";
@@ -3599,6 +3700,7 @@ HandleChanHello(uint32_t rsuIndex, const ChanHelloTag& hello)
     sock->SendTo(ackPkt, 0,
                  InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleId),
                                    VEHICLE_PORT));
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(CHAN_ACK), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -3711,6 +3813,7 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     hs.ephPriv = ephPriv;
     hs.ephPub  = ephPub;
     hs.nonceV  = nonceV;
+    hs.startTime = Simulator::Now().GetSeconds();
     g_vehicleChannelState[vehicleIndex].pending[rsuIndex] = hs;
 
     ChanHelloTag helloTag;
@@ -3735,6 +3838,7 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     sock->SendTo(pkt, 0,
                  InetSocketAddress(g_wirelessInterfaces.GetAddress(rsuWirelessIdx),
                                    RSU_PORT));
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(CHAN_HELLO), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -4248,6 +4352,10 @@ LogReceivedPacket(const std::string& receiverRole,
 
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
     MetricsOnReceive(isSybil, delay, countForPDR);
+    if (hasTag)
+    {
+        MetricsOnReceiveForMessage(messageType, delay, countForPDR);
+    }
 
     bool isDetectionMetricsCandidate =
         hasTag &&
@@ -4340,7 +4448,7 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
         packet->AddPacketTag(baseTag);
         packet->AddPacketTag(csTag);
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
-        MetricsOnTransmit(1);
+        MetricsOnTransmitForMessage(static_cast<uint32_t>(RSU2CONTROLLER_REPORT), 1);
         std::cout << "[Security] RSU2CTRL encrypted OK RSU=" << rsuIndex
                   << " records=" << batchTag.GetRecordCount()
                   << " ctBytes=" << ciphertext.size() << "\n";
@@ -4354,7 +4462,7 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(batchTag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(RSU2CONTROLLER_REPORT), 1);
 }
 
 static void
@@ -4404,7 +4512,7 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
         packet->AddPacketTag(baseTag);
         packet->AddPacketTag(csTag);
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
-        MetricsOnTransmit(1);
+        MetricsOnTransmitForMessage(static_cast<uint32_t>(CONTROLLER2RSU_COMMAND), 1);
         std::cout << "[Security] CTRL2RSU encrypted OK RSU=" << rsuIndex
                   << " target=" << target.realVehicleId << "\n";
         return;
@@ -4417,7 +4525,7 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(commandTag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(CONTROLLER2RSU_COMMAND), 1);
 }
 
 static void
@@ -4486,17 +4594,37 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
         packet->AddPacketTag(scTag);
 
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
-        MetricsOnTransmit(1);
+        MetricsOnTransmitForMessage(static_cast<uint32_t>(V2RSU_REPORT), 1);
         return;
     }
 
-    // ── No session yet — block the report completely ──────────────────────
-    // Sending an unencrypted report would expose vehicle data in plaintext
-    // and bypass token authentication.  Drop it silently; the vehicle will
-    // retry once the CHAN_HELLO/CHAN_ACK handshake completes.
-    std::cout << "[Security] BLOCKED V2RSU: no session V=" << vehicleIndex
-              << "->RSU=" << rsuIndex << " — report held until handshake completes."
-              << std::endl;
+    // ── No session yet — request secure handover, then block this report ───
+    // Mobility can bring a vehicle into a different RSU's area after the
+    // startup handshakes.  Start CHAN_HELLO on demand, but keep the current
+    // report blocked so V2RSU data never bypasses token authentication.
+    auto pendingIt = chanState.pending.find(rsuIndex);
+    bool pendingExpired = false;
+    if (pendingIt != chanState.pending.end() && channelHandshakeTimeout > 0.0)
+    {
+        double pendingAge = Simulator::Now().GetSeconds() - pendingIt->second.startTime;
+        pendingExpired = (pendingAge >= channelHandshakeTimeout);
+    }
+
+    if (pendingIt == chanState.pending.end() || pendingExpired)
+    {
+        SendChanHello(vehicleIndex, rsuIndex);
+        std::cout << "[Security] V2RSU handover: no session V=" << vehicleIndex
+                  << "->RSU=" << rsuIndex
+                  << " — CHAN_HELLO requested; report held until handshake completes."
+                  << std::endl;
+    }
+    else
+    {
+        std::cout << "[Security] BLOCKED V2RSU: pending session V=" << vehicleIndex
+                  << "->RSU=" << rsuIndex
+                  << " — report held until handshake completes."
+                  << std::endl;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4560,8 +4688,29 @@ SendRsuControllerReport(uint32_t rsuIndex)
     // Type 5: malicious RSU upserts fabricated Sybil records into its own regional
     // awareness table before reporting.  The controller receives and stores them as
     // legitimate vehicles, propagating the Sybil IDs upward.
-    if (sybil_attack_enabled && rsuIndex < g_rsuRegionalAwarenessTables.size())
+    bool maliciousRsuInjection =
+        sybil_attack_enabled &&
+        IsRsuMalicious(rsuIndex) &&
+        rsuIndex < g_rsuRegionalAwarenessTables.size();
+    if (maliciousRsuInjection)
+    {
         InjectSybilRecordsIntoRsuTable(rsuIndex, g_rsuRegionalAwarenessTables[rsuIndex]);
+
+        for (uint32_t k = 0; k < N_SYBIL_RSU; ++k)
+        {
+            uint32_t sybilId = N_Vehicles + 100u + rsuIndex * N_SYBIL_RSU + k;
+            auto it = g_rsuRegionalAwarenessTables[rsuIndex].find(sybilId);
+            if (it == g_rsuRegionalAwarenessTables[rsuIndex].end())
+                continue;
+
+            it->second.suspicionFlags |= SUSPICION_UNCORROBORATED_RSU_APPROVAL;
+            LogRsuRegionalAwarenessEvent("malicious_rsu_phantom_injected",
+                                         rsuIndex,
+                                         it->second,
+                                         "phantom_from_malicious_rsu",
+                                         0);
+        }
+    }
 
     if (rsuIndex < g_rsuRegionalAwarenessTables.size() &&
         !g_rsuRegionalAwarenessTables[rsuIndex].empty())
@@ -4877,7 +5026,7 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
                 sock->SendTo(encPkt, 0,
                              InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleIndex),
                                                VEHICLE_PORT));
-                MetricsOnTransmit(1);
+                MetricsOnTransmitForMessage(static_cast<uint32_t>(RSU2VEHICLE_COMMAND), 1);
                 std::cout << "[Security] RSU2VEH encrypted OK RSU=" << rsuIndex
                           << " Vehicle=" << vehicleIndex << "\n";
                 return;
@@ -4885,13 +5034,12 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
         }
     }
 
-    // ── Fallback: no session key — send plaintext with warning ────────────
-    std::cout << "[Security] RSU2VEH WARNING: no session key RSU=" << rsuIndex
-              << " Vehicle=" << vehicleIndex << " — sending plaintext command\n";
-    SendTaggedPacket(sock,
-                     g_wirelessInterfaces.GetAddress(vehicleIndex),
-                     VEHICLE_PORT,
-                     tx);
+    // No RSU-vehicle session: keep the downlink closed instead of falling back
+    // to plaintext. V2RSU handover logic establishes this session before
+    // trusted records and commands should normally exist for this RSU.
+    std::cout << "[Security] RSU2VEH blocked: no session key RSU=" << rsuIndex
+              << " Vehicle=" << vehicleIndex
+              << " Source=" << source << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -5043,6 +5191,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("simTime",                         simTime);
     getBool  ("routing_test",                    routing_test);
     getDouble("beaconInterval",                  beaconInterval);
+    getDouble("beaconJitterMax",                 beaconJitterMax);
     getDouble("rsuReportInterval",               rsuReportInterval);
     getBool  ("sybil_attack_enabled",            sybil_attack_enabled);
     getUint  ("sybil_attack_type",               sybil_attack_type);
@@ -5050,6 +5199,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getBool  ("controller_malicious_assumption", controller_malicious_assumption);
     getUint  ("proposed_method",                 proposed_method);
     getDouble("rsuCoverageRange",                rsuCoverageRange);
+    getDouble("v2vReliableRange",                v2vReliableRange);
     getDouble("rsuVehicleRecordTimeout",         rsuVehicleRecordTimeout);
     getDouble("rsuVehicleTableSnapshotInterval", rsuVehicleTableSnapshotInterval);
     getBool  ("awarenessSnapshotSharingEnabled", awarenessSnapshotSharingEnabled);
@@ -5059,6 +5209,18 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("vehicleNeighborTimeout",          vehicleNeighborTimeout);
     getDouble("rsuAwarenessTimeout",             rsuAwarenessTimeout);
     getDouble("controllerAwarenessTimeout",      controllerAwarenessTimeout);
+    getDouble("channelHandshakeTimeout",         channelHandshakeTimeout);
+    getBool  ("boundedRoadMobility",             boundedRoadMobility);
+    getDouble("roadStartX",                      roadStartX);
+    getDouble("roadLength",                      roadLength);
+    getDouble("roadBaseY",                       roadBaseY);
+    getUint  ("roadLaneCount",                   roadLaneCount);
+    getDouble("laneSpacing",                     laneSpacing);
+    getDouble("rsuOffsetY",                      rsuOffsetY);
+    getDouble("vehicleSpacing",                  vehicleSpacing);
+    getDouble("minVehicleSpeed",                 minVehicleSpeed);
+    getDouble("maxVehicleSpeed",                 maxVehicleSpeed);
+    getDouble("mobilityUpdateInterval",          mobilityUpdateInterval);
 }
 
 // ===========================================================================
@@ -5093,6 +5255,7 @@ main(int argc, char* argv[])
     cmd.AddValue("simTime",                    "Simulation time in seconds",             simTime);
     cmd.AddValue("routing_test",               "Small 3-vehicle/2-RSU/1-SDN test network", routing_test);
     cmd.AddValue("beaconInterval",             "Vehicle beacon period",                  beaconInterval);
+    cmd.AddValue("beaconJitterMax",            "Maximum random V2V beacon timing jitter in seconds", beaconJitterMax);
     cmd.AddValue("rsuReportInterval",          "RSU→Controller report period",           rsuReportInterval);
     cmd.AddValue("sybil_attack_enabled",       "Enable Sybil attack behavior",           sybil_attack_enabled);
     cmd.AddValue("sybil_attack_type",          "Attack variant 0-6 (see sybil_attacks.h)",sybil_attack_type);
@@ -5100,6 +5263,7 @@ main(int argc, char* argv[])
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
     cmd.AddValue("proposed_method",            "Detection method 0=none 1=rule 2=ML 3=FL 4=hybrid",proposed_method);
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
+    cmd.AddValue("v2vReliableRange",           "Reliable local V2V beacon evaluation radius in metres", v2vReliableRange);
     cmd.AddValue("rsuVehicleRecordTimeout",    "Seconds before an RSU forgets a vehicle",rsuVehicleRecordTimeout);
     cmd.AddValue("rsuVehicleTableSnapshotInterval","Seconds between RSU table CSV snapshots",rsuVehicleTableSnapshotInterval);
     cmd.AddValue("awarenessSnapshotSharingEnabled","Enable periodic full awareness snapshots",awarenessSnapshotSharingEnabled);
@@ -5109,6 +5273,18 @@ main(int argc, char* argv[])
     cmd.AddValue("vehicleNeighborTimeout",     "Seconds before a vehicle expires a neighbor record",vehicleNeighborTimeout);
     cmd.AddValue("rsuAwarenessTimeout",        "Seconds before an RSU expires awareness rows/aggregates",rsuAwarenessTimeout);
     cmd.AddValue("controllerAwarenessTimeout", "Seconds before controller expires global awareness",controllerAwarenessTimeout);
+    cmd.AddValue("channelHandshakeTimeout",    "Seconds before retrying a pending V2RSU channel handshake",channelHandshakeTimeout);
+    cmd.AddValue("boundedRoadMobility",        "Keep vehicles inside a bounded multi-lane road corridor",boundedRoadMobility);
+    cmd.AddValue("roadStartX",                 "Bounded road start x-coordinate",roadStartX);
+    cmd.AddValue("roadLength",                 "Bounded road length in metres",roadLength);
+    cmd.AddValue("roadBaseY",                  "Bounded road centre y-coordinate",roadBaseY);
+    cmd.AddValue("roadLaneCount",              "Number of synthetic road lanes",roadLaneCount);
+    cmd.AddValue("laneSpacing",                "Lane centre spacing in metres",laneSpacing);
+    cmd.AddValue("rsuOffsetY",                 "RSU offset from road centre line in metres",rsuOffsetY);
+    cmd.AddValue("vehicleSpacing",             "Initial vehicle spacing in metres",vehicleSpacing);
+    cmd.AddValue("minVehicleSpeed",            "Minimum bounded-road vehicle speed in m/s",minVehicleSpeed);
+    cmd.AddValue("maxVehicleSpeed",            "Maximum bounded-road vehicle speed in m/s",maxVehicleSpeed);
+    cmd.AddValue("mobilityUpdateInterval",     "Seconds between bounded-road wrap checks",mobilityUpdateInterval);
     cmd.Parse(argc, argv);
 
     if (routing_test)
@@ -5176,41 +5352,44 @@ main(int argc, char* argv[])
     // Mobility
     // -----------------------------------------------------------------------
 
-    // Tier 1 — Vehicles: evenly spaced along a horizontal road (y=40).
-    // V0=(20,40)  V1=(60,40)  V2=(100,40)
-    // 40 m gaps stay within Cost231 propagation range at 5.9 GHz / 23 dBm.
-    // Each vehicle moves east at a slightly different speed so their separation
-    // is visible in NetAnim over the 12-second window.
+    // Tier 1 — Vehicles: bounded multi-lane road corridor.
+    // Vehicles keep using ConstantVelocityMobilityModel so BSM speed/heading,
+    // RSSI checks, attack placement, and NetAnim continue to use the same API.
     MobilityHelper vehicleMobility;
     vehicleMobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
     vehicleMobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                         "MinX",      DoubleValue(20.0),
-                                         "MinY",      DoubleValue(40.0),
-                                         "DeltaX",    DoubleValue(40.0),
+                                         "MinX",      DoubleValue(roadStartX),
+                                         "MinY",      DoubleValue(roadBaseY),
+                                         "DeltaX",    DoubleValue(vehicleSpacing),
                                          "DeltaY",    DoubleValue(0.0),
-                                         "GridWidth", UintegerValue(3),
+                                         "GridWidth", UintegerValue(std::max(1u, N_Vehicles)),
                                          "LayoutType",StringValue("RowFirst"));
     vehicleMobility.Install(g_vehicleNodes);
 
     for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
     {
         auto mob = g_vehicleNodes.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-        mob->SetVelocity(Vector(2.0 + i, 0.0, 0.0));   // 2, 3, 4 m/s east
+        if (boundedRoadMobility)
+        {
+            mob->SetPosition(InitialVehiclePosition(i));
+            mob->SetVelocity(Vector(VehicleSpeed(i), 0.0, 0.0));
+        }
+        else
+        {
+            mob->SetVelocity(Vector(2.0 + i, 0.0, 0.0));
+        }
     }
 
-    // Tier 2 — RSUs: fixed above the road, one per coverage zone.
-    // RSU-0=(40,100)  RSU-1=(100,100)
-    // Each RSU is ~60 m above its vehicle cluster, well within link budget.
+    // Tier 2 — RSUs: fixed above the road and evenly distributed along the
+    // bounded corridor.  Each RSU is placed at the centre of its road segment,
+    // e.g. 800 m / 8 RSUs -> about 100 m between RSUs.
     MobilityHelper rsuMobility;
     rsuMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    rsuMobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                     "MinX",      DoubleValue(40.0),
-                                     "MinY",      DoubleValue(100.0),
-                                     "DeltaX",    DoubleValue(60.0),
-                                     "DeltaY",    DoubleValue(0.0),
-                                     "GridWidth", UintegerValue(N_RSUs),
-                                     "LayoutType",StringValue("RowFirst"));
     rsuMobility.Install(g_rsuNodes);
+    for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
+    {
+        g_rsuNodes.Get(i)->GetObject<MobilityModel>()->SetPosition(InitialRsuPosition(i));
+    }
 
     // Tier 3 — SDN controller: centred above both RSUs.
     // SDN=(70,190) — wired backhaul, physical position is cosmetic only.
@@ -5318,8 +5497,8 @@ main(int argc, char* argv[])
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211p);
     wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                 "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                 "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                 "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                 "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                  "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac;
     wifiMac.SetType("ns3::AdhocWifiMac");
@@ -5327,8 +5506,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_172;
     wifi_172.SetStandard(WIFI_STANDARD_80211p);
     wifi_172.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_172;
     wifiMac_172.SetType("ns3::AdhocWifiMac");
@@ -5336,8 +5515,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_174;
     wifi_174.SetStandard(WIFI_STANDARD_80211p);
     wifi_174.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_174;
     wifiMac_174.SetType("ns3::AdhocWifiMac");
@@ -5345,8 +5524,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_176;
     wifi_176.SetStandard(WIFI_STANDARD_80211p);
     wifi_176.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_176;
     wifiMac_176.SetType("ns3::AdhocWifiMac");
@@ -5354,8 +5533,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_180;
     wifi_180.SetStandard(WIFI_STANDARD_80211p);
     wifi_180.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_180;
     wifiMac_180.SetType("ns3::AdhocWifiMac");
@@ -5363,8 +5542,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_182;
     wifi_182.SetStandard(WIFI_STANDARD_80211p);
     wifi_182.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_182;
     wifiMac_182.SetType("ns3::AdhocWifiMac");
@@ -5372,8 +5551,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_184;
     wifi_184.SetStandard(WIFI_STANDARD_80211p);
     wifi_184.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_184;
     wifiMac_184.SetType("ns3::AdhocWifiMac");
@@ -5456,21 +5635,21 @@ main(int argc, char* argv[])
     // Normal traffic scheduling
     // -----------------------------------------------------------------------
 
-    // Secure channel handshake: each vehicle sends CHAN_HELLO to its nearest
-    // RSU at t=0.5s (staggered by 0.05s per vehicle).  The RSU responds with
-    // CHAN_ACK immediately, establishing the session key.  This completes well
-    // before the first V2RSU report at t≈1.1s.
-    // Each vehicle establishes a session with every RSU so reports are always
-    // encrypted regardless of which RSU the vehicle is nearest to at report time.
+    Ptr<UniformRandomVariable> beaconJitterRv = CreateObject<UniformRandomVariable>();
+    beaconJitterRv->SetAttribute("Min", DoubleValue(0.0));
+    beaconJitterRv->SetAttribute("Max", DoubleValue(std::max(0.0, beaconJitterMax)));
+
+    // Secure channel warm-up: each vehicle handshakes only with the nearest RSU.
+    // Later handovers are handled on demand inside SendV2RsuAwarenessPacket(),
+    // which starts CHAN_HELLO and holds the report until a session exists.
     for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
     {
         if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
             continue;
-        for (uint32_t r = 0; r < g_rsuNodes.GetN(); ++r)
-        {
-            double t_hello = 0.5 + 0.04 * (i * g_rsuNodes.GetN() + r);
-            Simulator::Schedule(Seconds(t_hello), &SendChanHello, i, r);
-        }
+
+        uint32_t r = FindNearestRsu(i);
+        double t_hello = 0.5 + 0.04 * i;
+        Simulator::Schedule(Seconds(t_hello), &SendChanHello, i, r);
     }
 
     // Tier 1: V2V broadcast beacons + V2RSU reports
@@ -5496,7 +5675,8 @@ main(int argc, char* argv[])
             v2v->messageType   = static_cast<uint32_t>(V2V_BEACON);
             v2v->sequenceNumber = g_seq++;
 
-            Simulator::Schedule(Seconds(t + 0.05 * i),
+            double jitter = (beaconJitterMax > 0.0) ? beaconJitterRv->GetValue() : 0.0;
+            Simulator::Schedule(Seconds(t + 0.05 * i + jitter),
                                 &SendV2VBeaconTagged,
                                 vehicleSocket,
                                 Ipv4Address("10.1.1.255"),
@@ -5542,6 +5722,8 @@ main(int argc, char* argv[])
     Simulator::Schedule(Seconds(1.0), &FlushMetrics);
     if (rsuVehicleTableSnapshotInterval > 0.0)
         Simulator::Schedule(Seconds(rsuVehicleTableSnapshotInterval), &SnapshotRsuVehicleTables);
+    if (boundedRoadMobility && mobilityUpdateInterval > 0.0)
+        Simulator::Schedule(Seconds(mobilityUpdateInterval), &UpdateBoundedRoadMobility);
     g_secMetrics->ScheduleAll(simTime);
 
     // -----------------------------------------------------------------------

@@ -850,6 +850,7 @@ struct VehicleChannelState
         std::vector<uint8_t> ephPriv;  // 32 bytes
         std::vector<uint8_t> ephPub;   // 64 bytes
         std::vector<uint8_t> nonceV;   // 32 bytes
+        double startTime = 0.0;         // simulation seconds
     };
     std::map<uint32_t, PendingHandshake>       pending;     // rsu_id → in-flight state
     // Once the CHAN_ACK is verified the session key is moved here.
@@ -1224,6 +1225,8 @@ extern Ipv4InterfaceContainer   g_wirelessInterfaces;
 extern Ipv4InterfaceContainer   g_wiredInterfaces;
 extern uint32_t                 g_seq;
 extern std::vector<uint32_t>    g_rsuReportCount;
+extern double                   rsuCoverageRange;
+extern double                   v2vReliableRange;
 
 // Vehicle ECDSA key material — DEFINED in Sybil-Developing-Improved.cc,
 // populated by LoadVehicleKeys() before Simulator::Run().
@@ -1374,10 +1377,34 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
     }
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
 
-    // V2V broadcast: one send reaches (N_Vehicles-1) other vehicles.
-    // All other flows are unicast: expect exactly 1 delivery.
-    uint32_t expectedDeliveries = (tx->destinationId == 0xFFFFFFFF)
-                                  ? (N_Vehicles > 1 ? N_Vehicles - 1 : 1)
-                                  : 1;
-    MetricsOnTransmit(expectedDeliveries);
+    // V2V broadcast in VANETs is a local-neighbour service, not a network-wide
+    // broadcast to every vehicle in the simulation.  For PDR, count only nearby
+    // vehicles in the reliable local awareness zone as intended receivers; ns-3
+    // still decides which of those packets are actually delivered over WiFi.
+    uint32_t expectedDeliveries = 1;
+    if (tx->destinationId == 0xFFFFFFFF)
+    {
+        expectedDeliveries = 0;
+        if (tx->realNodeId < g_vehicleNodes.GetN())
+        {
+            Ptr<MobilityModel> senderMob =
+                g_vehicleNodes.Get(tx->realNodeId)->GetObject<MobilityModel>();
+            if (senderMob)
+            {
+                for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+                {
+                    if (i == tx->realNodeId)
+                        continue;
+                    Ptr<MobilityModel> receiverMob =
+                        g_vehicleNodes.Get(i)->GetObject<MobilityModel>();
+                    if (receiverMob &&
+                        senderMob->GetDistanceFrom(receiverMob) <= v2vReliableRange)
+                    {
+                        ++expectedDeliveries;
+                    }
+                }
+            }
+        }
+    }
+    MetricsOnTransmitForMessage(tx->messageType, expectedDeliveries);
 }

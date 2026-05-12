@@ -358,7 +358,7 @@ OutsiderSendSybilReport(uint32_t vehicleIndex)
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     Ipv4Address rsuIp = g_wirelessInterfaces.GetAddress(N_Vehicles + nearestRsu);
     sock->SendTo(packet, 0, InetSocketAddress(rsuIp, RSU_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(V2RSU_REPORT), 1);
     ++g_seq;
 }
 

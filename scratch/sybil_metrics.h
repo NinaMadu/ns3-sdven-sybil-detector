@@ -21,7 +21,7 @@
 //       g_secMetrics->Initialize(N_Vehicles, N_RSUs, proposed_method);
 //         — after routing_test / N_RSUs adjustments, before Simulator::Run()
 //   4.  MetricsOnTransmit(expectedDeliveries)
-//         — inside SendTaggedPacket();  unicast=1, V2V-broadcast=N_Vehicles-1
+//         — inside SendTaggedPacket();  unicast=1, V2V-broadcast=nearby vehicles
 //   5.  MetricsOnReceive(isSybil, delay, countForPDR)
 //   6.  g_secMetrics->OnPacketReceived(...)
 //         — both 5 & 6 called from LogReceivedPacket()
@@ -61,6 +61,8 @@ extern uint32_t sybil_attack_percentage;
 extern double   simTime;
 extern uint32_t N_Vehicles;
 extern uint32_t N_RSUs;
+extern double   rsuCoverageRange;
+extern double   v2vReliableRange;
 
 // =============================================================================
 // M1–M4  CSV output paths
@@ -70,6 +72,7 @@ static std::string metricsPdrCsv        = "sybil-attack/outputs/metrics_M1_PDR.c
 static std::string metricsLatencyCsv    = "sybil-attack/outputs/metrics_M2_Latency.csv";
 static std::string metricsAttractionCsv = "sybil-attack/outputs/metrics_M3_PacketAttraction.csv";
 static std::string metricsCongestionCsv = "sybil-attack/outputs/metrics_M4_Congestion.csv";
+static std::string metricsTierSummaryCsv = "sybil-attack/outputs/metrics_tier_summary.csv";
 
 // =============================================================================
 // M1–M4  Cumulative counters
@@ -101,6 +104,27 @@ static uint64_t g_windowSybilDiverted = 0;
 static uint64_t g_windowAllReceived   = 0;
 static uint64_t g_windowFalseTraffic  = 0;
 static uint64_t g_windowLegitimate    = 0;
+
+struct TierMetricCounter
+{
+    std::string tier;
+    std::string channel;
+    std::string description;
+    uint64_t transmitted = 0;
+    uint64_t delivered = 0;
+    double delaySum = 0.0;
+    uint64_t delayCount = 0;
+};
+
+static std::vector<TierMetricCounter> g_tierMetrics = {
+    {"v2v_beacon", "wifi_80211p", "Vehicle-to-vehicle local beacon awareness"},
+    {"v2rsu_report", "wifi_80211p", "Vehicle-to-RSU reports and vehicle-to-RSU security setup"},
+    {"rsu2vehicle_downlink", "wifi_80211p", "RSU-to-vehicle commands and registration/token responses"},
+    {"rsu2controller_backhaul", "csma_backhaul", "RSU-to-controller awareness and registration forwarding"},
+    {"controller2rsu_backhaul", "csma_backhaul", "Controller-to-RSU commands and registration responses"},
+    {"sybil_injection", "logical_attack", "Fabricated attack injection traffic"},
+    {"other", "mixed", "Other tagged traffic"}
+};
 
 // =============================================================================
 // M5–M10  Detection mode constants
@@ -591,11 +615,18 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         std::string tier     = RoleToTier(receiverRole);
         std::string modeStr  = ModeLabel(m_proposedMethod);
 
-        // M10: wall-clock measured with std::chrono around detector call
-        auto   t0          = std::chrono::high_resolution_clock::now();
-        double confidence   = m_detector->ComputeConfidence(rec, m_proposedMethod);
-        auto   t1          = std::chrono::high_resolution_clock::now();
-        double wallClockMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        // M10: wall-clock measured around detector call.  In MODE_NONE the
+        // behavioral detector is intentionally disabled, so confidence and cost
+        // must stay zero for a true "no detection" experiment.
+        double confidence  = 0.0;
+        double wallClockMs = 0.0;
+        if (m_proposedMethod != MODE_NONE)
+        {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            confidence = m_detector->ComputeConfidence(rec, m_proposedMethod);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            wallClockMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
 
         bool isFlagged = (confidence >= m_detector->GetThreshold());
 
@@ -961,13 +992,52 @@ static Ptr<SecurityEvaluationMetrics> g_secMetrics;
 // M1–M4  Metric update hooks
 // =============================================================================
 
-// expectedDeliveries: 1 for unicast; (N_Vehicles - 1) for V2V broadcast so that
-// the PDR denominator equals actual intended recipients, not raw send count.
+// expectedDeliveries: 1 for unicast; for V2V broadcast, the sender passes the
+// number of current neighbour vehicles inside communication range.  This keeps
+// M1 aligned with SDVEN/VANET local awareness instead of assuming every vehicle
+// in the whole simulation is an intended receiver.
 static inline void
 MetricsOnTransmit(uint32_t expectedDeliveries = 1)
 {
     g_totalTransmitted += expectedDeliveries;
     g_windowTransmitted += expectedDeliveries;
+}
+
+static inline uint32_t
+MetricTierIndexForMessage(uint32_t messageType)
+{
+    switch (messageType)
+    {
+    case 1:  return 0; // V2V_BEACON
+    case 2:  // V2RSU_REPORT
+    case 7:  // CHAN_HELLO
+    case 10: // REG_REQUEST
+        return 1;
+    case 5:  // RSU2VEHICLE_COMMAND
+    case 8:  // CHAN_ACK
+    case 9:  // REG_CHALLENGE
+    case 13: // REG_CONFIRM
+        return 2;
+    case 3:  // RSU2CONTROLLER_REPORT
+    case 11: // REG_FORWARD
+        return 3;
+    case 4:  // CONTROLLER2RSU_COMMAND
+    case 12: // REG_RESPONSE
+        return 4;
+    case 6:  return 5; // SYBIL_INJECTION
+    default: return 6;
+    }
+}
+
+static inline void
+MetricsOnTransmitForMessage(uint32_t messageType, uint32_t expectedDeliveries = 1)
+{
+    MetricsOnTransmit(expectedDeliveries);
+    uint32_t tierIndex = MetricTierIndexForMessage(messageType);
+    if (tierIndex < g_tierMetrics.size())
+    {
+        g_tierMetrics[tierIndex].transmitted += expectedDeliveries;
+    }
 }
 
 // isSybil     : realNodeId != claimedNodeId (Sybil identity spoofing detected)
@@ -1011,6 +1081,24 @@ MetricsOnReceive(bool isSybil, double delay, bool countForPDR = true)
     }
 }
 
+static inline void
+MetricsOnReceiveForMessage(uint32_t messageType, double delay, bool countForPDR = true)
+{
+    uint32_t tierIndex = MetricTierIndexForMessage(messageType);
+    if (tierIndex >= g_tierMetrics.size())
+        return;
+
+    if (countForPDR)
+    {
+        g_tierMetrics[tierIndex].delivered++;
+    }
+    if (delay > 0.0)
+    {
+        g_tierMetrics[tierIndex].delaySum += delay;
+        g_tierMetrics[tierIndex].delayCount++;
+    }
+}
+
 // =============================================================================
 // M1–M4  CSV initialisation
 // =============================================================================
@@ -1042,6 +1130,10 @@ InitializeMetricsCsvFiles()
             << "window_total_packets,window_congestion_ratio,"
             << "cumulative_false_traffic,cumulative_legitimate,cumulative_total,"
             << "cumulative_congestion_ratio,sybil_attack_enabled,sybil_percentage\n";
+    }
+    {
+        std::ofstream out(metricsTierSummaryCsv.c_str(), std::ios::out);
+        out << "tier,channel,transmitted,delivered,pdr,avg_latency_ms,latency_sample_count,description\n";
     }
 }
 
@@ -1190,7 +1282,7 @@ WriteFinalSummary()
 
     out << "metric,value,description\n"
         << "M1_total_transmitted,"     << g_totalTransmitted
-        << ",Total packets scheduled for transmission\n"
+        << ",Total intended packet deliveries; V2V uses in-range vehicle neighbours only\n"
         << "M1_total_delivered,"       << g_totalDelivered
         << ",Total packets successfully received\n"
         << "M1_PDR,"                   << finalPDR
@@ -1220,7 +1312,11 @@ WriteFinalSummary()
         << "N_Vehicles,"               << N_Vehicles
         << ",Number of vehicle nodes\n"
         << "N_RSUs,"                   << N_RSUs
-        << ",Number of RSU edge nodes\n";
+        << ",Number of RSU edge nodes\n"
+        << "v2vReliableRange,"         << v2vReliableRange
+        << ",Reliable local V2V beacon evaluation radius in metres\n"
+        << "rsuCoverageRange,"         << rsuCoverageRange
+        << ",RSU coverage radius in metres\n";
 
     std::cout << "\n=== M1-M4 Evaluation Metrics Summary ===" << std::endl;
     std::cout << "M1 PDR               : " << finalPDR
@@ -1231,4 +1327,26 @@ WriteFinalSummary()
     std::cout << "M4 Congestion Ratio  : " << finalCongRatio
               << " (" << g_falseTrafficPackets << " false / " << totalPkts << " total)\n";
     std::cout << "Summary CSV          : " << summaryPath << std::endl;
+
+    std::ofstream tierOut(metricsTierSummaryCsv.c_str(), std::ios::out);
+    tierOut << "tier,channel,transmitted,delivered,pdr,avg_latency_ms,latency_sample_count,description\n";
+    for (const auto& tier : g_tierMetrics)
+    {
+        double tierPdr = (tier.transmitted > 0)
+                             ? static_cast<double>(tier.delivered) /
+                                   static_cast<double>(tier.transmitted)
+                             : 0.0;
+        double tierLatencyMs = (tier.delayCount > 0)
+                                   ? (tier.delaySum / static_cast<double>(tier.delayCount)) * 1000.0
+                                   : 0.0;
+        tierOut << tier.tier << ","
+                << tier.channel << ","
+                << tier.transmitted << ","
+                << tier.delivered << ","
+                << tierPdr << ","
+                << tierLatencyMs << ","
+                << tier.delayCount << ","
+                << tier.description << "\n";
+    }
+    std::cout << "Tier summary CSV     : " << metricsTierSummaryCsv << std::endl;
 }
