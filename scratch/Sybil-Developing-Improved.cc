@@ -2713,9 +2713,11 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
 
-    std::cout << "[V-Ctrl] Vehicle " << vehicleIndex
-              << ": V2CTRL_HELLO sent to RSU " << rsuIndex
-              << " (V-Ctrl E2E channel initiation)\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [V2CTRL_HELLO]           "
+              << "Vehicle=" << vehicleIndex
+              << " -> RSU=" << rsuIndex
+              << " (V-Ctrl E2E channel initiation)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -2781,9 +2783,11 @@ SendV2CtrlHelloForward(uint32_t rsuIndex, uint32_t vehicleId,
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[V-Ctrl] RSU " << rsuIndex
-              << " → Controller  V2CTRL_HELLO forward vehicle=" << vehicleId
-              << " (RSU-Ctrl encrypted)\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [V2CTRL_HELLO_FWD]       "
+              << "RSU=" << rsuIndex
+              << " -> Controller Vehicle=" << vehicleId
+              << " (RSU-Ctrl encrypted)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -2844,8 +2848,9 @@ SendRegChallenge(uint32_t rsuIndex, uint32_t vehicleIndex)
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[Reg] RSU " << rsuIndex << " → Vehicle " << vehicleIndex
-              << "  REG_CHALLENGE sent\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REG_CHALLENGE]          "
+              << "RSU=" << rsuIndex << " -> Vehicle=" << vehicleIndex << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -2961,9 +2966,10 @@ SendRegRequest(uint32_t vehicleIndex, uint32_t rsuIndex, const std::vector<uint8
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[Reg] Vehicle " << vehicleIndex << " → RSU " << rsuIndex
-              << "  REG_REQUEST sent"
-              << " (credentials nested-encrypted with V-Ctrl key)\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REG_REQUEST]            "
+              << "Vehicle=" << vehicleIndex << " -> RSU=" << rsuIndex
+              << " (credentials nested-encrypted with V-Ctrl key)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3018,8 +3024,9 @@ SendRegForward(uint32_t rsuIndex, uint32_t vehicleId, uint64_t vin,
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[Reg] RSU " << rsuIndex << " → Controller  REG_FORWARD vehicle="
-              << vehicleId << "\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REG_FORWARD]            "
+              << "RSU=" << rsuIndex << " -> Controller vehicle=" << vehicleId << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3073,8 +3080,10 @@ SendRegResponse(uint32_t originRsuIndex, uint32_t vehicleId,
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[Reg] Controller → RSU " << originRsuIndex
-              << "  REG_RESPONSE vehicle=" << vehicleId << "\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REG_RESPONSE]           "
+              << "Controller -> RSU=" << originRsuIndex
+              << " vehicle=" << vehicleId << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3130,8 +3139,10 @@ SendRegConfirm(uint32_t rsuIndex, uint32_t vehicleIndex,
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[Reg] RSU " << rsuIndex << " → Vehicle " << vehicleIndex
-              << "  REG_CONFIRM (token delivered)\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REG_CONFIRM]            "
+              << "RSU=" << rsuIndex << " -> Vehicle=" << vehicleIndex
+              << " (token delivered)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3192,8 +3203,9 @@ SendRegForwardNested(uint32_t rsuIndex, uint32_t vehicleId,
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[Reg] RSU " << rsuIndex << " → Controller  REG_FORWARD nested vehicle="
-              << vehicleId << " (credentials opaque to RSU)\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REG_FORWARD_NESTED]     "
+              << "RSU=" << rsuIndex << " -> Controller vehicle=" << vehicleId << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3246,9 +3258,10 @@ SendRegResponseNested(uint32_t originRsuIndex, uint32_t vehicleId,
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[Reg] Controller → RSU " << originRsuIndex
-              << "  REG_RESPONSE nested vehicle=" << vehicleId
-              << " (token opaque to RSU)\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REG_RESPONSE_NESTED]    "
+              << "Controller -> RSU=" << originRsuIndex
+              << " vehicle=" << vehicleId << " (token opaque to RSU)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3301,8 +3314,10 @@ SendRegConfirmNested(uint32_t rsuIndex, uint32_t vehicleIndex,
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[Reg] RSU " << rsuIndex << " → Vehicle " << vehicleIndex
-              << "  REG_CONFIRM nested (token opaque to RSU)\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REG_CONFIRM_NESTED]     "
+              << "RSU=" << rsuIndex << " -> Vehicle=" << vehicleIndex
+              << " (token opaque to RSU)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3394,7 +3409,8 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
     g_ctrlVehicleSessionKeys[vehicleId] = sessionKey;
     g_ctrlVehicleTxSeqNums[vehicleId]   = 0;
 
-    std::cout << "[V-Ctrl] Controller: V-Ctrl session key derived for vehicle=" << vehicleId
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[V-Ctrl] Controller: V-Ctrl session key derived for vehicle=" << vehicleId
               << " (cert verified)\n";
 
     // Step 5: Build Ctrl2VehicleAckTag
@@ -3463,8 +3479,10 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
 
-    std::cout << "[V-Ctrl] Controller → RSU " << rsuIndex
-              << "  CTRL2V_ACK for vehicle=" << vehicleId << "\n";
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [CTRL2V_ACK]             "
+              << "Controller -> RSU=" << rsuIndex
+              << " Vehicle=" << vehicleId << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -3546,7 +3564,8 @@ HandleCtrl2VehicleAck(uint32_t vehicleIndex, const Ctrl2VehicleAckTag& ackTag)
     pending.ephPub.clear();
     pending.nonceV.clear();
 
-    std::cout << "[V-Ctrl] Vehicle " << vehicleIndex
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[V-Ctrl] Vehicle " << vehicleIndex
               << ": V-Ctrl E2E session key established"
               << " (ctrl cert OK, sig OK) — registration credentials now E2E encrypted\n";
 }
@@ -3820,7 +3839,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
         helloTag.Deserialize(dtb);
 
         uint32_t vId = helloTag.vehicleId;
-        std::cout << "[V-Ctrl] Controller: V2CTRL_HELLO received from vehicle=" << vId
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[V-Ctrl] Controller: V2CTRL_HELLO received from vehicle=" << vId
                   << " via RSU=" << rIdx << "\n";
         HandleRelayedV2CtrlHello(rIdx, vId, helloTag);
     }
@@ -3928,7 +3948,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             }
 
             uint64_t vin = reqTag.GetVin();
-            std::cout << "[Reg] Controller: REG_FORWARD nested vehicle=" << vId
+            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                      << "[Reg] Controller: REG_FORWARD nested vehicle=" << vId
                       << " credentials decrypted with V-Ctrl key (RSU never saw them)\n";
 
             // Verify VIN in whitelist.
@@ -3970,7 +3991,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             g_globalTokenStore[vId]     = token;
             g_controllerTokenStore[vId] = token;
 
-            std::cout << "[Reg] Controller: token generated for vehicle=" << vId
+            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                      << "[Reg] Controller: token generated for vehicle=" << vId
                       << " (VIN verified, V-Ctrl nested) → g_globalTokenStore updated\n";
 
             // Encrypt token with V-Ctrl key for secure delivery to vehicle.
@@ -3987,7 +4009,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             innerTokenBlob.push_back((tSeq >>  8) & 0xFF); innerTokenBlob.push_back( tSeq        & 0xFF);
             innerTokenBlob.insert(innerTokenBlob.end(), tCipher.begin(), tCipher.end());
 
-            std::cout << "[Reg] Controller: sending nested REG_RESPONSE to RSU=" << originRsuId
+            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                      << "[Reg] Controller: sending nested REG_RESPONSE to RSU=" << originRsuId
                       << " (token encrypted with V-Ctrl key, opaque to RSU)\n";
             SendRegResponseNested(originRsuId, vId, innerTokenBlob);
         }
@@ -4140,8 +4163,10 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
         sock->SendTo(fwdPkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
         MetricsOnTransmit(1);
 
-        std::cout << "[V-Ctrl] RSU " << rIdx << " → Vehicle " << vId
-                  << "  CTRL2V_ACK relayed (V-Ctrl E2E handshake completing)\n";
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[SEND] [CTRL2V_ACK_RELAY]       "
+                  << "RSU=" << rIdx << " -> Vehicle=" << vId
+                  << " (V-Ctrl E2E handshake completing)" << std::endl;
         return;
     }
 
@@ -4183,7 +4208,8 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
 
             // g_globalTokenStore was already written by the controller before sending.
             // RSU doesn't need to extract the token — just relay to vehicle.
-            std::cout << "[Reg] RSU " << rIdx << ": REG_RESPONSE nested, relaying encrypted "
+            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                      << "[Reg] RSU " << rIdx << ": REG_RESPONSE nested, relaying encrypted "
                       << "token to vehicle=" << vId << " (RSU cannot read token)\n";
 
             if (receiverId == rIdx && vId < N_Vehicles)
@@ -4206,7 +4232,8 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
             std::vector<uint8_t> token(respTag.token, respTag.token + 32);
 
             g_globalTokenStore[vId] = token;
-            std::cout << "[Reg] RSU " << rIdx << ": REG_RESPONSE received, token stored for vehicle="
+            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                      << "[Reg] RSU " << rIdx << ": REG_RESPONSE received, token stored for vehicle="
                       << vId << " → g_globalTokenStore updated\n";
 
             if (receiverId == respTag.originRsuId && vId < N_Vehicles)
@@ -4647,7 +4674,8 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
     state.sessionKeys[rsuId] = sessionKey;
     state.pending.erase(it);  // forward secrecy — ephemeral material discarded
 
-    std::cout << "[Security] Secure channel established"
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[Security] V-RSU secure channel established"
               << "  Vehicle=" << vehicleIndex
               << "  RSU=" << rsuId
               << "  (cert OK, sig OK)" << std::endl;
@@ -4663,7 +4691,8 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
         // Vehicle already registered — no V-Ctrl channel needed.
         // It will include its token in V2RSU reports and RSUs will verify
         // against g_globalTokenStore.  No action required here.
-        std::cout << "[Reg] Vehicle " << vehicleIndex
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[Reg] Vehicle " << vehicleIndex
                   << ": V-RSU channel ready — ALREADY REGISTERED, "
                   << "token in hand, ready to send authenticated reports\n";
     }
@@ -4672,7 +4701,8 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
         // V-Ctrl E2E channel already established (e.g. from a previous RSU).
         // Registration credentials already exchanged; waiting for token or
         // next V2RSU report will trigger the pending challenge.
-        std::cout << "[Reg] Vehicle " << vehicleIndex
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[Reg] Vehicle " << vehicleIndex
                   << ": V-RSU channel ready — V-Ctrl E2E channel already established, "
                   << "will send registration credentials when challenged\n";
     }
@@ -4683,7 +4713,8 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
         // V-Ctrl infrastructure available — initiate handshake so that
         // registration credentials and token delivery are E2E encrypted
         // (RSU cannot read or modify them).
-        std::cout << "[Reg] Vehicle " << vehicleIndex
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[Reg] Vehicle " << vehicleIndex
                   << ": V-RSU channel ready — initiating V-Ctrl E2E handshake "
                   << "before registration\n";
         Simulator::ScheduleNow(&SendV2CtrlHello, vehicleIndex, rsuId);
@@ -4692,7 +4723,8 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
     {
         // V-Ctrl infrastructure not available (keys not generated).
         // Fall back to single-layer (V-RSU only) registration.
-        std::cout << "[Reg] Vehicle " << vehicleIndex
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[Reg] Vehicle " << vehicleIndex
                   << ": V-RSU channel ready — no V-Ctrl keys, "
                   << "single-layer registration will proceed when challenged\n";
     }
@@ -4797,7 +4829,24 @@ LogReceivedPacket(const std::string& receiverRole,
                   const SybilPacketTag& tag,
                   bool hasTag)
 {
-    uint32_t triggerSeq = hasTag ? tag.GetSequenceNumber() : 0;
+    uint32_t triggerSeq  = hasTag ? tag.GetSequenceNumber() : 0;
+    double   delay       = hasTag ? Simulator::Now().GetSeconds() - tag.GetCreatedTime() : 0.0;
+    uint32_t messageType = hasTag ? tag.GetMessageType() : 0;
+
+    if (hasTag)
+    {
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[RECV] [" << MessageTypeToString(messageType) << "]";
+        uint32_t padLen = MessageTypeToString(messageType).size();
+        if (padLen < 24) std::cout << std::string(24 - padLen, ' ');
+        std::cout << " Receiver=" << receiverRole << "/" << receiverId
+                  << " FromReal=" << tag.GetRealNodeId();
+        if (tag.GetRealNodeId() != tag.GetClaimedNodeId())
+            std::cout << "(Claimed=" << tag.GetClaimedNodeId() << ")";
+        std::cout << " Seq=" << tag.GetSequenceNumber()
+                  << " Delay=" << delay << "s"
+                  << " Channel=" << channel << std::endl;
+    }
 
     // --- CHAN_HELLO handler (at RSU) ---
     if (hasTag &&
@@ -4852,9 +4901,10 @@ LogReceivedPacket(const std::string& receiverRole,
                     {
                         TagBuffer dtb(plain.data(), plain.data() + hSz);
                         helloTag.Deserialize(dtb);
-                        std::cout << "[V-Ctrl] RSU " << rId
+                        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                  << "[V-Ctrl] RSU " << rId
                                   << ": V2CTRL_HELLO from vehicle=" << vId
-                                  << " — relaying to controller\n";
+                                  << " — decrypted, relaying to controller\n";
                         SendV2CtrlHelloForward(rId, vId, helloTag);
                     }
                     else
@@ -4885,7 +4935,8 @@ LogReceivedPacket(const std::string& receiverRole,
                 // report and the RSU will accept it against g_globalTokenStore.
                 if (vId < g_vehicleTokens.size() && !g_vehicleTokens[vId].empty())
                 {
-                    std::cout << "[Reg] Vehicle " << vId
+                    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                              << "[Reg] Vehicle " << vId
                               << ": REG_CHALLENGE from RSU " << rId
                               << " — ALREADY REGISTERED (token in hand), "
                               << "skipping re-registration\n";
@@ -4923,14 +4974,16 @@ LogReceivedPacket(const std::string& receiverRole,
                             // Strict mode: never send registration credentials unless
                             // the V-Ctrl E2E channel is ready.  The V2CTRL_HELLO
                             // handshake is normally triggered in HandleChanAck.
-                            std::cout << "[Reg] Vehicle " << vId
+                            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                      << "[Reg] Vehicle " << vId
                                       << ": REG_CHALLENGE from RSU " << rId
                                       << " — V-Ctrl channel unavailable/pending,"
                                       << " blocking REG_REQUEST\n";
                             return;
                         }
 
-                        std::cout << "[Reg] Vehicle " << vId
+                        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                  << "[Reg] Vehicle " << vId
                                   << ": REG_CHALLENGE received from RSU " << rId
                                   << " — sending REG_REQUEST (V-Ctrl E2E encrypted)\n";
                         SendRegRequest(vId, rId, nonce);
@@ -5042,7 +5095,8 @@ LogReceivedPacket(const std::string& receiverRole,
                         }
                         std::vector<uint8_t> challengeNonce = pit->second;
                         pending.erase(pit);
-                        std::cout << "[Reg] RSU " << rId
+                        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                  << "[Reg] RSU " << rId
                                   << ": REG_REQUEST nested from vehicle=" << vId
                                   << " — relaying to controller (credentials opaque)\n";
                         SendRegForwardNested(rId, vId, innerBlob, challengeNonce);
@@ -5069,7 +5123,8 @@ LogReceivedPacket(const std::string& receiverRole,
 
                             if (nonceOk)
                             {
-                                std::cout << "[Reg] RSU " << rId
+                                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                          << "[Reg] RSU " << rId
                                           << ": REG_REQUEST from vehicle=" << vId
                                           << " nonce OK — forwarding to controller\n";
                                 SendRegForward(rId, vId, reqTag.GetVin(),
@@ -5142,7 +5197,8 @@ LogReceivedPacket(const std::string& receiverRole,
                                 if (!token.empty() && token.size() == 32)
                                 {
                                     g_vehicleTokens[vId] = token;
-                                    std::cout << "[Reg] Vehicle " << vId
+                                    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                              << "[Reg] Vehicle " << vId
                                               << ": REG_CONFIRM received (V-Ctrl nested)"
                                               << " — token stored! "
                                               << "Will include token in future V2RSU reports.\n";
@@ -5178,7 +5234,8 @@ LogReceivedPacket(const std::string& receiverRole,
                             {
                                 g_vehicleTokens[vId].assign(
                                     confirmTag.token, confirmTag.token + 32);
-                                std::cout << "[Reg] Vehicle " << vId
+                                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                          << "[Reg] Vehicle " << vId
                                           << ": REG_CONFIRM received — token stored! "
                                           << "Will include token in future V2RSU reports.\n";
                             }
@@ -5285,7 +5342,8 @@ LogReceivedPacket(const std::string& receiverRole,
                                      plaintext.data() + 33 + reportSz);
                         decryptedReport.Deserialize(tb);
                         hasDecryptedReport = true;
-                        std::cout << "[Security] V2RSU decrypted OK"
+                        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                  << "[Security] V2RSU decrypted OK"
                                   << "  RSU=" << rId
                                   << "  Vehicle=" << vId
                                   << "  Seq=" << scTag.seqNum << std::endl;
@@ -5301,14 +5359,16 @@ LogReceivedPacket(const std::string& receiverRole,
                                 tokenIt->second == recvTok)
                             {
                                 tokenAccepted = true;
-                                std::cout << "[Reg] RSU " << rId << ": V2RSU token VALID"
+                                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                          << "[Reg] RSU " << rId << ": V2RSU token VALID"
                                           << " vehicle=" << vId
                                           << " → report accepted into awareness table\n";
                             }
                             else
                             {
                                 // tokenAccepted stays false — report will be dropped.
-                                std::cout << "[Reg] RSU " << rId << ": V2RSU token INVALID"
+                                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                          << "[Reg] RSU " << rId << ": V2RSU token INVALID"
                                           << " vehicle=" << vId
                                           << " → report REJECTED, re-challenging\n";
                                 if (rId < g_rsuPendingChallenges.size() &&
@@ -5322,7 +5382,8 @@ LogReceivedPacket(const std::string& receiverRole,
                         else
                         {
                             // tokenAccepted stays false — report will be dropped.
-                            std::cout << "[Reg] RSU " << rId << ": V2RSU no token"
+                            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                      << "[Reg] RSU " << rId << ": V2RSU no token"
                                       << " vehicle=" << vId
                                       << " → report REJECTED, challenging\n";
                             if (rId < g_rsuPendingChallenges.size() &&
@@ -5382,8 +5443,6 @@ LogReceivedPacket(const std::string& receiverRole,
         aggCount = g_rsuReportCount[receiverId];
 
     std::ofstream out(communicationCsv.c_str(), std::ios::app);
-    double   delay       = hasTag ? Simulator::Now().GetSeconds() - tag.GetCreatedTime() : 0.0;
-    uint32_t messageType = hasTag ? tag.GetMessageType() : 0;
     BsmCoreDataTag bsmTag;
     bool hasBsm = packet->PeekPacketTag(bsmTag);
     BsmCoreData bsm = hasBsm ? bsmTag.GetBsm() : BsmCoreData();
@@ -5423,7 +5482,8 @@ LogReceivedPacket(const std::string& receiverRole,
 
             if (v2vSigValid)
             {
-                std::cout << "[Security] V2V beacon sig VALID"
+                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                          << "[Security] V2V beacon sig VALID"
                           << "  Receiver=vehicle/" << receiverId
                           << "  From=vehicle/" << tag.GetRealNodeId()
                           << "  Seq=" << tag.GetSequenceNumber()
@@ -5431,7 +5491,8 @@ LogReceivedPacket(const std::string& receiverRole,
             }
             else
             {
-                std::cout << "[Security] V2V beacon sig INVALID *** DROP ***"
+                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                          << "[Security] V2V beacon sig INVALID *** DROP ***"
                           << "  Receiver=vehicle/" << receiverId
                           << "  FromReal="  << tag.GetRealNodeId()
                           << "  Claimed="   << tag.GetClaimedNodeId()
@@ -5481,21 +5542,6 @@ LogReceivedPacket(const std::string& receiverRole,
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.trustScore       : 0.0) << ","
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.suspicionFlags   : 0u) << ","
         << (hasTag ? "received_tagged" : "received_untagged") << "\n";
-
-    if (hasTag)
-    {
-        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
-                  << "[RECV] [" << MessageTypeToString(messageType) << "]";
-        uint32_t padLen = MessageTypeToString(messageType).size();
-        if (padLen < 24) std::cout << std::string(24 - padLen, ' ');
-        std::cout << " Receiver=" << receiverRole << "/" << receiverId
-                  << " FromReal=" << tag.GetRealNodeId();
-        if (tag.GetRealNodeId() != tag.GetClaimedNodeId())
-            std::cout << "(Claimed=" << tag.GetClaimedNodeId() << ")";
-        std::cout << " Seq=" << tag.GetSequenceNumber()
-                  << " Delay=" << delay << "s"
-                  << " Channel=" << channel << std::endl;
-    }
 
     // M1 PDR: only credit V2V beacon delivery when the receiver is another vehicle.
     bool isV2VBroadcast = hasTag && tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
