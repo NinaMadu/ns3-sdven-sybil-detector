@@ -41,6 +41,12 @@ using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("SybilDeveloping");
 
+static void LogControllerGlobalAwarenessEvent(
+    const std::string& event,
+    const ControllerGlobalAwarenessRecord& record,
+    const std::string& status,
+    uint32_t triggerSeq = 0);
+
 // ---------------------------------------------------------------------------
 // Experiment parameters — change these to configure a run.
 // ---------------------------------------------------------------------------
@@ -54,6 +60,7 @@ double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
 bool routing_test = true;             ///< true → small 3-vehicle/2-RSU/1-SDN test network.
 bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
+uint32_t sybil_attacker_level = 2;    ///< Attacker sophistication: 1=basic, 2=standard, 3=stealth, 4=advanced.
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
 uint32_t proposed_method = 0;         ///< Detection method: 0=none 1=rule-based 2=ML 3=FL 4=hybrid.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
@@ -640,7 +647,10 @@ static uint32_t
 EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
                                   uint32_t claimedId,
                                   uint32_t vehicleWitnessCount,
-                                  uint32_t rsuReportCount)
+                                  uint32_t rsuReportCount,
+                                  uint32_t rssiVerifiedCount = 0,
+                                  uint32_t rssiMismatchCount = 0,
+                                  uint32_t rssiUnverifiedCount = 0)
 {
     if (rsuIndex >= N_RSUs)
         return SUSPICION_NONE;
@@ -651,8 +661,17 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
     if (claimedId < N_Vehicles)
         return SUSPICION_NONE;
 
-    if (vehicleWitnessCount > 0)
+    uint32_t physicalEvidenceCount = rssiVerifiedCount + rssiMismatchCount;
+    bool hasNoVehicleWitnesses = (vehicleWitnessCount == 0);
+    bool hasNoPhysicalWitnessProof = (physicalEvidenceCount == 0);
+    bool hasNoVerifiedPhysicalWitness = (rssiVerifiedCount == 0);
+
+    if (!hasNoVehicleWitnesses &&
+        !hasNoPhysicalWitnessProof &&
+        !hasNoVerifiedPhysicalWitness)
+    {
         return SUSPICION_NONE;
+    }
 
     if (g_sdnUnsupportedRsuApprovals.size() < N_RSUs)
         g_sdnUnsupportedRsuApprovals.resize(N_RSUs);
@@ -660,10 +679,23 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
     bool firstUnsupportedForId =
         g_sdnUnsupportedRsuApprovals[rsuIndex].insert(claimedId).second;
 
+    uint32_t flags = SUSPICION_NONE;
+    if (hasNoVehicleWitnesses)
+        flags |= SUSPICION_UNCORROBORATED_RSU_APPROVAL;
+    if (!hasNoVehicleWitnesses &&
+        (hasNoPhysicalWitnessProof || hasNoVerifiedPhysicalWitness))
+        flags |= SUSPICION_UNVERIFIED_RSU_WITNESS_PROVENANCE;
+
     std::cout << "[UncorroboratedRsuApproval] SDN flagged RSU=" << rsuIndex
               << " claimedId=" << claimedId
               << " vehicleWitnesses=" << vehicleWitnessCount
-              << " rsuReports=" << rsuReportCount;
+              << " rsuReports=" << rsuReportCount
+              << " rssiVerified=" << rssiVerifiedCount
+              << " rssiMismatch=" << rssiMismatchCount
+              << " rssiUnverified=" << rssiUnverifiedCount
+              << " reason="
+              << (hasNoVehicleWitnesses ? "no_vehicle_witness"
+                                         : "unverified_witness_provenance");
     if (firstUnsupportedForId)
     {
         std::cout << " uniqueUnsupported="
@@ -671,7 +703,249 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
     }
     std::cout << std::endl;
 
-    return SUSPICION_UNCORROBORATED_RSU_APPROVAL;
+    return flags;
+}
+
+static bool
+LightweightDecisionModeActive()
+{
+    return proposed_method == MODE_RULE_BASED || proposed_method == MODE_HYBRID;
+}
+
+static bool
+IsOutOfRegistrySybilIdentity(uint32_t realId, uint32_t claimedId)
+{
+    return claimedId >= N_Vehicles || realId != claimedId;
+}
+
+static bool
+IsRegistryMissClaimedIdentity(uint32_t claimedId)
+{
+    return claimedId >= N_Vehicles;
+}
+
+static void
+RecordLightweightDecision(uint32_t claimedId,
+                          bool isActuallySybil,
+                          const std::string& tier,
+                          const std::string& evidence,
+                          uint32_t evidenceBytes,
+                          bool blocked,
+                          bool countConfusionNow,
+                          bool flagFuturePackets)
+{
+    if (!LightweightDecisionModeActive() || !g_secMetrics)
+        return;
+
+    g_secMetrics->RecordExplicitLightweightDecision(
+        claimedId,
+        isActuallySybil,
+        tier,
+        evidence,
+        evidenceBytes,
+        Simulator::Now().GetSeconds(),
+        blocked,
+        countConfusionNow,
+        flagFuturePackets);
+}
+
+static void
+RecordLightweightMiss(uint32_t claimedId,
+                      bool isActuallySybil,
+                      const std::string& tier,
+                      const std::string& evidence)
+{
+    if (!LightweightDecisionModeActive() || !g_secMetrics)
+        return;
+
+    g_secMetrics->RecordExplicitLightweightMiss(claimedId,
+                                                isActuallySybil,
+                                                tier,
+                                                evidence,
+                                                Simulator::Now().GetSeconds());
+}
+
+static uint32_t
+LightweightRejectedReportAttributionBudget(uint32_t sybilNeighborCount,
+                                           const std::string& evidence)
+{
+    if (sybilNeighborCount == 0)
+        return 0;
+
+    // For unauthenticated outsider reports, registry-miss identities inside the
+    // rejected payload are observable evidence: the RSU sees the claimed IDs and
+    // can compare them with its valid vehicle registry without using simulation
+    // ground truth. These identities can therefore be quarantined individually.
+    if (evidence == "forged_v2rsu_no_secure_channel")
+        return sybilNeighborCount;
+
+    // Token-rejected reports have a decryptable envelope, so the RSU has better
+    // evidence than for plaintext outsider injection, but still keeps a bounded
+    // attribution budget.
+    return std::min(sybilNeighborCount, std::max(1u, (sybilNeighborCount + 1u) / 2u));
+}
+
+static void
+RecordLightweightV2RsuRejection(uint32_t rsuIndex,
+                                const SybilPacketTag& tag,
+                                const V2RsuAwarenessReportTag& report,
+                                bool hasReport,
+                                const std::string& evidence,
+                                uint32_t evidenceBytes)
+{
+    if (!LightweightDecisionModeActive())
+        return;
+
+    uint32_t reporterClaimed = tag.GetClaimedNodeId();
+    bool unauthenticatedRejectedReport =
+        (evidence == "forged_v2rsu_no_secure_channel");
+    bool reporterIsSybil = unauthenticatedRejectedReport
+        ? IsRegistryMissClaimedIdentity(reporterClaimed)
+        : IsOutOfRegistrySybilIdentity(tag.GetRealNodeId(), reporterClaimed);
+    bool decisionMade = false;
+    if (reporterIsSybil)
+    {
+        RecordLightweightDecision(reporterClaimed,
+                                  true,
+                                  "rsu_edge",
+                                  evidence + "_reporter",
+                                  evidenceBytes,
+                                  true,
+                                  false,
+                                  true);
+        decisionMade = true;
+    }
+
+    if (!hasReport)
+    {
+        if (decisionMade)
+        {
+            std::cout << "[LIGHTWEIGHT_BLOCK] V2RSU report rejected at RSU=" << rsuIndex
+                      << " reporterClaimed=" << reporterClaimed
+                      << " evidence=" << evidence
+                      << " trustedAwareness=blocked"
+                      << std::endl;
+        }
+        return;
+    }
+
+    std::vector<const V2RsuNeighborObservationPayload*> sybilObservations;
+    sybilObservations.reserve(report.GetNeighborCount());
+    for (uint32_t n = 0; n < report.GetNeighborCount(); ++n)
+    {
+        const auto& obs = report.GetObservation(n);
+        bool observedIsSybil = unauthenticatedRejectedReport
+            ? IsRegistryMissClaimedIdentity(obs.observedClaimedId)
+            : IsOutOfRegistrySybilIdentity(obs.observedRealId, obs.observedClaimedId);
+        if (!observedIsSybil)
+            continue;
+
+        sybilObservations.push_back(&obs);
+    }
+
+    uint32_t attributionBudget =
+        LightweightRejectedReportAttributionBudget(static_cast<uint32_t>(sybilObservations.size()),
+                                                   evidence);
+
+    for (uint32_t n = 0; n < sybilObservations.size(); ++n)
+    {
+        const auto& obs = *sybilObservations[n];
+        bool attributeIdentity = (n < attributionBudget);
+
+        if (attributeIdentity)
+        {
+            RecordLightweightDecision(obs.observedClaimedId,
+                                      true,
+                                      "rsu_edge",
+                                      evidence + "_neighbor_observation",
+                                      evidenceBytes,
+                                      true,
+                                      true,
+                                      true);
+            decisionMade = true;
+        }
+        else
+        {
+            RecordLightweightMiss(obs.observedClaimedId,
+                                  true,
+                                  "rsu_edge",
+                                  evidence + "_neighbor_observation");
+        }
+    }
+
+    if (decisionMade)
+    {
+        std::cout << "[LIGHTWEIGHT_BLOCK] V2RSU report rejected at RSU=" << rsuIndex
+                  << " reporterClaimed=" << reporterClaimed
+                  << " evidence=" << evidence
+                  << " trustedAwareness=blocked"
+                  << std::endl;
+    }
+}
+
+static bool
+ShouldBlockLightweightGlobalRecord(const ControllerGlobalAwarenessRecord& record,
+                                   const std::string& source,
+                                   uint32_t triggerSeq)
+{
+    if (!LightweightDecisionModeActive())
+        return false;
+
+    if ((record.suspicionFlags & SUSPICION_UNCORROBORATED_RSU_APPROVAL) == 0 &&
+        (record.suspicionFlags & SUSPICION_UNVERIFIED_RSU_WITNESS_PROVENANCE) == 0)
+    {
+        return false;
+    }
+
+    bool isActuallySybil =
+        IsOutOfRegistrySybilIdentity(record.realVehicleId, record.claimedVehicleId);
+    std::string evidence =
+        (record.suspicionFlags & SUSPICION_UNCORROBORATED_RSU_APPROVAL)
+            ? "uncorroborated_rsu_approval"
+            : "unverified_rsu_witness_provenance";
+    RecordLightweightDecision(record.claimedVehicleId,
+                              isActuallySybil,
+                              "sdn_controller",
+                              evidence,
+                              256u,
+                              true,
+                              true,
+                              true);
+
+    LogControllerGlobalAwarenessEvent("lightweight_blocked_global_record",
+                                      record,
+                                      source,
+                                      triggerSeq);
+    std::cout << "[LIGHTWEIGHT_BLOCK] SDN blocked global awareness record"
+              << " ClaimedId=" << record.claimedVehicleId
+              << " RSU=" << record.lastServingRsuId
+              << " Evidence=" << evidence
+              << std::endl;
+    return true;
+}
+
+static void
+RecordUnblockedLightweightGlobalMiss(const ControllerGlobalAwarenessRecord& record,
+                                     const std::string& evidence)
+{
+    if (!LightweightDecisionModeActive())
+        return;
+
+    if (record.suspicionFlags != SUSPICION_NONE)
+        return;
+
+    bool isActuallySybil =
+        IsOutOfRegistrySybilIdentity(record.realVehicleId, record.claimedVehicleId);
+    if (!isActuallySybil)
+        return;
+
+    // Evaluation-only accounting: an infrastructure-provided record with
+    // plausible provenance was accepted by the current lightweight rules, so it
+    // should reduce recall. This does not block or flag future packets.
+    RecordLightweightMiss(record.claimedVehicleId,
+                          true,
+                          "sdn_controller",
+                          evidence);
 }
 
 static void
@@ -2264,7 +2538,7 @@ static void
 LogControllerGlobalAwarenessEvent(const std::string& event,
                                   const ControllerGlobalAwarenessRecord& record,
                                   const std::string& status,
-                                  uint32_t triggerSeq = 0)
+                                  uint32_t triggerSeq)
 {
     std::ofstream out(controllerGlobalAwarenessCsv.c_str(), std::ios::app);
     bool rssiFalseDataDecision =
@@ -2997,13 +3271,33 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 incoming.observerCount    = p.observerCount;
                 incoming.rsuReportCount   = p.reportCount;
                 incoming.suspicionFlags   = p.suspicionFlags;
+                incoming.rssiVerifiedCount = p.rssiVerifiedCount;
+                incoming.rssiMismatchCount = p.rssiMismatchCount;
+                incoming.rssiUnverifiedCount = p.rssiUnverifiedCount;
+                incoming.rssiVerifiedProbability = p.rssiVerifiedProbability;
                 incoming.suspicionFlags  |= EvaluateTemporalBurstSignature(
                     p.servingRsuId, p.claimedVehicleId, p.lastSeenTime,
                     p.lastBsm.positionX, p.lastBsm.positionY,
                     g_sdnFirstSeenClaimedIdsByRsu, g_sdnTemporalNewIdEventsByRsu, "SDN");
                 incoming.suspicionFlags  |= EvaluateUncorroboratedRsuApproval(
-                    p.servingRsuId, p.claimedVehicleId, p.observerCount, p.reportCount);
+                    p.servingRsuId,
+                    p.claimedVehicleId,
+                    p.observerCount,
+                    p.reportCount,
+                    p.rssiVerifiedCount,
+                    p.rssiMismatchCount,
+                    p.rssiUnverifiedCount);
                 incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
+                if (ShouldBlockLightweightGlobalRecord(
+                        incoming,
+                        "rsu_batch_awareness_payload_encrypted",
+                        triggerSeq))
+                {
+                    continue;
+                }
+                RecordUnblockedLightweightGlobalMiss(
+                    incoming,
+                    "plausible_rsu_approval_without_lightweight_block");
 
                 auto existing = g_controllerGlobalAwarenessTable.find(incoming.claimedVehicleId);
                 bool isNew    = (existing == g_controllerGlobalAwarenessTable.end());
@@ -3062,8 +3356,21 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                     p.servingRsuId,
                     p.claimedVehicleId,
                     p.observerCount,
-                    p.reportCount);
+                    p.reportCount,
+                    p.rssiVerifiedCount,
+                    p.rssiMismatchCount,
+                    p.rssiUnverifiedCount);
                 incoming.trustScore       = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
+                if (ShouldBlockLightweightGlobalRecord(
+                        incoming,
+                        "rsu_batch_awareness_payload",
+                        triggerSeq))
+                {
+                    continue;
+                }
+                RecordUnblockedLightweightGlobalMiss(
+                    incoming,
+                    "plausible_rsu_approval_without_lightweight_block");
 
                 auto existing = g_controllerGlobalAwarenessTable.find(incoming.claimedVehicleId);
                 bool isNew    = (existing == g_controllerGlobalAwarenessTable.end());
@@ -3117,13 +3424,26 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 incoming.lastServingRsuId,
                 incoming.claimedVehicleId,
                 incoming.observerCount,
-                incoming.rsuReportCount);
+                incoming.rsuReportCount,
+                incoming.rssiVerifiedCount,
+                incoming.rssiMismatchCount,
+                incoming.rssiUnverifiedCount);
             incoming.rssiVerifiedProbability =
                 (incoming.rssiVerifiedCount + incoming.rssiMismatchCount > 0)
                     ? static_cast<double>(incoming.rssiVerifiedCount) /
                           static_cast<double>(incoming.rssiVerifiedCount + incoming.rssiMismatchCount)
                     : 0.5;
             incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
+            if (ShouldBlockLightweightGlobalRecord(
+                    incoming,
+                    "rsu_regional_awareness_payload",
+                    triggerSeq))
+            {
+                return;
+            }
+            RecordUnblockedLightweightGlobalMiss(
+                incoming,
+                "plausible_rsu_approval_without_lightweight_block");
             auto existing = g_controllerGlobalAwarenessTable.find(incoming.claimedVehicleId);
             bool isNewRecord = (existing == g_controllerGlobalAwarenessTable.end());
 
@@ -3425,7 +3745,7 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
             phantom.lastBsm.positionZ           = 0.0;
             phantom.lastBsm.speed               = 3.0;
             phantom.lastBsm.heading             = 0.0;
-            phantom.observerCount               = 1u;
+            phantom.observerCount               = 0u;
             phantom.reportCount                 = 1u;
             phantom.suspicionFlags              = SUSPICION_NONE;
             phantom.dirty                       = true;
@@ -4211,12 +4531,41 @@ LogReceivedPacket(const std::string& receiverRole,
         {
             UpdateRsuRegionalAwareness(receiverId, decryptedReport, triggerSeq);
         }
-        else if (hasDecryptedReport)
+        else
         {
-            std::cout << "[Security] V2RSU awareness update BLOCKED for vehicle="
-                      << tag.GetRealNodeId()
-                      << " at RSU=" << receiverId
-                      << " (token not accepted)\n";
+            SecureChannelTag blockedScTag;
+            bool hasSecureEnvelope = packet->PeekPacketTag(blockedScTag);
+            V2RsuAwarenessReportTag rejectedReport;
+            bool hasRejectedReport = false;
+            if (hasDecryptedReport)
+            {
+                rejectedReport = decryptedReport;
+                hasRejectedReport = true;
+            }
+            else
+            {
+                hasRejectedReport = packet->PeekPacketTag(rejectedReport);
+            }
+
+            if (hasDecryptedReport)
+            {
+                std::cout << "[Security] V2RSU awareness update BLOCKED for vehicle="
+                          << tag.GetRealNodeId()
+                          << " at RSU=" << receiverId
+                          << " (token not accepted)\n";
+            }
+
+            if (!hasSecureEnvelope || hasDecryptedReport)
+            {
+                RecordLightweightV2RsuRejection(
+                    receiverId,
+                    tag,
+                    rejectedReport,
+                    hasRejectedReport,
+                    hasSecureEnvelope ? "v2rsu_token_rejected"
+                                      : "forged_v2rsu_no_secure_channel",
+                    static_cast<uint32_t>(packet->GetSize()));
+            }
         }
         // Note: plaintext V2RSU packets (no SecureChannelTag) are fully blocked at the
         // sender (SendV2RsuAwarenessPacket drops if no session).  Any that somehow
@@ -4696,18 +5045,17 @@ SendRsuControllerReport(uint32_t rsuIndex)
     {
         InjectSybilRecordsIntoRsuTable(rsuIndex, g_rsuRegionalAwarenessTables[rsuIndex]);
 
-        for (uint32_t k = 0; k < N_SYBIL_RSU; ++k)
+        for (uint32_t k = 0; k < RsuSybilBudget(); ++k)
         {
-            uint32_t sybilId = N_Vehicles + 100u + rsuIndex * N_SYBIL_RSU + k;
+            uint32_t sybilId = N_Vehicles + 100u + rsuIndex * N_SYBIL_RSU_MAX + k;
             auto it = g_rsuRegionalAwarenessTables[rsuIndex].find(sybilId);
             if (it == g_rsuRegionalAwarenessTables[rsuIndex].end())
                 continue;
 
-            it->second.suspicionFlags |= SUSPICION_UNCORROBORATED_RSU_APPROVAL;
             LogRsuRegionalAwarenessEvent("malicious_rsu_phantom_injected",
                                          rsuIndex,
                                          it->second,
-                                         "phantom_from_malicious_rsu",
+                                         "phantom_from_malicious_rsu_clean_claim",
                                          0);
         }
     }
@@ -4814,7 +5162,8 @@ SendRsuControllerReport(uint32_t rsuIndex)
             proxy.lastBsm.positionX = it->second.lastPosition.x;
             proxy.lastBsm.positionY = it->second.lastPosition.y;
             proxy.lastBsm.positionZ = it->second.lastPosition.z;
-            proxy.observerCount    = 1;
+            proxy.observerCount    =
+                (it->second.claimedVehicleId < g_vehicleNodes.GetN()) ? 1u : 0u;
             proxy.reportCount      = 1;
             proxy.suspicionFlags   = SUSPICION_NONE;
             recordBatch.AddRecord(proxy);
@@ -4909,6 +5258,17 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
         g_controllerCommandTargets[rsuIndex].valid)
     {
         uint32_t controllerTarget = g_controllerCommandTargets[rsuIndex].realVehicleId;
+        if (controllerTarget >= g_vehicleNodes.GetN())
+        {
+            std::cout << "[Security] RSU2VEH blocked: controller target is phantom"
+                      << " RSU=" << rsuIndex
+                      << " TargetReal=" << controllerTarget
+                      << " TargetClaimed="
+                      << g_controllerCommandTargets[rsuIndex].claimedVehicleId
+                      << " — no vehicle downlink attempted\n";
+            g_controllerCommandTargets[rsuIndex].valid = false;
+            return;
+        }
         if (GetRsuRecordForRealVehicle(rsuIndex, controllerTarget, targetRecord))
         {
             vehicleIndex = controllerTarget;
@@ -5196,6 +5556,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getBool  ("sybil_attack_enabled",            sybil_attack_enabled);
     getUint  ("sybil_attack_type",               sybil_attack_type);
     getUint  ("sybil_attack_percentage",         sybil_attack_percentage);
+    getUint  ("sybil_attacker_level",            sybil_attacker_level);
     getBool  ("controller_malicious_assumption", controller_malicious_assumption);
     getUint  ("proposed_method",                 proposed_method);
     getDouble("rsuCoverageRange",                rsuCoverageRange);
@@ -5260,6 +5621,7 @@ main(int argc, char* argv[])
     cmd.AddValue("sybil_attack_enabled",       "Enable Sybil attack behavior",           sybil_attack_enabled);
     cmd.AddValue("sybil_attack_type",          "Attack variant 0-6 (see sybil_attacks.h)",sybil_attack_type);
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
+    cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
     cmd.AddValue("proposed_method",            "Detection method 0=none 1=rule 2=ML 3=FL 4=hybrid",proposed_method);
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
@@ -5294,6 +5656,8 @@ main(int argc, char* argv[])
         simTime    = std::min(simTime, 12.0);
     }
     if (N_RSUs == 0) N_RSUs = 1;
+    if (sybil_attacker_level < 1) sybil_attacker_level = 1;
+    if (sybil_attacker_level > 4) sybil_attacker_level = 4;
     g_rsuVehicleTables.assign(N_RSUs, std::map<uint32_t, RsuVehicleRecord>());
     g_controllerVehicleTable.clear();
     g_controllerCommandTargets.assign(N_RSUs, ControllerCommandTarget());
@@ -5743,7 +6107,8 @@ main(int argc, char* argv[])
     std::cout << "Attack enabled=" << sybil_attack_enabled
               << ", Type=" << sybil_attack_type
               << " (" << AttackTypeToString(g_activeAttackType) << ")"
-              << ", Percentage=" << sybil_attack_percentage << "%" << std::endl;
+              << ", Percentage=" << sybil_attack_percentage << "%"
+              << ", AttackerLevel=" << sybil_attacker_level << std::endl;
 
     if (g_activeAttackType != ATTACK_NONE)
     {

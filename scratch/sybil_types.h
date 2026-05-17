@@ -121,7 +121,8 @@ enum SdvenSuspicionFlags
     SUSPICION_TRAJECTORY_SHADOWING = 1u << 6,
     SUSPICION_UNCORROBORATED_RSU_APPROVAL = 1u << 7,
     SUSPICION_RSSI_DISTANCE_MISMATCH      = 1u << 8,  ///< Claimed BSM position inconsistent with RSSI-estimated distance
-    SUSPICION_INVALID_V2V_SIGNATURE       = 1u << 9   ///< V2V beacon ECDSA signature failed verification
+    SUSPICION_INVALID_V2V_SIGNATURE       = 1u << 9,  ///< V2V beacon ECDSA signature failed verification
+    SUSPICION_UNVERIFIED_RSU_WITNESS_PROVENANCE = 1u << 10 ///< RSU claims witnesses without physical/RSSI proof
 };
 
 // RSSI-based position verification result stored per neighbor observation.

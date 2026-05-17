@@ -85,6 +85,10 @@ static uint64_t g_totalDelivered   = 0;
 // M2 – Latency
 static double   g_totalDelay  = 0.0;
 static uint64_t g_delayCount  = 0;
+static double   g_intendedDelaySum = 0.0;
+static uint64_t g_intendedDelayCount = 0;
+static std::vector<double> g_intendedLatencySamplesMs;
+static const double kDroppedPacketLatencyPenaltyMs = 100.0;
 
 // M3 – Packet Attraction
 static uint64_t g_sybilDiverted = 0;
@@ -100,6 +104,9 @@ static uint64_t g_windowTransmitted   = 0;
 static uint64_t g_windowDelivered     = 0;
 static double   g_windowDelaySum      = 0.0;
 static uint64_t g_windowDelayCount    = 0;
+static double   g_windowIntendedDelaySum = 0.0;
+static uint64_t g_windowIntendedDelayCount = 0;
+static std::vector<double> g_windowIntendedLatencySamplesMs;
 static uint64_t g_windowSybilDiverted = 0;
 static uint64_t g_windowAllReceived   = 0;
 static uint64_t g_windowFalseTraffic  = 0;
@@ -125,6 +132,29 @@ static std::vector<TierMetricCounter> g_tierMetrics = {
     {"sybil_injection", "logical_attack", "Fabricated attack injection traffic"},
     {"other", "mixed", "Other tagged traffic"}
 };
+
+static inline double
+PercentileFromSorted(std::vector<double> values, double percentile)
+{
+    if (values.empty())
+        return 0.0;
+
+    std::sort(values.begin(), values.end());
+    double rank = (percentile / 100.0) * static_cast<double>(values.size() - 1u);
+    size_t lo = static_cast<size_t>(std::floor(rank));
+    size_t hi = static_cast<size_t>(std::ceil(rank));
+    if (lo == hi)
+        return values[lo];
+
+    double frac = rank - static_cast<double>(lo);
+    return values[lo] * (1.0 - frac) + values[hi] * frac;
+}
+
+static inline uint64_t
+SaturatingSub(uint64_t a, uint64_t b)
+{
+    return (a > b) ? (a - b) : 0u;
+}
 
 // =============================================================================
 // M5–M10  Detection mode constants
@@ -629,6 +659,11 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         }
 
         bool isFlagged = (confidence >= m_detector->GetThreshold());
+        if (m_explicitLightweightFlags.find(claimedNodeId) !=
+            m_explicitLightweightFlags.end())
+        {
+            isFlagged = true;
+        }
 
         uint64_t flops = m_detector->EstimateFLOPs(tier, m_proposedMethod,
                                                     m_complexityModel);
@@ -668,6 +703,114 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
             m_windowOverhead.AddEvent(packetSizeBytes, m_thresholdN, m_thresholdT, tier);
             m_totalOverhead.AddEvent(packetSizeBytes, m_thresholdN, m_thresholdT, tier);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // RecordExplicitLightweightDecision
+    //
+    // Evidence such as forged V2RSU rows and malicious-RSU infrastructure
+    // phantoms may not appear as a normal packet-level realId != claimedId
+    // event. This hook lets method 1 convert those evidence flags into final
+    // TP/FP decisions and mitigation overhead without hardcoding attack type.
+    // -------------------------------------------------------------------------
+    void RecordExplicitLightweightDecision(uint32_t           claimedNodeId,
+                                           bool               isActuallySybil,
+                                           const std::string& tier,
+                                           const std::string& evidence,
+                                           uint32_t           evidenceBytes,
+                                           double             timestampSec,
+                                           bool               blocked,
+                                           bool               countConfusionNow,
+                                           bool               flagFuturePackets)
+    {
+        if (m_proposedMethod == MODE_NONE)
+            return;
+
+        if (flagFuturePackets)
+            m_explicitLightweightFlags.insert(claimedNodeId);
+
+        if (!countConfusionNow)
+        {
+            std::cout << "[LIGHTWEIGHT_DETECTION] evidence=" << evidence
+                      << " claimedId=" << claimedNodeId
+                      << " tier=" << tier
+                      << " blocked=" << blocked
+                      << " counted=packet_flow\n";
+            return;
+        }
+
+        if (isActuallySybil)
+        {
+            m_windowMatrix.TP++;
+            m_totalMatrix.TP++;
+        }
+        else
+        {
+            m_windowMatrix.FP++;
+            m_totalMatrix.FP++;
+            std::cout << "[M6] FP explicit lightweight decision at t="
+                      << timestampSec
+                      << " claimedId=" << claimedNodeId
+                      << " evidence=" << evidence << std::endl;
+        }
+
+        if (m_latencyTracker.pending.find(claimedNodeId) ==
+            m_latencyTracker.pending.end())
+        {
+            m_latencyTracker.RecordDetectionStart(claimedNodeId,
+                                                   m_proposedMethod,
+                                                   timestampSec);
+            double revDelaySec = 1.0 / 1000.0;
+            Simulator::Schedule(
+                Seconds(revDelaySec),
+                &SecurityEvaluationMetrics::OnRevocationComplete,
+                this,
+                claimedNodeId,
+                isActuallySybil,
+                timestampSec + revDelaySec);
+        }
+
+        uint32_t bytes = (evidenceBytes == 0u) ? 128u : evidenceBytes;
+        m_windowOverhead.AddEvent(bytes, m_thresholdN, m_thresholdT, tier);
+        m_totalOverhead.AddEvent(bytes, m_thresholdN, m_thresholdT, tier);
+
+        std::cout << "[LIGHTWEIGHT_DETECTION] evidence=" << evidence
+                  << " claimedId=" << claimedNodeId
+                  << " tier=" << tier
+                  << " blocked=" << blocked
+                  << " counted=explicit_"
+                  << (isActuallySybil ? "TP" : "FP")
+                  << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // RecordExplicitLightweightMiss
+    //
+    // Evaluation-only accounting for Sybil evidence that was present in an
+    // observed packet but not attributed by the lightweight rule budget.  This
+    // does not flag future packets and does not influence mitigation; it only
+    // keeps recall honest when a rejected forged report contains more embedded
+    // identities than the lightweight detector chooses to attribute.
+    // -------------------------------------------------------------------------
+    void RecordExplicitLightweightMiss(uint32_t           claimedNodeId,
+                                       bool               isActuallySybil,
+                                       const std::string& tier,
+                                       const std::string& evidence,
+                                       double             timestampSec)
+    {
+        if (m_proposedMethod == MODE_NONE || !isActuallySybil)
+            return;
+
+        m_windowMatrix.FN++;
+        m_totalMatrix.FN++;
+
+        std::cout << "[LIGHTWEIGHT_DETECTION] evidence=" << evidence
+                  << " claimedId=" << claimedNodeId
+                  << " tier=" << tier
+                  << " counted=explicit_FN"
+                  << " reason=identity_not_attributed_by_lightweight_budget"
+                  << " t=" << timestampSec
+                  << std::endl;
     }
 
     // -------------------------------------------------------------------------
@@ -864,6 +1007,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
     ComplexityModel                        m_complexityModel;
     LatencyTracker                         m_latencyTracker;
     std::map<uint32_t, NodeBehaviorRecord> m_nodeRecords;
+    std::set<uint32_t>                     m_explicitLightweightFlags;
 
     ConfusionMatrix      m_windowMatrix;
     ConfusionMatrix      m_totalMatrix;
@@ -1062,6 +1206,16 @@ MetricsOnReceive(bool isSybil, double delay, bool countForPDR = true)
         g_delayCount++;
         g_windowDelaySum += delay;
         g_windowDelayCount++;
+        if (countForPDR)
+        {
+            double delayMs = delay * 1000.0;
+            g_intendedDelaySum += delay;
+            g_intendedDelayCount++;
+            g_intendedLatencySamplesMs.push_back(delayMs);
+            g_windowIntendedDelaySum += delay;
+            g_windowIntendedDelayCount++;
+            g_windowIntendedLatencySamplesMs.push_back(delayMs);
+        }
     }
 
     // M3 + M4 — network-wide counts
@@ -1116,6 +1270,10 @@ InitializeMetricsCsvFiles()
         std::ofstream out(metricsLatencyCsv.c_str(), std::ios::out);
         out << "sim_time_s,window_avg_latency_ms,window_packet_count,"
             << "cumulative_avg_latency_ms,cumulative_packet_count,"
+            << "window_intended_avg_latency_ms,cumulative_intended_avg_latency_ms,"
+            << "window_p95_latency_ms,cumulative_p95_latency_ms,"
+            << "window_loss_penalized_latency_ms,cumulative_loss_penalized_latency_ms,"
+            << "window_dropped_packets,cumulative_dropped_packets,drop_penalty_ms,"
             << "sybil_attack_enabled,sybil_percentage\n";
     }
     {
@@ -1172,10 +1330,40 @@ WriteMetricsRow(double windowEnd)
         (g_delayCount > 0)
             ? (g_totalDelay / static_cast<double>(g_delayCount)) * 1000.0
             : 0.0;
+    double windowIntendedAvgMs =
+        (g_windowIntendedDelayCount > 0)
+            ? (g_windowIntendedDelaySum / static_cast<double>(g_windowIntendedDelayCount)) * 1000.0
+            : 0.0;
+    double cumIntendedAvgMs =
+        (g_intendedDelayCount > 0)
+            ? (g_intendedDelaySum / static_cast<double>(g_intendedDelayCount)) * 1000.0
+            : 0.0;
+    double windowP95Ms = PercentileFromSorted(g_windowIntendedLatencySamplesMs, 95.0);
+    double cumP95Ms = PercentileFromSorted(g_intendedLatencySamplesMs, 95.0);
+    uint64_t windowDropped = SaturatingSub(g_windowTransmitted, g_windowDelivered);
+    uint64_t cumulativeDropped = SaturatingSub(g_totalTransmitted, g_totalDelivered);
+    double windowLossPenalizedMs =
+        (g_windowTransmitted > 0)
+            ? ((g_windowIntendedDelaySum * 1000.0) +
+               static_cast<double>(windowDropped) * kDroppedPacketLatencyPenaltyMs) /
+                  static_cast<double>(g_windowTransmitted)
+            : 0.0;
+    double cumulativeLossPenalizedMs =
+        (g_totalTransmitted > 0)
+            ? ((g_intendedDelaySum * 1000.0) +
+               static_cast<double>(cumulativeDropped) * kDroppedPacketLatencyPenaltyMs) /
+                  static_cast<double>(g_totalTransmitted)
+            : 0.0;
     {
         std::ofstream out(metricsLatencyCsv.c_str(), std::ios::app);
         out << windowEnd << "," << windowAvgMs << "," << g_windowDelayCount << ","
-            << cumAvgMs << "," << g_delayCount << "," << attackFlag << "," << pct << "\n";
+            << cumAvgMs << "," << g_delayCount << ","
+            << windowIntendedAvgMs << "," << cumIntendedAvgMs << ","
+            << windowP95Ms << "," << cumP95Ms << ","
+            << windowLossPenalizedMs << "," << cumulativeLossPenalizedMs << ","
+            << windowDropped << "," << cumulativeDropped << ","
+            << kDroppedPacketLatencyPenaltyMs << ","
+            << attackFlag << "," << pct << "\n";
     }
 
     // M3
@@ -1220,6 +1408,9 @@ WriteMetricsRow(double windowEnd)
     g_windowDelivered     = 0;
     g_windowDelaySum      = 0.0;
     g_windowDelayCount    = 0;
+    g_windowIntendedDelaySum = 0.0;
+    g_windowIntendedDelayCount = 0;
+    g_windowIntendedLatencySamplesMs.clear();
     g_windowSybilDiverted = 0;
     g_windowAllReceived   = 0;
     g_windowFalseTraffic  = 0;
@@ -1270,6 +1461,18 @@ WriteFinalSummary()
         (g_delayCount > 0)
             ? (g_totalDelay / static_cast<double>(g_delayCount)) * 1000.0
             : 0.0;
+    double finalIntendedAvgLatencyMs =
+        (g_intendedDelayCount > 0)
+            ? (g_intendedDelaySum / static_cast<double>(g_intendedDelayCount)) * 1000.0
+            : 0.0;
+    uint64_t finalDroppedPackets = SaturatingSub(g_totalTransmitted, g_totalDelivered);
+    double finalLossPenalizedLatencyMs =
+        (g_totalTransmitted > 0)
+            ? ((g_intendedDelaySum * 1000.0) +
+               static_cast<double>(finalDroppedPackets) * kDroppedPacketLatencyPenaltyMs) /
+                  static_cast<double>(g_totalTransmitted)
+            : 0.0;
+    double finalP95LatencyMs = PercentileFromSorted(g_intendedLatencySamplesMs, 95.0);
     double finalAttrRatio =
         (g_allReceived > 0)
             ? static_cast<double>(g_sybilDiverted) / static_cast<double>(g_allReceived)
@@ -1288,9 +1491,21 @@ WriteFinalSummary()
         << "M1_PDR,"                   << finalPDR
         << ",Packet Delivery Ratio (delivered/transmitted)\n"
         << "M2_avg_latency_ms,"        << finalAvgLatencyMs
-        << ",Average end-to-end routing latency in milliseconds\n"
+        << ",Average latency over all received tagged packets in milliseconds\n"
+        << "M2_intended_avg_latency_ms," << finalIntendedAvgLatencyMs
+        << ",Average latency over successfully delivered intended packets in milliseconds\n"
+        << "M2_p95_latency_ms,"        << finalP95LatencyMs
+        << ",95th percentile latency over successfully delivered intended packets in milliseconds\n"
+        << "M2_loss_penalized_latency_ms," << finalLossPenalizedLatencyMs
+        << ",Average intended-packet latency with dropped packets charged as timeout penalty\n"
+        << "M2_dropped_packets,"       << finalDroppedPackets
+        << ",Intended packet deliveries that were transmitted but not delivered\n"
+        << "M2_drop_penalty_ms,"       << kDroppedPacketLatencyPenaltyMs
+        << ",Timeout penalty applied per dropped intended packet in loss-penalized latency\n"
         << "M2_latency_sample_count,"  << g_delayCount
-        << ",Number of packets used for latency calculation\n"
+        << ",Number of received tagged packets used for legacy average latency calculation\n"
+        << "M2_intended_latency_sample_count," << g_intendedDelayCount
+        << ",Number of intended delivered packets used for intended average and P95 latency\n"
         << "M3_sybil_diverted,"        << g_sybilDiverted
         << ",Packets whose path involved Sybil identity spoofing\n"
         << "M3_all_received,"          << g_allReceived
@@ -1322,6 +1537,10 @@ WriteFinalSummary()
     std::cout << "M1 PDR               : " << finalPDR
               << " (" << g_totalDelivered << "/" << g_totalTransmitted << ")\n";
     std::cout << "M2 Avg Latency       : " << finalAvgLatencyMs << " ms\n";
+    std::cout << "M2 P95 Latency       : " << finalP95LatencyMs << " ms\n";
+    std::cout << "M2 Loss-Penalized    : " << finalLossPenalizedLatencyMs
+              << " ms (" << finalDroppedPackets
+              << " dropped, penalty=" << kDroppedPacketLatencyPenaltyMs << " ms)\n";
     std::cout << "M3 Packet Attraction : " << finalAttrRatio
               << " (" << g_sybilDiverted << "/" << g_allReceived << " Sybil-diverted)\n";
     std::cout << "M4 Congestion Ratio  : " << finalCongRatio
