@@ -22,6 +22,7 @@
 #include "sybil_crypto.h"     // ECDSA P-256 sign / verify / SHA-256
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -1364,6 +1365,10 @@ extern Ipv4InterfaceContainer   g_wiredInterfaces;
 extern uint32_t                 g_seq;
 extern std::vector<uint32_t>    g_rsuReportCount;
 
+// Master security toggle — false disables all crypto, registration, token auth.
+// DEFINED in Sybil-Developing-Improved.cc; controlled via --SecEnabled=true/false.
+extern bool g_secEnabled;
+
 // Vehicle ECDSA key material — DEFINED in Sybil-Developing-Improved.cc,
 // populated by LoadVehicleKeys() before Simulator::Run().
 extern std::vector<std::vector<uint8_t>> g_vehiclePrivKeys;  // 32 bytes each
@@ -1513,15 +1518,18 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
         packet->AddPacketTag(BsmCoreDataTag(bsm));
 
         // --- V2V Signature ---
-        // Sign the BSM with the sender's private key so receivers can verify
-        // data integrity and sender authenticity without a prior key lookup.
         uint32_t senderIdx = tx->realNodeId;
-        if (senderIdx < g_vehiclePrivKeys.size() && !g_vehiclePrivKeys[senderIdx].empty())
+        if (g_secEnabled &&
+            senderIdx < g_vehiclePrivKeys.size() && !g_vehiclePrivKeys[senderIdx].empty())
         {
-            std::vector<uint8_t> payload = SerializeBsmForSigning(bsm);
-            std::vector<uint8_t> hash    = CryptoSha256(payload);
+            std::vector<uint8_t> payload  = SerializeBsmForSigning(bsm);
+            std::vector<uint8_t> hash     = CryptoSha256(payload);
+            auto __t0 = std::chrono::high_resolution_clock::now();
             std::vector<uint8_t> sigBytes = CryptoEcdsaSign(g_vehiclePrivKeys[senderIdx], hash);
-
+            auto __t1 = std::chrono::high_resolution_clock::now();
+            double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+            std::cout << "[Latency] V2V_BEACON  vehicle/" << senderIdx
+                      << "  sign  " << __ms << "\n";
             if (!sigBytes.empty())
             {
                 V2VSignatureTag sigTag;
@@ -1529,6 +1537,11 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
                 std::memcpy(sigTag.sig,     sigBytes.data(),                     64);
                 packet->AddPacketTag(sigTag);
             }
+        }
+        else if (!g_secEnabled)
+        {
+            std::cout << "[Latency] V2V_BEACON  vehicle/" << senderIdx
+                      << "  sign  0.000\n";
         }
     }
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));

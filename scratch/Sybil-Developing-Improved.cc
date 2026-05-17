@@ -26,6 +26,7 @@
 #include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -51,6 +52,7 @@ double simTime = 12.0;                ///< Total simulation time (seconds).
 double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
 double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
 bool routing_test = true;             ///< true → small 3-vehicle/2-RSU/1-SDN test network.
+bool g_secEnabled         = true;     ///< Master security toggle — false = plain network (no crypto/registration).
 bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
@@ -2921,7 +2923,12 @@ SendRegRequest(uint32_t vehicleIndex, uint32_t rsuIndex, const std::vector<uint8
     uint32_t innerSeq = g_vehicleCtrlTxSeqNums[vehicleIndex]++;
     std::vector<uint8_t> innerIv  = CryptoRandBytes(12);
     std::vector<uint8_t> innerAad = BuildV2CtrlAad(vehicleIndex, innerSeq);
+    auto __ri0 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> innerCipher = CryptoAesGcmEncrypt(vCtrlKey, innerIv, tagBytes, innerAad);
+    auto __ri1 = std::chrono::high_resolution_clock::now();
+    double __innerMs = std::chrono::duration<double, std::milli>(__ri1 - __ri0).count();
+    std::cout << "[Latency] REG_REQUEST  vehicle/" << vehicleIndex
+              << "  inner_encrypt(V-Ctrl)  " << __innerMs << "\n";
     if (innerCipher.empty()) { std::cerr << "[Reg] REG_REQUEST V-Ctrl encrypt failed\n"; return; }
 
     outerPlain.push_back(0x01);  // nested flag
@@ -2943,7 +2950,12 @@ SendRegRequest(uint32_t vehicleIndex, uint32_t rsuIndex, const std::vector<uint8
     aad[8]=(seq         >>24)&0xFF; aad[9]=(seq         >>16)&0xFF;
     aad[10]=(seq        >> 8)&0xFF; aad[11]=seq              &0xFF;
 
+    auto __ro0 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(sessionKey, iv, outerPlain, aad);
+    auto __ro1 = std::chrono::high_resolution_clock::now();
+    double __outerMs = std::chrono::duration<double, std::milli>(__ro1 - __ro0).count();
+    std::cout << "[Latency] REG_REQUEST  vehicle/" << vehicleIndex
+              << "  outer_encrypt(V-RSU)  " << __outerMs << "\n";
     if (ciphertext.empty()) { std::cerr << "[Reg] REG_REQUEST encrypt failed\n"; return; }
 
     SecureChannelTag scTag;
@@ -3182,7 +3194,12 @@ SendRegForwardNested(uint32_t rsuIndex, uint32_t vehicleId,
     uint32_t seq = g_rsuCtrlTxSeqNums[rsuIndex]++;
     std::vector<uint8_t> iv  = CryptoRandBytes(12);
     std::vector<uint8_t> aad = BuildCtrlAad(rsuIndex, 0, seq);
+    auto __rfeo0 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(key, iv, plaintext, aad);
+    auto __rfeo1 = std::chrono::high_resolution_clock::now();
+    double __rfeoMs = std::chrono::duration<double, std::milli>(__rfeo1 - __rfeo0).count();
+    std::cout << "[Latency] REG_REQUEST  rsu_edge/" << rsuIndex
+              << "  outer_encrypt(RSU-Ctrl)  " << __rfeoMs << "\n";
     if (ciphertext.empty()) { std::cerr << "[Reg] REG_FORWARD nested encrypt failed\n"; return; }
 
     CtrlSecureTag csTag;
@@ -3237,7 +3254,12 @@ SendRegResponseNested(uint32_t originRsuIndex, uint32_t vehicleId,
     uint32_t seq = g_ctrlRsuTxSeqNums[originRsuIndex]++;
     std::vector<uint8_t> iv  = CryptoRandBytes(12);
     std::vector<uint8_t> aad = BuildCtrlAad(originRsuIndex, 1, seq);
+    auto __rreo0 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(key, iv, plaintext, aad);
+    auto __rreo1 = std::chrono::high_resolution_clock::now();
+    double __rreoMs = std::chrono::duration<double, std::milli>(__rreo1 - __rreo0).count();
+    std::cout << "[Latency] REG_CONFIRM  sdn_controller/0"
+              << "  outer_encrypt(RSU-Ctrl)  " << __rreoMs << "\n";
     if (ciphertext.empty()) { std::cerr << "[Reg] REG_RESPONSE nested encrypt failed\n"; return; }
 
     CtrlSecureTag csTag;
@@ -3293,7 +3315,12 @@ SendRegConfirmNested(uint32_t rsuIndex, uint32_t vehicleIndex,
     uint32_t seq = g_rsuVehicleTxSeqNums[rsuIndex][vehicleIndex]++;
     std::vector<uint8_t> iv  = CryptoRandBytes(12);
     std::vector<uint8_t> aad = BuildRsuVehicleAad(rsuIndex, vehicleIndex, seq);
+    auto __rceo0 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(sessionKey, iv, outerPlain, aad);
+    auto __rceo1 = std::chrono::high_resolution_clock::now();
+    double __rceoMs = std::chrono::duration<double, std::milli>(__rceo1 - __rceo0).count();
+    std::cout << "[Latency] REG_CONFIRM  rsu_edge/" << rsuIndex
+              << "  outer_encrypt(V-RSU)  " << __rceoMs << "\n";
     if (ciphertext.empty()) { std::cerr << "[Reg] REG_CONFIRM nested encrypt failed\n"; return; }
 
     RsuVehicleSecureTag envTag;
@@ -3600,8 +3627,13 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             std::vector<uint8_t> enc(pktSz);
             packet->CopyData(enc.data(), pktSz);
 
+            auto __t0 = std::chrono::high_resolution_clock::now();
             std::vector<uint8_t> plain =
                 CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
+            auto __t1 = std::chrono::high_resolution_clock::now();
+            double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+            std::cout << "[Latency] RSU2CTRL_REPORT  sdn_controller/0"
+                      << "  decrypt  " << __ms << "\n";
             if (plain.empty())
             {
                 std::cerr << "[Security] RSU2CTRL GCM auth FAILED RSU=" << rIdx << "\n";
@@ -3657,6 +3689,11 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             }
             return;
         }
+
+        // No-security path: no CtrlSecureTag, log 0.000 decrypt latency.
+        if (!g_secEnabled)
+            std::cout << "[Latency] RSU2CTRL_REPORT  sdn_controller/0"
+                      << "  decrypt  0.000\n";
 
         // Primary path: batch awareness tag (all vehicle records in one packet).
         RsuControllerBatchAwarenessTag batchTag;
@@ -3868,8 +3905,13 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
         std::vector<uint8_t> enc(pktSz);
         packet->CopyData(enc.data(), pktSz);
 
+        auto __rfo0 = std::chrono::high_resolution_clock::now();
         std::vector<uint8_t> plain =
             CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
+        auto __rfo1 = std::chrono::high_resolution_clock::now();
+        double __rfOuterMs = std::chrono::duration<double, std::milli>(__rfo1 - __rfo0).count();
+        std::cout << "[Latency] REG_REQUEST  sdn_controller/0"
+                  << "  outer_decrypt(RSU-Ctrl)  " << __rfOuterMs << "\n";
         if (plain.empty())
         {
             std::cerr << "[Reg] REG_FORWARD GCM auth FAILED RSU=" << rIdx << "\n"; return;
@@ -3917,8 +3959,13 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                               | (uint32_t(innerBlob[14]) <<  8) |  uint32_t(innerBlob[15]);
             std::vector<uint8_t> innerCipher(innerBlob.begin() + 16, innerBlob.end());
             std::vector<uint8_t> innerAad = BuildV2CtrlAad(vId, innerSeq);
+            auto __rfi0 = std::chrono::high_resolution_clock::now();
             std::vector<uint8_t> innerPlain =
                 CryptoAesGcmDecrypt(vCtrlKey, innerIv, innerCipher, innerAad);
+            auto __rfi1 = std::chrono::high_resolution_clock::now();
+            double __rfInnerMs = std::chrono::duration<double, std::milli>(__rfi1 - __rfi0).count();
+            std::cout << "[Latency] REG_REQUEST  sdn_controller/0"
+                      << "  inner_decrypt(V-Ctrl)  " << __rfInnerMs << "\n";
             if (innerPlain.empty())
             {
                 std::cerr << "[Reg] REG_FORWARD nested: V-Ctrl decrypt FAILED vehicle=" << vId
@@ -3985,7 +4032,12 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             std::vector<uint8_t> tokenInput = g_tokenMasterKey;
             tokenInput.push_back((vId >> 24) & 0xFF); tokenInput.push_back((vId >> 16) & 0xFF);
             tokenInput.push_back((vId >>  8) & 0xFF); tokenInput.push_back( vId        & 0xFF);
+            auto __tg0 = std::chrono::high_resolution_clock::now();
             std::vector<uint8_t> token = CryptoSha256(tokenInput);
+            auto __tg1 = std::chrono::high_resolution_clock::now();
+            double __tgMs = std::chrono::duration<double, std::milli>(__tg1 - __tg0).count();
+            std::cout << "[Latency] REG_REQUEST  sdn_controller/0"
+                      << "  token_generate  " << __tgMs << "\n";
 
             // Write token to global store directly (simulation shared-memory).
             g_globalTokenStore[vId]     = token;
@@ -4000,7 +4052,12 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             uint32_t tSeq = g_ctrlVehicleTxSeqNums[vId]++;
             std::vector<uint8_t> tIv  = CryptoRandBytes(12);
             std::vector<uint8_t> tAad = BuildCtrlVehicleAad(vId, tSeq);
+            auto __te0 = std::chrono::high_resolution_clock::now();
             std::vector<uint8_t> tCipher = CryptoAesGcmEncrypt(vCtrlKey, tIv, token, tAad);
+            auto __te1 = std::chrono::high_resolution_clock::now();
+            double __teMs = std::chrono::duration<double, std::milli>(__te1 - __te0).count();
+            std::cout << "[Latency] REG_CONFIRM  sdn_controller/0"
+                      << "  inner_encrypt(V-Ctrl)  " << __teMs << "\n";
             if (tCipher.empty()) { std::cerr << "[Reg] Token V-Ctrl encrypt failed\n"; return; }
 
             std::vector<uint8_t> innerTokenBlob;
@@ -4190,8 +4247,13 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
         std::vector<uint8_t> enc(pktSz);
         packet->CopyData(enc.data(), pktSz);
 
+        auto __rcdo0 = std::chrono::high_resolution_clock::now();
         std::vector<uint8_t> plain =
             CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
+        auto __rcdo1 = std::chrono::high_resolution_clock::now();
+        double __rcdoMs = std::chrono::duration<double, std::milli>(__rcdo1 - __rcdo0).count();
+        std::cout << "[Latency] REG_CONFIRM  rsu_edge/" << rIdx
+                  << "  outer_decrypt(RSU-Ctrl)  " << __rcdoMs << "\n";
         if (plain.empty())
         {
             std::cerr << "[Reg] REG_RESPONSE GCM auth FAILED RSU=" << rIdx << "\n"; return;
@@ -4270,8 +4332,13 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
         std::vector<uint8_t> enc(pktSz);
         packet->CopyData(enc.data(), pktSz);
 
+        auto __t0 = std::chrono::high_resolution_clock::now();
         std::vector<uint8_t> plain =
             CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
+        auto __t1 = std::chrono::high_resolution_clock::now();
+        double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+        std::cout << "[Latency] CTRL2RSU_CMD  rsu_edge/" << rIdx
+                  << "  decrypt  " << __ms << "\n";
         if (plain.empty())
         {
             std::cerr << "[Security] CTRL2RSU GCM auth FAILED RSU=" << rIdx << "\n";
@@ -4285,8 +4352,11 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
     }
     else
     {
-        // Legacy unencrypted path
+        // No-security / legacy unencrypted path
         if (!packet->PeekPacketTag(commandTag)) return;
+        if (!g_secEnabled)
+            std::cout << "[Latency] CTRL2RSU_CMD  rsu_edge/" << receiverId
+                      << "  decrypt  0.000\n";
     }
 
     g_controllerCommandTargets[receiverId].valid = true;
@@ -4791,6 +4861,7 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
 static bool
 EnsureVehicleRsuSession(uint32_t vehicleIndex, uint32_t rsuIndex, const std::string& reason)
 {
+    if (!g_secEnabled) return true;  // no session needed in plain-network mode
     if (vehicleIndex >= g_vehicleChannelState.size() || rsuIndex >= N_RSUs)
         return false;
 
@@ -5071,8 +5142,13 @@ LogReceivedPacket(const std::string& receiverRole,
                     std::vector<uint8_t> enc(pktSz);
                     packet->CopyData(enc.data(), pktSz);
 
+                    auto __rro0 = std::chrono::high_resolution_clock::now();
                     std::vector<uint8_t> plain =
                         CryptoAesGcmDecrypt(it->second, iv, enc, aad);
+                    auto __rro1 = std::chrono::high_resolution_clock::now();
+                    double __rroMs = std::chrono::duration<double, std::milli>(__rro1 - __rro0).count();
+                    std::cout << "[Latency] REG_REQUEST  rsu_edge/" << rId
+                              << "  outer_decrypt(V-RSU)  " << __rroMs << "\n";
 
                     if (plain.empty())
                     {
@@ -5169,8 +5245,13 @@ LogReceivedPacket(const std::string& receiverRole,
                     std::vector<uint8_t> enc(pktSz);
                     packet->CopyData(enc.data(), pktSz);
 
+                    auto __rco0 = std::chrono::high_resolution_clock::now();
                     std::vector<uint8_t> plain =
                         CryptoAesGcmDecrypt(it->second, iv, enc, aad);
+                    auto __rco1 = std::chrono::high_resolution_clock::now();
+                    double __rcoMs = std::chrono::duration<double, std::milli>(__rco1 - __rco0).count();
+                    std::cout << "[Latency] REG_CONFIRM  vehicle/" << vId
+                              << "  outer_decrypt(V-RSU)  " << __rcoMs << "\n";
 
                     if (!plain.empty() && plain[0] == 0x01 && plain.size() > 1)
                     {
@@ -5192,8 +5273,13 @@ LogReceivedPacket(const std::string& receiverRole,
                                 std::vector<uint8_t> innerCipher(innerTokenBlob.begin() + 16,
                                                                  innerTokenBlob.end());
                                 std::vector<uint8_t> innerAad = BuildCtrlVehicleAad(vId, innerSeq);
+                                auto __rci0 = std::chrono::high_resolution_clock::now();
                                 std::vector<uint8_t> token =
                                     CryptoAesGcmDecrypt(vCtrlKey, innerIv, innerCipher, innerAad);
+                                auto __rci1 = std::chrono::high_resolution_clock::now();
+                                double __rciMs = std::chrono::duration<double, std::milli>(__rci1 - __rci0).count();
+                                std::cout << "[Latency] REG_CONFIRM  vehicle/" << vId
+                                          << "  inner_decrypt(V-Ctrl)  " << __rciMs << "\n";
                                 if (!token.empty() && token.size() == 32)
                                 {
                                     g_vehicleTokens[vId] = token;
@@ -5256,6 +5342,14 @@ LogReceivedPacket(const std::string& receiverRole,
         tag.GetMessageType() == static_cast<uint32_t>(RSU2VEHICLE_COMMAND) &&
         receiverRole == "vehicle")
     {
+        // ── No-security path ───────────────────────────────────────────────
+        if (!g_secEnabled)
+        {
+            std::cout << "[Latency] RSU2VEH_CMD  vehicle/" << receiverId
+                      << "  decrypt  0.000\n";
+        }
+        else
+        {
         RsuVehicleSecureTag envTag;
         if (packet->PeekPacketTag(envTag))
         {
@@ -5274,8 +5368,13 @@ LogReceivedPacket(const std::string& receiverRole,
                     std::vector<uint8_t> enc(pktSz);
                     packet->CopyData(enc.data(), pktSz);
 
+                    auto __t0 = std::chrono::high_resolution_clock::now();
                     std::vector<uint8_t> plain =
                         CryptoAesGcmDecrypt(it->second, iv, enc, aad);
+                    auto __t1 = std::chrono::high_resolution_clock::now();
+                    double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+                    std::cout << "[Latency] RSU2VEH_CMD  vehicle/" << vId
+                              << "  decrypt  " << __ms << "\n";
 
                     if (!plain.empty() && plain.size() >= 12)
                     {
@@ -5298,6 +5397,7 @@ LogReceivedPacket(const std::string& receiverRole,
                 }
             }
         }
+        } // end g_secEnabled
     }
 
     // --- Early decryption pass for encrypted V2RSU reports ---
@@ -5312,11 +5412,39 @@ LogReceivedPacket(const std::string& receiverRole,
         tag.GetMessageType() == static_cast<uint32_t>(V2RSU_REPORT) &&
         receiverRole == "rsu_edge")
     {
+        uint32_t vId = tag.GetRealNodeId();
+        uint32_t rId = receiverId;
+
+        // ── No-security path: accept plaintext report directly ───────────────
+        if (!g_secEnabled)
+        {
+            uint32_t payloadSz = packet->GetSize();
+            std::vector<uint8_t> plain(payloadSz);
+            packet->CopyData(plain.data(), payloadSz);
+            uint32_t reportSz = decryptedReport.GetSerializedSize();
+            if (plain.size() >= 33 + reportSz)
+            {
+                auto __t0 = std::chrono::high_resolution_clock::now();
+                TagBuffer tb(plain.data() + 33, plain.data() + 33 + reportSz);
+                decryptedReport.Deserialize(tb);
+                auto __t1 = std::chrono::high_resolution_clock::now();
+                double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+                std::cout << "[Latency] V2RSU_REPORT  rsu_edge/" << rId
+                          << "  decrypt  " << __ms << "\n";
+                std::cout << "[Latency] V2RSU_REPORT  rsu_edge/" << rId
+                          << "  token_auth  0.000\n";
+                hasDecryptedReport = true;
+                tokenAccepted      = true;
+            }
+        }
+        else
+        {
+        // ── Security ON: decrypt + token auth ───────────────────────────────
         SecureChannelTag scTag;
         if (packet->PeekPacketTag(scTag))
         {
-            uint32_t vId = scTag.vehicleId;
-            uint32_t rId = scTag.rsuId;
+            vId = scTag.vehicleId;
+            rId = scTag.rsuId;
             if (rId < g_rsuSessionKeys.size())
             {
                 auto it = g_rsuSessionKeys[rId].find(vId);
@@ -5330,14 +5458,18 @@ LogReceivedPacket(const std::string& receiverRole,
                     std::vector<uint8_t> ciphertext(payloadSz);
                     packet->CopyData(ciphertext.data(), payloadSz);
 
+                    auto __t0 = std::chrono::high_resolution_clock::now();
                     std::vector<uint8_t> plaintext =
                         CryptoAesGcmDecrypt(skey, iv, ciphertext, aad);
+                    auto __t1 = std::chrono::high_resolution_clock::now();
+                    double __decMs = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+                    std::cout << "[Latency] V2RSU_REPORT  rsu_edge/" << rId
+                              << "  decrypt  " << __decMs << "\n";
 
                     uint32_t reportSz = decryptedReport.GetSerializedSize();
                     if (!plaintext.empty() &&
                         plaintext.size() == 33 + reportSz)
                     {
-                        // ── Step 1: deserialise the report (always, for logging) ──
                         TagBuffer tb(plaintext.data() + 33,
                                      plaintext.data() + 33 + reportSz);
                         decryptedReport.Deserialize(tb);
@@ -5348,8 +5480,9 @@ LogReceivedPacket(const std::string& receiverRole,
                                   << "  Vehicle=" << vId
                                   << "  Seq=" << scTag.seqNum << std::endl;
 
-                        // ── Step 2: token authentication — gates awareness update ──
+                        // ── Token authentication ──────────────────────────────
                         bool hasToken = (plaintext[0] != 0);
+                        auto __ta0 = std::chrono::high_resolution_clock::now();
                         if (hasToken)
                         {
                             std::vector<uint8_t> recvTok(plaintext.begin() + 1,
@@ -5357,31 +5490,33 @@ LogReceivedPacket(const std::string& receiverRole,
                             auto tokenIt = g_globalTokenStore.find(vId);
                             if (tokenIt != g_globalTokenStore.end() &&
                                 tokenIt->second == recvTok)
-                            {
                                 tokenAccepted = true;
-                                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
-                                          << "[Reg] RSU " << rId << ": V2RSU token VALID"
-                                          << " vehicle=" << vId
-                                          << " → report accepted into awareness table\n";
-                            }
-                            else
-                            {
-                                // tokenAccepted stays false — report will be dropped.
-                                std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
-                                          << "[Reg] RSU " << rId << ": V2RSU token INVALID"
-                                          << " vehicle=" << vId
-                                          << " → report REJECTED, re-challenging\n";
-                                if (rId < g_rsuPendingChallenges.size() &&
-                                    g_rsuPendingChallenges[rId].find(vId) ==
-                                    g_rsuPendingChallenges[rId].end())
-                                {
-                                    SendRegChallenge(rId, vId);
-                                }
-                            }
+                        }
+                        auto __ta1 = std::chrono::high_resolution_clock::now();
+                        double __authMs = std::chrono::duration<double, std::milli>(__ta1 - __ta0).count();
+                        std::cout << "[Latency] V2RSU_REPORT  rsu_edge/" << rId
+                                  << "  token_auth  " << __authMs << "\n";
+
+                        if (hasToken && tokenAccepted)
+                        {
+                            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                      << "[Reg] RSU " << rId << ": V2RSU token VALID"
+                                      << " vehicle=" << vId
+                                      << " → report accepted into awareness table\n";
+                        }
+                        else if (hasToken)
+                        {
+                            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                                      << "[Reg] RSU " << rId << ": V2RSU token INVALID"
+                                      << " vehicle=" << vId
+                                      << " → report REJECTED, re-challenging\n";
+                            if (rId < g_rsuPendingChallenges.size() &&
+                                g_rsuPendingChallenges[rId].find(vId) ==
+                                g_rsuPendingChallenges[rId].end())
+                                SendRegChallenge(rId, vId);
                         }
                         else
                         {
-                            // tokenAccepted stays false — report will be dropped.
                             std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                                       << "[Reg] RSU " << rId << ": V2RSU no token"
                                       << " vehicle=" << vId
@@ -5389,9 +5524,7 @@ LogReceivedPacket(const std::string& receiverRole,
                             if (rId < g_rsuPendingChallenges.size() &&
                                 g_rsuPendingChallenges[rId].find(vId) ==
                                 g_rsuPendingChallenges[rId].end())
-                            {
                                 SendRegChallenge(rId, vId);
-                            }
                         }
                     }
                     else
@@ -5403,6 +5536,7 @@ LogReceivedPacket(const std::string& receiverRole,
                 }
             }
         }
+        } // end g_secEnabled
     }
 
     // Edge aggregation: count V2RSU_REPORTs reaching each RSU.
@@ -5478,7 +5612,21 @@ LogReceivedPacket(const std::string& receiverRole,
             std::vector<uint8_t> hash     = CryptoSha256(payload);
             std::vector<uint8_t> pubKey(sigTag.pub_key, sigTag.pub_key + 64);
             std::vector<uint8_t> sigBytes(sigTag.sig,   sigTag.sig     + 64);
-            v2vSigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
+            if (g_secEnabled)
+            {
+                auto __t0 = std::chrono::high_resolution_clock::now();
+                v2vSigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
+                auto __t1 = std::chrono::high_resolution_clock::now();
+                double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+                std::cout << "[Latency] V2V_BEACON  vehicle/" << receiverId
+                          << "  verify  " << __ms << "\n";
+            }
+            else
+            {
+                v2vSigValid = true;
+                std::cout << "[Latency] V2V_BEACON  vehicle/" << receiverId
+                          << "  verify  0.000\n";
+            }
 
             if (v2vSigValid)
             {
@@ -5499,6 +5647,12 @@ LogReceivedPacket(const std::string& receiverRole,
                           << "  Seq="       << tag.GetSequenceNumber()
                           << std::endl;
             }
+        }
+        else if (!g_secEnabled)
+        {
+            // No signature tag in plain-network mode — log 0.000 verify latency.
+            std::cout << "[Latency] V2V_BEACON  vehicle/" << receiverId
+                      << "  verify  0.000\n";
         }
     }
 
@@ -5604,7 +5758,8 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
                            sequenceNumber);
 
     // ── Encrypted path: pre-shared key established ────────────────────────
-    if (rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
+    if (g_secEnabled &&
+        rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
     {
         uint32_t tagSz = batchTag.GetSerializedSize();
         std::vector<uint8_t> plaintext(tagSz, 0);
@@ -5615,8 +5770,13 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
         std::vector<uint8_t> iv  = CryptoRandBytes(12);
         std::vector<uint8_t> aad = BuildCtrlAad(rsuIndex, 0, seq);
 
+        auto __t0 = std::chrono::high_resolution_clock::now();
         std::vector<uint8_t> ciphertext =
             CryptoAesGcmEncrypt(g_rsuCtrlSharedKeys[rsuIndex], iv, plaintext, aad);
+        auto __t1 = std::chrono::high_resolution_clock::now();
+        double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+        std::cout << "[Latency] RSU2CTRL_REPORT  rsu_edge/" << rsuIndex
+                  << "  encrypt  " << __ms << "\n";
 
         if (ciphertext.empty())
         {
@@ -5641,9 +5801,13 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
         return;
     }
 
-    // ── Fallback: no key loaded — send plaintext with warning ─────────────
-    std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
-              << "; sending unencrypted RSU→Controller report.\n";
+    // ── Plaintext path (no-security or no key loaded) ─────────────────────
+    if (!g_secEnabled)
+        std::cout << "[Latency] RSU2CTRL_REPORT  rsu_edge/" << rsuIndex
+                  << "  encrypt  0.000\n";
+    else
+        std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
+                  << "; sending unencrypted RSU→Controller report.\n";
     Ptr<Packet> packet = Create<Packet>(260 + batchTag.GetRecordCount() * 144);
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(batchTag);
@@ -5668,7 +5832,8 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
                                        Simulator::Now().GetSeconds());
 
     // ── Encrypted path ─────────────────────────────────────────────────────
-    if (rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
+    if (g_secEnabled &&
+        rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
     {
         uint32_t tagSz = commandTag.GetSerializedSize();
         std::vector<uint8_t> plaintext(tagSz, 0);
@@ -5679,8 +5844,13 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
         std::vector<uint8_t> iv  = CryptoRandBytes(12);
         std::vector<uint8_t> aad = BuildCtrlAad(rsuIndex, 1, seq);
 
+        auto __t0 = std::chrono::high_resolution_clock::now();
         std::vector<uint8_t> ciphertext =
             CryptoAesGcmEncrypt(g_rsuCtrlSharedKeys[rsuIndex], iv, plaintext, aad);
+        auto __t1 = std::chrono::high_resolution_clock::now();
+        double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+        std::cout << "[Latency] CTRL2RSU_CMD  sdn_controller/0"
+                  << "  encrypt  " << __ms << "\n";
 
         if (ciphertext.empty())
         {
@@ -5704,9 +5874,13 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
         return;
     }
 
-    // ── Fallback: no key loaded — send plaintext with warning ─────────────
-    std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
-              << "; sending unencrypted Controller→RSU command.\n";
+    // ── Plaintext path (no-security or no key loaded) ─────────────────────
+    if (!g_secEnabled)
+        std::cout << "[Latency] CTRL2RSU_CMD  sdn_controller/0"
+                  << "  encrypt  0.000\n";
+    else
+        std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
+                  << "; sending unencrypted Controller→RSU command.\n";
     Ptr<Packet> packet = Create<Packet>(140);
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(commandTag);
@@ -5736,6 +5910,26 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
                        static_cast<uint32_t>(V2RSU_REPORT), sequenceNumber,
                        position.x, position.y, position.z);
 
+    // ── No-security path: send plaintext report directly ─────────────────
+    if (!g_secEnabled)
+    {
+        uint32_t reportSz = report.GetSerializedSize();
+        std::vector<uint8_t> plaintext(33 + reportSz, 0);
+        TagBuffer tb(plaintext.data() + 33, plaintext.data() + 33 + reportSz);
+        auto __t0 = std::chrono::high_resolution_clock::now();
+        report.Serialize(tb);
+        auto __t1 = std::chrono::high_resolution_clock::now();
+        double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+        std::cout << "[Latency] V2RSU_REPORT  vehicle/" << vehicleIndex
+                  << "  encrypt  " << __ms << "\n";
+        Ptr<Packet> packet = Create<Packet>(plaintext.data(), plaintext.size());
+        packet->AddPacketTag(tag);
+        packet->AddPacketTag(BsmCoreDataTag(report.GetSelfBsm()));
+        socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
+        MetricsOnTransmit(1);
+        return;
+    }
+
     // ── Encrypted path: session key is established ────────────────────────
     auto& chanState = g_vehicleChannelState[vehicleIndex];
     if (chanState.HasSession(rsuIndex))
@@ -5757,8 +5951,13 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
         std::vector<uint8_t> iv  = CryptoRandBytes(12);
         std::vector<uint8_t> aad = BuildV2RsuAad(vehicleIndex, rsuIndex, seqNum);
 
+        auto __t0 = std::chrono::high_resolution_clock::now();
         std::vector<uint8_t> ciphertext =
             CryptoAesGcmEncrypt(chanState.GetSessionKey(rsuIndex), iv, plaintext, aad);
+        auto __t1 = std::chrono::high_resolution_clock::now();
+        double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+        std::cout << "[Latency] V2RSU_REPORT  vehicle/" << vehicleIndex
+                  << "  encrypt  " << __ms << "\n";
 
         if (ciphertext.empty())
         {
@@ -5767,7 +5966,6 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
             return;
         }
 
-        // Payload = ciphertext || 16-byte auth tag (already appended by encrypt)
         Ptr<Packet> packet = Create<Packet>(ciphertext.data(), ciphertext.size());
         packet->AddPacketTag(tag);
         packet->AddPacketTag(BsmCoreDataTag(report.GetSelfBsm()));
@@ -5785,9 +5983,6 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
     }
 
     // ── No session yet — block the report completely ──────────────────────
-    // Sending an unencrypted report would expose vehicle data in plaintext
-    // and bypass token authentication.  Drop it silently; the vehicle will
-    // retry once the CHAN_HELLO/CHAN_ACK handshake completes.
     std::cout << "[Security] BLOCKED V2RSU: no session V=" << vehicleIndex
               << "->RSU=" << rsuIndex << " — report held until handshake completes."
               << std::endl;
@@ -6118,6 +6313,18 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
               << " -> Vehicle=" << vehicleIndex
               << " Source=" << source << std::endl;
 
+    // ── No-security path ─────────────────────────────────────────────────
+    if (!g_secEnabled)
+    {
+        std::cout << "[Latency] RSU2VEH_CMD  rsu_edge/" << rsuIndex
+                  << "  encrypt  0.000\n";
+        SendTaggedPacket(sock,
+                         g_wirelessInterfaces.GetAddress(vehicleIndex),
+                         VEHICLE_PORT,
+                         tx);
+        return;
+    }
+
     // ── Encrypted path: use session key if established ────────────────────
     if (rsuIndex < g_rsuSessionKeys.size())
     {
@@ -6141,8 +6348,13 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
             uint32_t seq = g_rsuVehicleTxSeqNums[rsuIndex][vehicleIndex]++;
             std::vector<uint8_t> iv  = CryptoRandBytes(12);
             std::vector<uint8_t> aad = BuildRsuVehicleAad(rsuIndex, vehicleIndex, seq);
+            auto __t0 = std::chrono::high_resolution_clock::now();
             std::vector<uint8_t> ct  =
                 CryptoAesGcmEncrypt(keyIt->second, iv, plaintext, aad);
+            auto __t1 = std::chrono::high_resolution_clock::now();
+            double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+            std::cout << "[Latency] RSU2VEH_CMD  rsu_edge/" << rsuIndex
+                      << "  encrypt  " << __ms << "\n";
 
             if (!ct.empty())
             {
@@ -6261,6 +6473,7 @@ main(int argc, char* argv[])
     CreateProjectDirectories();
 
     CommandLine cmd;
+    cmd.AddValue("SecEnabled",                 "Enable crypto, registration & token auth (false = plain network)", g_secEnabled);
     cmd.AddValue("N_Vehicles",                 "Number of vehicle nodes",                N_Vehicles);
     cmd.AddValue("N_RSUs",                     "Number of RSU edge nodes",               N_RSUs);
     cmd.AddValue("simTime",                    "Simulation time in seconds",             simTime);
@@ -6637,13 +6850,16 @@ main(int argc, char* argv[])
     // starts a new CHAN_HELLO on demand and defers the protected report until the
     // new session is ready.  This avoids creating session keys with every RSU at
     // startup.
-    for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+    if (g_secEnabled)
     {
-        if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
-            continue;
-        uint32_t r = FindNearestRsu(i);
-        double t_hello = 0.5 + 0.04 * i;
-        Simulator::Schedule(Seconds(t_hello), &SendChanHello, i, r);
+        for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+        {
+            if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
+                continue;
+            uint32_t r = FindNearestRsu(i);
+            double t_hello = 0.5 + 0.04 * i;
+            Simulator::Schedule(Seconds(t_hello), &SendChanHello, i, r);
+        }
     }
 
     // Tier 1: V2V broadcast beacons + V2RSU reports
