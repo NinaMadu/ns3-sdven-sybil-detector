@@ -97,6 +97,8 @@ std::string controllerVehicleTableCsv = "sybil-attack/outputs/controller_vehicle
 std::string controllerGlobalAwarenessCsv = "sybil-attack/outputs/controller_global_awareness_log.csv";
 std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
 std::string rssiVerificationCsv = "sybil-attack/outputs/rssi_verification_log.csv";
+std::string flDatasetCsv = "sybil-attack/outputs/fl_dataset.csv";
+
 
 // ---------------------------------------------------------------------------
 // Global containers (NOT static — extern'd in sybil_types.h so attack
@@ -186,6 +188,12 @@ static std::vector<double> g_vehicleLastV2RsuReportTime;
 static std::vector<uint32_t> g_vehicleV2RsuReportCount;
 static std::vector<double> g_rsuLastControllerAwarenessReportTime;
 static std::vector<uint32_t> g_rsuControllerAwarenessReportCount;
+static std::vector<uint32_t> g_vehicleBeaconsSentWindow;  // beacons sent per snapshot window
+static std::vector<uint32_t> g_vehicleBeaconsRecvWindow;  // beacons received per snapshot window
+static std::vector<double>   g_vehicleResidualEnergy;     // 0–100 % simulated battery charge
+static std::vector<double>   g_vehiclePrevSpeed;          // for 1-s acceleration derivative
+static std::vector<std::set<uint32_t>> g_vehicleSeenClaimedIds; // distinct claimed IDs ever seen
+
 
 struct TemporalNewIdentityEvent
 {
@@ -3818,6 +3826,10 @@ UpdateVehicleNeighborRecord(uint32_t observerVehicleId,
     uint32_t observedClaimedId = tag.GetClaimedNodeId();
     uint32_t observedRealId = tag.GetRealNodeId();
     uint32_t observableSourceId = tag.GetObservableSourceId();
+
+    g_vehicleSeenClaimedIds[observerVehicleId].insert(observedClaimedId);
+    if (observerVehicleId < g_vehicleBeaconsRecvWindow.size())
+        g_vehicleBeaconsRecvWindow[observerVehicleId]++;
     auto& table = g_vehicleNeighborTables[observerVehicleId];
     auto it = table.find(observedClaimedId);
     bool isNewRecord = (it == table.end());
@@ -4989,6 +5001,10 @@ SendV2VBeaconTagged(Ptr<Socket> sock, Ipv4Address dest, uint16_t port, Ptr<TxInf
               << " ClaimedId=" << tx->claimedNodeId
               << " Seq=" << tx->sequenceNumber
               << " -> Broadcast" << std::endl;
+    if (tx->realNodeId < N_Vehicles)
+    {
+        g_vehicleBeaconsSentWindow[tx->realNodeId]++;
+    }
     SendTaggedPacket(sock, dest, port, tx);
 }
 
@@ -5584,6 +5600,170 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("mobilityUpdateInterval",          mobilityUpdateInterval);
 }
 
+// =============================================================================
+// LogFlDatasetSnapshot — FLEMDS dataset logger (fires every 1 s).
+//
+// Each row captures one vehicle at one second tick with:
+//   • Kinematic BSM features (LSTM input columns)
+//   • Neighbour-aggregated RSSI stats
+//   • Simulated resource metrics — FLBFLVS client-selection inputs
+//   • Binary ground-truth label  (Normal=0, Sybil=1)
+//   • Raw attack-type column kept for multi-class ablations
+//
+// Binary label mapping (FLEMDS paper §IV-B):
+//   g_vehicleIsAttacker[vid] == true  →  sybil_label = 1  (any of types 1–6)
+//   g_vehicleIsAttacker[vid] == false →  sybil_label = 0
+// =============================================================================
+static void
+LogFlDatasetSnapshot()
+{
+    static bool headerWritten = false;
+    std::ofstream f(flDatasetCsv, std::ios::app);
+    if (!f.is_open()) return;
+
+    if (!headerWritten)
+    {
+        f << "sim_time,vehicle_id,real_id,claimed_id,"
+             "pos_x,pos_y,speed,heading,acceleration,"
+             "beacons_sent,beacons_recv,rssi_avg_dbm,rssi_std_dbm,"
+             "dist_mismatch_avg,dist_mismatch_count,neighbor_count,id_change_count,"
+             "residual_energy_pct,memory_free_pct,data_quality,"
+             "suspicion_flags,trust_score,"
+             "attack_type_raw,sybil_label\n";
+        headerWritten = true;
+    }
+
+    // Suspicion flag importance weights (bit 0..10, max total = 17.0).
+    // Higher weight = flag is a stronger Sybil indicator.
+    static const double kFlagWeights[11] = {
+        2.0,  // bit 0  ID_MISMATCH
+        2.0,  // bit 1  POSITION_CONFLICT
+        1.5,  // bit 2  DUPLICATE_ID
+        1.0,  // bit 3  RANGE_ANOMALY
+        1.5,  // bit 4  TEMPORAL_BURST
+        2.0,  // bit 5  RSSI_COLOCATION
+        1.5,  // bit 6  TRAJECTORY_SHADOWING
+        1.0,  // bit 7  UNCORROBORATED_RSU_APPROVAL
+        2.0,  // bit 8  RSSI_DISTANCE_MISMATCH
+        1.5,  // bit 9  INVALID_V2V_SIGNATURE
+        1.0,  // bit 10 UNVERIFIED_RSU_WITNESS_PROVENANCE
+    };
+    static const double kMaxFlagWeight       = 17.0;
+    static const double kMaxNeighbours       = 30.0;  // memory normalisation
+    static const double kEnergyDrainPerBeacon = 0.05; // 0.05 % per sent beacon
+
+    double t = Simulator::Now().GetSeconds();
+
+    for (uint32_t vid = 0; vid < N_Vehicles; ++vid)
+    {
+        // ── Kinematics from ns-3 mobility model ────────────────────────────
+        Ptr<MobilityModel> mob = g_vehicleNodes.Get(vid)->GetObject<MobilityModel>();
+        Vector pos = mob->GetPosition();
+        Vector vel = mob->GetVelocity();
+        double speed    = std::sqrt(vel.x * vel.x + vel.y * vel.y);
+        double heading  = std::atan2(vel.y, vel.x) * (180.0 / M_PI); // degrees
+        double accel    = speed - g_vehiclePrevSpeed[vid];            // Δv / 1 s
+        g_vehiclePrevSpeed[vid] = speed;
+
+        // ── Neighbour-table aggregation ─────────────────────────────────────
+        double   rssiSum          = 0.0;
+        double   rssiSumSq        = 0.0;
+        double   distMismatchSum  = 0.0;
+        uint32_t distMismatchCnt  = 0;
+        int      rssiCount        = 0;
+        uint32_t combinedSuspicion = 0;
+
+        for (auto& [nid, rec] : g_vehicleNeighborTables[vid])
+        {
+            if (rec.rssiDbm > -990.0)
+            {
+                rssiSum   += rec.rssiDbm;
+                rssiSumSq += rec.rssiDbm * rec.rssiDbm;
+                ++rssiCount;
+            }
+            if (rec.rssiEstimatedDistance > 0.0 && rec.claimedDistance > 0.0)
+            {
+                double mm = std::abs(rec.rssiEstimatedDistance - rec.claimedDistance);
+                distMismatchSum += mm;
+                if (mm > 20.0) ++distMismatchCnt; // >20 m = suspicious
+            }
+            combinedSuspicion |= rec.suspicionFlags;
+        }
+
+        double rssiAvg = rssiCount > 0 ? rssiSum / rssiCount : -95.0;
+        double rssiVar = rssiCount > 1
+            ? (rssiSumSq / rssiCount - rssiAvg * rssiAvg) : 0.0;
+        double rssiStd        = std::sqrt(std::max(0.0, rssiVar));
+        double distMismatchAvg = rssiCount > 0 ? distMismatchSum / rssiCount : 0.0;
+
+        // ── Weighted trust score ────────────────────────────────────────────
+        double weightedSusp = 0.0;
+        for (int b = 0; b < 11; ++b)
+            if (combinedSuspicion & (1u << b))
+                weightedSusp += kFlagWeights[b];
+        double trustScore = std::max(0.0, 1.0 - (weightedSusp / kMaxFlagWeight));
+
+        // ── Beacon counts and data quality ──────────────────────────────────
+        uint32_t beaconsSent = g_vehicleBeaconsSentWindow[vid];
+        uint32_t beaconsRecv = g_vehicleBeaconsRecvWindow[vid];
+        // data_quality: fraction of expected beacons actually received from neighbours
+        double expectedRecv = (1.0 / beaconInterval) *
+                              static_cast<double>(g_vehicleNeighborTables[vid].size());
+        double dataQuality  = expectedRecv > 0.0
+            ? std::min(static_cast<double>(beaconsRecv) / expectedRecv, 1.0) : 0.0;
+
+        // ── Simulated resource metrics (FLBFLVS inputs) ─────────────────────
+        g_vehicleResidualEnergy[vid] = std::max(5.0,
+            g_vehicleResidualEnergy[vid] - beaconsSent * kEnergyDrainPerBeacon);
+        double memUsedPct  = std::min(100.0,
+            (g_vehicleNeighborTables[vid].size() / kMaxNeighbours) * 100.0);
+        double memFreePct  = 100.0 - memUsedPct;
+
+        uint32_t idChanges    = static_cast<uint32_t>(g_vehicleSeenClaimedIds[vid].size());
+
+        // ── Ground-truth label (binary FLEMDS target) ───────────────────────
+        // attack_type_raw: the actual attack variant this vehicle performs (0 for normals).
+        // sybil_label:     0 = Normal, 1 = Sybil  (binary FLEMDS training target).
+        uint32_t attackTypeRaw = IsSybilVehicle(vid)
+            ? static_cast<uint32_t>(g_activeAttackType) : 0u;
+        int sybilLabel = IsSybilVehicle(vid) ? 1 : 0;
+
+        // ── Write CSV row ───────────────────────────────────────────────────
+        f << std::fixed << std::setprecision(4)
+          << t                                         << ","
+          << vid                                       << ","
+          << vid                                       << ","  // real_id = node index
+          << GetClaimedVehicleId(vid, N_Vehicles)      << ","
+          << pos.x                                     << ","
+          << pos.y                                     << ","
+          << speed                                     << ","
+          << heading                                   << ","
+          << accel                                     << ","
+          << beaconsSent                               << ","
+          << beaconsRecv                               << ","
+          << rssiAvg                                   << ","
+          << rssiStd                                   << ","
+          << distMismatchAvg                           << ","
+          << distMismatchCnt                           << ","
+          << g_vehicleNeighborTables[vid].size()       << ","
+          << idChanges                                 << ","
+          << g_vehicleResidualEnergy[vid]              << ","
+          << memFreePct                                << ","
+          << dataQuality                               << ","
+          << combinedSuspicion                         << ","
+          << trustScore                                << ","
+          << attackTypeRaw                             << ","
+          << sybilLabel                                << "\n";
+
+        // Reset per-window counters
+        g_vehicleBeaconsSentWindow[vid] = 0;
+        g_vehicleBeaconsRecvWindow[vid] = 0;
+    }
+
+    Simulator::Schedule(Seconds(1.0), &LogFlDatasetSnapshot);
+}
+
+
 // ===========================================================================
 // main
 // ===========================================================================
@@ -6141,6 +6321,13 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
 
     Simulator::Stop(Seconds(simTime));
+    g_vehicleBeaconsSentWindow.assign(N_Vehicles, 0);
+    g_vehicleBeaconsRecvWindow.assign(N_Vehicles, 0);
+    g_vehicleResidualEnergy.assign(N_Vehicles, 100.0); // 100 % initial battery charge
+    g_vehiclePrevSpeed.assign(N_Vehicles, 0.0);
+    g_vehicleSeenClaimedIds.assign(N_Vehicles, std::set<uint32_t>());
+    Simulator::Schedule(Seconds(1.0), &LogFlDatasetSnapshot);
+
     Simulator::Run();
     Simulator::Destroy();
 
