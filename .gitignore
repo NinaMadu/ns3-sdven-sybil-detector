@@ -17,6 +17,7 @@
 !scratch/sybil_attacks.h
 !scratch/sybil_types.h
 !scratch/sybil_crypto.h
+!scratch/rssi_sybil_detection.h
 
 # Track repository docs/config
 !README.md

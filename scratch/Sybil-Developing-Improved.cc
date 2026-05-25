@@ -24,6 +24,7 @@
 #include "ns3/network-module.h"
 #include "ns3/wifi-module.h"
 #include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
+#include "rssi_sybil_detection.h"
 
 #include <algorithm>
 #include <chrono>
@@ -37,6 +38,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <random>
 
 using namespace ns3;
 
@@ -47,17 +49,17 @@ NS_LOG_COMPONENT_DEFINE("SybilDeveloping");
 // ---------------------------------------------------------------------------
 
 uint32_t N_Vehicles = 8;              ///< Number of vehicle nodes.
-uint32_t N_RSUs = 2;                  ///< Number of RSU edge nodes.
+uint32_t N_RSUs = 4;                  ///< Number of RSU edge nodes.
 double simTime = 12.0;                ///< Total simulation time (seconds).
 double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
 double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
-bool routing_test = true;             ///< true → small 3-vehicle/2-RSU/1-SDN test network.
+bool routing_test = false;             ///< true → small 3-vehicle/2-RSU/1-SDN test network.
 bool g_secEnabled         = true;     ///< Master security toggle — false = plain network (no crypto/registration).
-bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
+bool sybil_attack_enabled = true;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
 uint32_t proposed_method = 0;         ///< Detection method: 0=rule-based 1=ML 2=FL 3=hybrid.
-uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
+uint32_t sybil_attack_type = 2;       ///< Attack variant (see sybil_attacks.h).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
 double rsuVehicleRecordTimeout = 3.0; ///< Seconds before an RSU forgets an unseen vehicle.
 double rsuVehicleTableSnapshotInterval = 1.0; ///< Periodic RSU table CSV snapshot interval.
@@ -1679,9 +1681,9 @@ static void
 InitializeRssiVerificationCsv()
 {
     std::ofstream out(rssiVerificationCsv.c_str(), std::ios::out);
+
     out << "time,observer_vehicle_id,observed_claimed_id,observed_real_id,"
-        << "rssi_dbm,rssi_estimated_distance_m,claimed_distance_m,mismatch_m,"
-        << "threshold_m,verification_state,suspicion_flags\n";
+        << "rssi_dbm,rssi_estimated_distance_m,claimed_distance_m,mismatch\n";
 }
 
 static void
@@ -5718,6 +5720,8 @@ LogReceivedPacket(const std::string& receiverRole,
     }
 }
 
+
+
 static void
 ReceivePacket(std::string receiverRole, uint32_t receiverId,
               std::string channel, Ptr<Socket> socket)
@@ -5729,6 +5733,37 @@ ReceivePacket(std::string receiverRole, uint32_t receiverId,
         SybilPacketTag tag;
         bool hasTag = packet->PeekPacketTag(tag);
         LogReceivedPacket(receiverRole, receiverId, channel, packet, tag, hasTag);
+
+        if (receiverRole == "rsu_edge" && hasTag)
+        {
+            double rssiDbm = -80.0;
+            uint32_t rid = tag.GetRealNodeId();
+            if (rid < g_vehicleNodes.GetN() &&
+                receiverId < g_rsuNodes.GetN())
+            {
+                Ptr<MobilityModel> vm =
+                    g_vehicleNodes.Get(rid)->GetObject<MobilityModel>();
+                Ptr<MobilityModel> rm =
+                    g_rsuNodes.Get(receiverId)->GetObject<MobilityModel>();
+                double dist = std::max(0.5, vm->GetDistanceFrom(rm));
+                double pl = std::abs(RssiSybilDetector::kRef1mDbm)
+                          + 10.0 * RssiSybilDetector::kPathLossExp
+                          * std::log10(dist);
+                rssiDbm = RssiSybilDetector::kTxPowerDbm - pl;
+                static std::mt19937 rng_r(std::random_device{}());
+                static std::uniform_real_distribution<double> uni(0.0, 1.0);
+                // Rayleigh sample: r = sigma * sqrt(-2 * ln(U))
+                double sigma_ch = 0.7071; // unit-power Rayleigh
+                double rayleighGain = sigma_ch * std::sqrt(-2.0 * std::log(std::max(uni(rng_r), 1e-9)));
+                rssiDbm += 20.0 * std::log10(rayleighGain); // apply fading in dB
+            }
+            RssiSybilDetector::FeedObservation(
+                receiverId,
+                tag.GetClaimedNodeId(),
+                tag.GetRealNodeId(),
+                rssiDbm,
+                Simulator::Now().GetSeconds());
+        }
     }
 }
 
@@ -6186,6 +6221,7 @@ SendControllerRsuCommand(uint32_t rsuIndex)
     // Type 6: malicious controller injects Sybil records into its global table.
     // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections
     // when N_RSUs > 1).  Records then flow back to RSUs via controller commands.
+    RssiSybilDetector::RunDetection(0.0, 200.0, 20.0, 110.0, 65.0);
     if (sybil_attack_enabled && rsuIndex == 0)
         InjectSybilRecordsIntoControllerTable(g_controllerGlobalAwarenessTable);
 
@@ -6500,7 +6536,7 @@ main(int argc, char* argv[])
     if (routing_test)
     {
         N_Vehicles = 3;
-        N_RSUs     = 2;
+        N_RSUs     = 4;
         simTime    = std::min(simTime, 12.0);
     }
     if (N_RSUs == 0) N_RSUs = 1;
@@ -6590,16 +6626,28 @@ main(int argc, char* argv[])
     // Tier 2 — RSUs: fixed above the road, one per coverage zone.
     // RSU-0=(40,100)  RSU-1=(100,100)
     // Each RSU is ~60 m above its vehicle cluster, well within link budget.
-    MobilityHelper rsuMobility;
-    rsuMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    rsuMobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                     "MinX",      DoubleValue(40.0),
-                                     "MinY",      DoubleValue(100.0),
-                                     "DeltaX",    DoubleValue(60.0),
-                                     "DeltaY",    DoubleValue(0.0),
-                                     "GridWidth", UintegerValue(N_RSUs),
-                                     "LayoutType",StringValue("RowFirst"));
+   MobilityHelper rsuMobility;
+   rsuMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+   rsuMobility.SetPositionAllocator("ns3::GridPositionAllocator",
+                                 "MinX",      DoubleValue(20.0),  // ← was 40.0
+                                 "MinY",      DoubleValue(100.0),
+                                 "DeltaX",    DoubleValue(40.0),  // ← was 60.0
+                                 "DeltaY",    DoubleValue(0.0),
+                                 "GridWidth", UintegerValue(N_RSUs),
+                                 "LayoutType",StringValue("RowFirst"));
     rsuMobility.Install(g_rsuNodes);
+
+    // ADD this new block:
+{
+    std::vector<RssiSybilDetector::RssiPos2D> rsuPos;
+    for (uint32_t u = 0; u < N_RSUs; ++u) {
+        Vector p = g_rsuNodes.Get(u)
+                             ->GetObject<MobilityModel>()
+                             ->GetPosition();
+        rsuPos.push_back({p.x, p.y});
+    }
+    RssiSybilDetector::Init(N_RSUs, rsuPos);
+}
 
     // Tier 3 — SDN controller: centred above both RSUs.
     // SDN=(70,190) — wired backhaul, physical position is cosmetic only.
@@ -6985,9 +7033,14 @@ main(int argc, char* argv[])
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
     Simulator::Destroy();
+   
 
     WriteMetricsRow(simTime);
     WriteFinalSummary();
+
+    RssiSybilDetector::PrintMetrics();
+
+    
 
     return 0;
 }
