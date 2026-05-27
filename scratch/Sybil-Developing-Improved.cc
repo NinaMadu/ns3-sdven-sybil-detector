@@ -42,6 +42,12 @@ using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("SybilDeveloping");
 
+static void LogControllerGlobalAwarenessEvent(
+    const std::string& event,
+    const ControllerGlobalAwarenessRecord& record,
+    const std::string& status,
+    uint32_t triggerSeq = 0);
+
 // ---------------------------------------------------------------------------
 // Experiment parameters — change these to configure a run.
 // ---------------------------------------------------------------------------
@@ -50,15 +56,18 @@ uint32_t N_Vehicles = 8;              ///< Number of vehicle nodes.
 uint32_t N_RSUs = 2;                  ///< Number of RSU edge nodes.
 double simTime = 12.0;                ///< Total simulation time (seconds).
 double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
+double beaconJitterMax = 0.02;        ///< Maximum random V2V beacon timing jitter (seconds).
 double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
 bool routing_test = true;             ///< true → small 3-vehicle/2-RSU/1-SDN test network.
 bool g_secEnabled         = true;     ///< Master security toggle — false = plain network (no crypto/registration).
 bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
+uint32_t sybil_attacker_level = 2;    ///< Attacker sophistication: 1=basic, 2=standard, 3=stealth, 4=advanced.
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
-uint32_t proposed_method = 0;         ///< Detection method: 0=rule-based 1=ML 2=FL 3=hybrid.
+uint32_t proposed_method = 0;         ///< Detection method: 0=none 1=rule-based 2=ML 3=FL 4=hybrid.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
+double v2vReliableRange = 100.0;      ///< Reliable local V2V beacon evaluation radius (metres).
 double rsuVehicleRecordTimeout = 3.0; ///< Seconds before an RSU forgets an unseen vehicle.
 double rsuVehicleTableSnapshotInterval = 1.0; ///< Periodic RSU table CSV snapshot interval.
 bool awarenessSnapshotSharingEnabled = true; ///< Periodically send full awareness snapshots.
@@ -68,6 +77,18 @@ double awarenessReportOverlap = 0.25;        ///< Seconds of overlap for delta r
 double vehicleNeighborTimeout = 3.0;         ///< Expire vehicle neighbor records after silence.
 double rsuAwarenessTimeout = 5.0;            ///< Expire RSU awareness rows/aggregates after silence.
 double controllerAwarenessTimeout = 8.0;     ///< Expire SDN global awareness records after silence.
+double channelHandshakeTimeout = 1.0;        ///< Retry V2RSU CHAN_HELLO after pending timeout.
+bool boundedRoadMobility = true;             ///< Keep vehicles inside a bounded road corridor.
+double roadStartX = 20.0;                    ///< Road corridor start x-coordinate.
+double roadLength = 800.0;                   ///< Road corridor length in metres.
+double roadBaseY = 40.0;                     ///< Centre y-coordinate of the road corridor.
+uint32_t roadLaneCount = 2;                  ///< Number of synthetic lanes.
+double laneSpacing = 4.0;                    ///< Spacing between lane centre lines.
+double rsuOffsetY = 60.0;                    ///< RSU offset from road centre line in metres.
+double vehicleSpacing = 35.0;                ///< Initial spacing between vehicles.
+double minVehicleSpeed = 8.0;                ///< Slowest vehicle speed in m/s.
+double maxVehicleSpeed = 16.0;               ///< Fastest vehicle speed in m/s.
+double mobilityUpdateInterval = 0.5;         ///< Seconds between bounded-road wrap checks.
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
 std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_table_log.csv";
@@ -639,7 +660,10 @@ static uint32_t
 EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
                                   uint32_t claimedId,
                                   uint32_t vehicleWitnessCount,
-                                  uint32_t rsuReportCount)
+                                  uint32_t rsuReportCount,
+                                  uint32_t rssiVerifiedCount = 0,
+                                  uint32_t rssiMismatchCount = 0,
+                                  uint32_t rssiUnverifiedCount = 0)
 {
     if (rsuIndex >= N_RSUs)
         return SUSPICION_NONE;
@@ -650,8 +674,17 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
     if (claimedId < N_Vehicles)
         return SUSPICION_NONE;
 
-    if (vehicleWitnessCount > 0)
+    uint32_t physicalEvidenceCount = rssiVerifiedCount + rssiMismatchCount;
+    bool hasNoVehicleWitnesses = (vehicleWitnessCount == 0);
+    bool hasNoPhysicalWitnessProof = (physicalEvidenceCount == 0);
+    bool hasNoVerifiedPhysicalWitness = (rssiVerifiedCount == 0);
+
+    if (!hasNoVehicleWitnesses &&
+        !hasNoPhysicalWitnessProof &&
+        !hasNoVerifiedPhysicalWitness)
+    {
         return SUSPICION_NONE;
+    }
 
     if (g_sdnUnsupportedRsuApprovals.size() < N_RSUs)
         g_sdnUnsupportedRsuApprovals.resize(N_RSUs);
@@ -659,10 +692,23 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
     bool firstUnsupportedForId =
         g_sdnUnsupportedRsuApprovals[rsuIndex].insert(claimedId).second;
 
+    uint32_t flags = SUSPICION_NONE;
+    if (hasNoVehicleWitnesses)
+        flags |= SUSPICION_UNCORROBORATED_RSU_APPROVAL;
+    if (!hasNoVehicleWitnesses &&
+        (hasNoPhysicalWitnessProof || hasNoVerifiedPhysicalWitness))
+        flags |= SUSPICION_UNVERIFIED_RSU_WITNESS_PROVENANCE;
+
     std::cout << "[UncorroboratedRsuApproval] SDN flagged RSU=" << rsuIndex
               << " claimedId=" << claimedId
               << " vehicleWitnesses=" << vehicleWitnessCount
-              << " rsuReports=" << rsuReportCount;
+              << " rsuReports=" << rsuReportCount
+              << " rssiVerified=" << rssiVerifiedCount
+              << " rssiMismatch=" << rssiMismatchCount
+              << " rssiUnverified=" << rssiUnverifiedCount
+              << " reason="
+              << (hasNoVehicleWitnesses ? "no_vehicle_witness"
+                                         : "unverified_witness_provenance");
     if (firstUnsupportedForId)
     {
         std::cout << " uniqueUnsupported="
@@ -670,7 +716,249 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
     }
     std::cout << std::endl;
 
-    return SUSPICION_UNCORROBORATED_RSU_APPROVAL;
+    return flags;
+}
+
+static bool
+LightweightDecisionModeActive()
+{
+    return proposed_method == MODE_RULE_BASED || proposed_method == MODE_HYBRID;
+}
+
+static bool
+IsOutOfRegistrySybilIdentity(uint32_t realId, uint32_t claimedId)
+{
+    return claimedId >= N_Vehicles || realId != claimedId;
+}
+
+static bool
+IsRegistryMissClaimedIdentity(uint32_t claimedId)
+{
+    return claimedId >= N_Vehicles;
+}
+
+static void
+RecordLightweightDecision(uint32_t claimedId,
+                          bool isActuallySybil,
+                          const std::string& tier,
+                          const std::string& evidence,
+                          uint32_t evidenceBytes,
+                          bool blocked,
+                          bool countConfusionNow,
+                          bool flagFuturePackets)
+{
+    if (!LightweightDecisionModeActive() || !g_secMetrics)
+        return;
+
+    g_secMetrics->RecordExplicitLightweightDecision(
+        claimedId,
+        isActuallySybil,
+        tier,
+        evidence,
+        evidenceBytes,
+        Simulator::Now().GetSeconds(),
+        blocked,
+        countConfusionNow,
+        flagFuturePackets);
+}
+
+static void
+RecordLightweightMiss(uint32_t claimedId,
+                      bool isActuallySybil,
+                      const std::string& tier,
+                      const std::string& evidence)
+{
+    if (!LightweightDecisionModeActive() || !g_secMetrics)
+        return;
+
+    g_secMetrics->RecordExplicitLightweightMiss(claimedId,
+                                                isActuallySybil,
+                                                tier,
+                                                evidence,
+                                                Simulator::Now().GetSeconds());
+}
+
+static uint32_t
+LightweightRejectedReportAttributionBudget(uint32_t sybilNeighborCount,
+                                           const std::string& evidence)
+{
+    if (sybilNeighborCount == 0)
+        return 0;
+
+    // For unauthenticated outsider reports, registry-miss identities inside the
+    // rejected payload are observable evidence: the RSU sees the claimed IDs and
+    // can compare them with its valid vehicle registry without using simulation
+    // ground truth. These identities can therefore be quarantined individually.
+    if (evidence == "forged_v2rsu_no_secure_channel")
+        return sybilNeighborCount;
+
+    // Token-rejected reports have a decryptable envelope, so the RSU has better
+    // evidence than for plaintext outsider injection, but still keeps a bounded
+    // attribution budget.
+    return std::min(sybilNeighborCount, std::max(1u, (sybilNeighborCount + 1u) / 2u));
+}
+
+static void
+RecordLightweightV2RsuRejection(uint32_t rsuIndex,
+                                const SybilPacketTag& tag,
+                                const V2RsuAwarenessReportTag& report,
+                                bool hasReport,
+                                const std::string& evidence,
+                                uint32_t evidenceBytes)
+{
+    if (!LightweightDecisionModeActive())
+        return;
+
+    uint32_t reporterClaimed = tag.GetClaimedNodeId();
+    bool unauthenticatedRejectedReport =
+        (evidence == "forged_v2rsu_no_secure_channel");
+    bool reporterIsSybil = unauthenticatedRejectedReport
+        ? IsRegistryMissClaimedIdentity(reporterClaimed)
+        : IsOutOfRegistrySybilIdentity(tag.GetRealNodeId(), reporterClaimed);
+    bool decisionMade = false;
+    if (reporterIsSybil)
+    {
+        RecordLightweightDecision(reporterClaimed,
+                                  true,
+                                  "rsu_edge",
+                                  evidence + "_reporter",
+                                  evidenceBytes,
+                                  true,
+                                  false,
+                                  true);
+        decisionMade = true;
+    }
+
+    if (!hasReport)
+    {
+        if (decisionMade)
+        {
+            std::cout << "[LIGHTWEIGHT_BLOCK] V2RSU report rejected at RSU=" << rsuIndex
+                      << " reporterClaimed=" << reporterClaimed
+                      << " evidence=" << evidence
+                      << " trustedAwareness=blocked"
+                      << std::endl;
+        }
+        return;
+    }
+
+    std::vector<const V2RsuNeighborObservationPayload*> sybilObservations;
+    sybilObservations.reserve(report.GetNeighborCount());
+    for (uint32_t n = 0; n < report.GetNeighborCount(); ++n)
+    {
+        const auto& obs = report.GetObservation(n);
+        bool observedIsSybil = unauthenticatedRejectedReport
+            ? IsRegistryMissClaimedIdentity(obs.observedClaimedId)
+            : IsOutOfRegistrySybilIdentity(obs.observedRealId, obs.observedClaimedId);
+        if (!observedIsSybil)
+            continue;
+
+        sybilObservations.push_back(&obs);
+    }
+
+    uint32_t attributionBudget =
+        LightweightRejectedReportAttributionBudget(static_cast<uint32_t>(sybilObservations.size()),
+                                                   evidence);
+
+    for (uint32_t n = 0; n < sybilObservations.size(); ++n)
+    {
+        const auto& obs = *sybilObservations[n];
+        bool attributeIdentity = (n < attributionBudget);
+
+        if (attributeIdentity)
+        {
+            RecordLightweightDecision(obs.observedClaimedId,
+                                      true,
+                                      "rsu_edge",
+                                      evidence + "_neighbor_observation",
+                                      evidenceBytes,
+                                      true,
+                                      true,
+                                      true);
+            decisionMade = true;
+        }
+        else
+        {
+            RecordLightweightMiss(obs.observedClaimedId,
+                                  true,
+                                  "rsu_edge",
+                                  evidence + "_neighbor_observation");
+        }
+    }
+
+    if (decisionMade)
+    {
+        std::cout << "[LIGHTWEIGHT_BLOCK] V2RSU report rejected at RSU=" << rsuIndex
+                  << " reporterClaimed=" << reporterClaimed
+                  << " evidence=" << evidence
+                  << " trustedAwareness=blocked"
+                  << std::endl;
+    }
+}
+
+static bool
+ShouldBlockLightweightGlobalRecord(const ControllerGlobalAwarenessRecord& record,
+                                   const std::string& source,
+                                   uint32_t triggerSeq)
+{
+    if (!LightweightDecisionModeActive())
+        return false;
+
+    if ((record.suspicionFlags & SUSPICION_UNCORROBORATED_RSU_APPROVAL) == 0 &&
+        (record.suspicionFlags & SUSPICION_UNVERIFIED_RSU_WITNESS_PROVENANCE) == 0)
+    {
+        return false;
+    }
+
+    bool isActuallySybil =
+        IsOutOfRegistrySybilIdentity(record.realVehicleId, record.claimedVehicleId);
+    std::string evidence =
+        (record.suspicionFlags & SUSPICION_UNCORROBORATED_RSU_APPROVAL)
+            ? "uncorroborated_rsu_approval"
+            : "unverified_rsu_witness_provenance";
+    RecordLightweightDecision(record.claimedVehicleId,
+                              isActuallySybil,
+                              "sdn_controller",
+                              evidence,
+                              256u,
+                              true,
+                              true,
+                              true);
+
+    LogControllerGlobalAwarenessEvent("lightweight_blocked_global_record",
+                                      record,
+                                      source,
+                                      triggerSeq);
+    std::cout << "[LIGHTWEIGHT_BLOCK] SDN blocked global awareness record"
+              << " ClaimedId=" << record.claimedVehicleId
+              << " RSU=" << record.lastServingRsuId
+              << " Evidence=" << evidence
+              << std::endl;
+    return true;
+}
+
+static void
+RecordUnblockedLightweightGlobalMiss(const ControllerGlobalAwarenessRecord& record,
+                                     const std::string& evidence)
+{
+    if (!LightweightDecisionModeActive())
+        return;
+
+    if (record.suspicionFlags != SUSPICION_NONE)
+        return;
+
+    bool isActuallySybil =
+        IsOutOfRegistrySybilIdentity(record.realVehicleId, record.claimedVehicleId);
+    if (!isActuallySybil)
+        return;
+
+    // Evaluation-only accounting: an infrastructure-provided record with
+    // plausible provenance was accepted by the current lightweight rules, so it
+    // should reduce recall. This does not block or flag future packets.
+    RecordLightweightMiss(record.claimedVehicleId,
+                          true,
+                          "sdn_controller",
+                          evidence);
 }
 
 static void
@@ -1001,6 +1289,10 @@ struct RsuControllerAwarenessPayload
     uint32_t observerCount    = 0;
     uint32_t reportCount      = 0;
     uint32_t suspicionFlags   = SUSPICION_NONE;
+    uint32_t rssiVerifiedCount = 0;
+    uint32_t rssiMismatchCount = 0;
+    uint32_t rssiUnverifiedCount = 0;
+    double   rssiVerifiedProbability = 0.5;
 };
 
 class RsuControllerBatchAwarenessTag : public Tag
@@ -1018,10 +1310,10 @@ class RsuControllerBatchAwarenessTag : public Tag
     }
     TypeId GetInstanceTypeId() const override { return GetTypeId(); }
 
-    // Each slot: 10×uint32 + 13×double (same layout as RsuControllerAwarenessTag)
+    // Each slot: 13×uint32 + 14×double.
     uint32_t GetSerializedSize() const override
     {
-        static const uint32_t perRecord = 10 * sizeof(uint32_t) + 13 * sizeof(double);
+        static const uint32_t perRecord = 13 * sizeof(uint32_t) + 14 * sizeof(double);
         return 2 * sizeof(uint32_t) + MAX_RSU2CONTROLLER_RECORDS * perRecord;
     }
 
@@ -1055,6 +1347,10 @@ class RsuControllerBatchAwarenessTag : public Tag
             i.WriteU32(r.observerCount);
             i.WriteU32(r.reportCount);
             i.WriteU32(r.suspicionFlags);
+            i.WriteU32(r.rssiVerifiedCount);
+            i.WriteU32(r.rssiMismatchCount);
+            i.WriteU32(r.rssiUnverifiedCount);
+            i.WriteDouble(r.rssiVerifiedProbability);
         }
     }
 
@@ -1090,6 +1386,10 @@ class RsuControllerBatchAwarenessTag : public Tag
             r.observerCount         = i.ReadU32();
             r.reportCount           = i.ReadU32();
             r.suspicionFlags        = i.ReadU32();
+            r.rssiVerifiedCount     = i.ReadU32();
+            r.rssiMismatchCount     = i.ReadU32();
+            r.rssiUnverifiedCount   = i.ReadU32();
+            r.rssiVerifiedProbability = i.ReadDouble();
         }
     }
 
@@ -1111,6 +1411,10 @@ class RsuControllerBatchAwarenessTag : public Tag
         r.observerCount    = rec.observerCount;
         r.reportCount      = rec.reportCount;
         r.suspicionFlags   = rec.suspicionFlags;
+        r.rssiVerifiedCount = rec.rssiVerifiedCount;
+        r.rssiMismatchCount = rec.rssiMismatchCount;
+        r.rssiUnverifiedCount = rec.rssiUnverifiedCount;
+        r.rssiVerifiedProbability = rec.rssiVerifiedProbability;
         ++m_recordCount;
         return true;
     }
@@ -1643,7 +1947,8 @@ InitializeRsuVehicleObservationCsv()
     out << "time,event,rsu_id,observed_claimed_id,row_index,row_type,reported_by_vehicle_id,"
         << "observed_real_id,report_receive_time,observation_time,bsm_x,bsm_y,bsm_z,"
         << "bsm_speed,bsm_heading,estimated_distance,received_beacon_count,"
-        << "suspicion_flags,dirty,rows_for_claimed_id,trigger_seq,status\n";
+        << "suspicion_flags,rssi_estimated_distance_m,rssi_verification_state,"
+        << "dirty,rows_for_claimed_id,trigger_seq,status\n";
 }
 
 static void
@@ -1661,7 +1966,9 @@ InitializeRsuRegionalAwarenessCsv()
     std::ofstream out(rsuRegionalAwarenessCsv.c_str(), std::ios::out);
     out << "time,event,rsu_id,claimed_vehicle_id,real_vehicle_id,first_seen_time,"
         << "last_seen_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,observer_count,"
-        << "report_count,suspicion_flags,dirty,last_reported_to_controller_time,"
+        << "report_count,suspicion_flags,rssi_verified_count,rssi_mismatch_count,"
+        << "rssi_unverified_count,rssi_verified_probability,rssi_false_data_decision,"
+        << "dirty,last_reported_to_controller_time,"
         << "regional_table_size,trigger_seq,status\n";
 }
 
@@ -1672,6 +1979,8 @@ InitializeControllerGlobalAwarenessCsv()
     out << "time,event,claimed_vehicle_id,real_vehicle_id,last_serving_rsu_id,"
         << "first_seen_time,last_seen_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,"
         << "observer_count,rsu_report_count,trust_score,suspicion_flags,"
+        << "rssi_verified_count,rssi_mismatch_count,rssi_unverified_count,"
+        << "rssi_verified_probability,rssi_false_data_decision,"
         << "global_table_size,trigger_seq,status\n";
 }
 
@@ -1741,6 +2050,93 @@ DistanceBetween(const Vector& a, const Vector& b)
     double dy = a.y - b.y;
     double dz = a.z - b.z;
     return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+static double
+RoadEndX()
+{
+    return roadStartX + std::max(roadLength, vehicleSpacing);
+}
+
+static double
+VehicleLaneY(uint32_t vehicleIndex)
+{
+    uint32_t lanes = std::max(1u, roadLaneCount);
+    uint32_t lane = vehicleIndex % lanes;
+    double centre = (static_cast<double>(lanes) - 1.0) / 2.0;
+    return roadBaseY + (static_cast<double>(lane) - centre) * laneSpacing;
+}
+
+static double
+VehicleSpeed(uint32_t vehicleIndex)
+{
+    if (maxVehicleSpeed <= minVehicleSpeed)
+        return minVehicleSpeed;
+
+    uint32_t lanes = std::max(1u, roadLaneCount);
+    uint32_t classIndex = (vehicleIndex / lanes) % 5u;
+    double fraction = static_cast<double>(classIndex) / 4.0;
+    return minVehicleSpeed + fraction * (maxVehicleSpeed - minVehicleSpeed);
+}
+
+static Vector
+InitialVehiclePosition(uint32_t vehicleIndex)
+{
+    double length = std::max(roadLength, vehicleSpacing);
+    double x = roadStartX + std::fmod(static_cast<double>(vehicleIndex) * vehicleSpacing,
+                                      length);
+    return Vector(x, VehicleLaneY(vehicleIndex), 0.0);
+}
+
+static Vector
+InitialRsuPosition(uint32_t rsuIndex)
+{
+    uint32_t rsuCount = std::max(1u, N_RSUs);
+    double usableLength = std::max(roadLength, vehicleSpacing);
+    double spacing = usableLength / static_cast<double>(rsuCount);
+    double x = roadStartX + spacing * (static_cast<double>(rsuIndex) + 0.5);
+    return Vector(x, roadBaseY + rsuOffsetY, 0.0);
+}
+
+static void
+ApplyBoundedRoadVehicleState(uint32_t vehicleIndex)
+{
+    if (vehicleIndex >= g_vehicleNodes.GetN())
+        return;
+
+    Ptr<ConstantVelocityMobilityModel> mob =
+        g_vehicleNodes.Get(vehicleIndex)->GetObject<ConstantVelocityMobilityModel>();
+    if (!mob)
+        return;
+
+    Vector pos = mob->GetPosition();
+    double startX = roadStartX;
+    double endX = RoadEndX();
+    double length = std::max(endX - startX, vehicleSpacing);
+
+    while (pos.x > endX)
+        pos.x -= length;
+    while (pos.x < startX)
+        pos.x += length;
+
+    pos.y = VehicleLaneY(vehicleIndex);
+    pos.z = 0.0;
+    mob->SetPosition(pos);
+    mob->SetVelocity(Vector(VehicleSpeed(vehicleIndex), 0.0, 0.0));
+}
+
+static void
+UpdateBoundedRoadMobility()
+{
+    if (!boundedRoadMobility)
+        return;
+
+    for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+        ApplyBoundedRoadVehicleState(i);
+
+    double next = Simulator::Now().GetSeconds() + mobilityUpdateInterval;
+    if (mobilityUpdateInterval > 0.0 && next < simTime)
+        Simulator::Schedule(Seconds(mobilityUpdateInterval), &UpdateBoundedRoadMobility);
 }
 
 static void
@@ -1841,6 +2237,8 @@ LogRsuVehicleObservationRowEvent(const std::string& event,
         << row.claimedDistance << ","
         << row.receivedBeaconCount << ","
         << row.suspicionFlags << ","
+        << row.rssiEstimatedDistance << ","
+        << row.rssiVerificationState << ","
         << (row.dirty ? 1 : 0) << ","
         << rowsForClaimedId << ","
         << triggerSeq << ","
@@ -1969,6 +2367,8 @@ UpsertRsuRegionalAwarenessSelf(uint32_t rsuIndex,
     row.claimedDistance = 0.0;
     row.receivedBeaconCount = 1;
     row.suspicionFlags = suspicionFlags;
+    row.rssiEstimatedDistance = -1.0;
+    row.rssiVerificationState = RSSI_UNVERIFIED;
     row.suspicionFlags |= GetRssiCoLocationFlags(N_Vehicles + rsuIndex,
                                                  row.observedClaimedId);
     row.suspicionFlags |= EvaluateTemporalBurstSignature(
@@ -2015,10 +2415,21 @@ UpsertRsuRegionalAwarenessSelf(uint32_t rsuIndex,
             aggregate.realVehicleId = r.observedRealId;
         }
         aggregate.suspicionFlags |= r.suspicionFlags;
+        if (r.rssiVerificationState == RSSI_VERIFIED)
+            ++aggregate.rssiVerifiedCount;
+        else if (r.rssiVerificationState == RSSI_MISMATCH)
+            ++aggregate.rssiMismatchCount;
+        else
+            ++aggregate.rssiUnverifiedCount;
     }
 
     aggregate.observerCount = uniqueReporters.size();
     aggregate.reportCount = rows.size();
+    uint32_t rssiEvidence = aggregate.rssiVerifiedCount + aggregate.rssiMismatchCount;
+    aggregate.rssiVerifiedProbability =
+        (rssiEvidence > 0)
+            ? static_cast<double>(aggregate.rssiVerifiedCount) / static_cast<double>(rssiEvidence)
+            : 0.5;
 
     bool isNewAggregate =
         g_rsuRegionalAwarenessTables[rsuIndex].find(aggregate.claimedVehicleId) ==
@@ -2062,6 +2473,8 @@ UpsertRsuRegionalAwarenessObservation(uint32_t rsuIndex,
     row.claimedDistance = observation.claimedDistance;
     row.receivedBeaconCount = observation.receivedBeaconCount;
     row.suspicionFlags = observation.suspicionFlags;
+    row.rssiEstimatedDistance = observation.rssiEstimatedDistance;
+    row.rssiVerificationState = observation.rssiVerificationState;
     row.suspicionFlags |= GetRssiCoLocationFlags(N_Vehicles + rsuIndex,
                                                  row.observedClaimedId);
     row.suspicionFlags |= EvaluateTemporalBurstSignature(
@@ -2108,10 +2521,21 @@ UpsertRsuRegionalAwarenessObservation(uint32_t rsuIndex,
             aggregate.realVehicleId = r.observedRealId;
         }
         aggregate.suspicionFlags |= r.suspicionFlags;
+        if (r.rssiVerificationState == RSSI_VERIFIED)
+            ++aggregate.rssiVerifiedCount;
+        else if (r.rssiVerificationState == RSSI_MISMATCH)
+            ++aggregate.rssiMismatchCount;
+        else
+            ++aggregate.rssiUnverifiedCount;
     }
 
     aggregate.observerCount = uniqueReporters.size();
     aggregate.reportCount = rows.size();
+    uint32_t rssiEvidence = aggregate.rssiVerifiedCount + aggregate.rssiMismatchCount;
+    aggregate.rssiVerifiedProbability =
+        (rssiEvidence > 0)
+            ? static_cast<double>(aggregate.rssiVerifiedCount) / static_cast<double>(rssiEvidence)
+            : 0.5;
 
     bool isNewAggregate =
         g_rsuRegionalAwarenessTables[rsuIndex].find(aggregate.claimedVehicleId) ==
@@ -2179,6 +2603,9 @@ LogRsuRegionalAwarenessEvent(const std::string& event,
                          : 0;
 
     std::ofstream out(rsuRegionalAwarenessCsv.c_str(), std::ios::app);
+    bool rssiFalseDataDecision =
+        record.rssiMismatchCount > 0 &&
+        record.rssiVerifiedProbability < 0.5;
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << rsuIndex << ","
@@ -2194,6 +2621,11 @@ LogRsuRegionalAwarenessEvent(const std::string& event,
         << record.observerCount << ","
         << record.reportCount << ","
         << record.suspicionFlags << ","
+        << record.rssiVerifiedCount << ","
+        << record.rssiMismatchCount << ","
+        << record.rssiUnverifiedCount << ","
+        << record.rssiVerifiedProbability << ","
+        << (rssiFalseDataDecision ? 1 : 0) << ","
         << (record.dirty ? 1 : 0) << ","
         << record.lastReportedToControllerTime << ","
         << tableSize << ","
@@ -2205,9 +2637,12 @@ static void
 LogControllerGlobalAwarenessEvent(const std::string& event,
                                   const ControllerGlobalAwarenessRecord& record,
                                   const std::string& status,
-                                  uint32_t triggerSeq = 0)
+                                  uint32_t triggerSeq)
 {
     std::ofstream out(controllerGlobalAwarenessCsv.c_str(), std::ios::app);
+    bool rssiFalseDataDecision =
+        record.rssiMismatchCount > 0 &&
+        record.rssiVerifiedProbability < 0.5;
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << record.claimedVehicleId << ","
@@ -2224,6 +2659,11 @@ LogControllerGlobalAwarenessEvent(const std::string& event,
         << record.rsuReportCount << ","
         << record.trustScore << ","
         << record.suspicionFlags << ","
+        << record.rssiVerifiedCount << ","
+        << record.rssiMismatchCount << ","
+        << record.rssiUnverifiedCount << ","
+        << record.rssiVerifiedProbability << ","
+        << (rssiFalseDataDecision ? 1 : 0) << ","
         << g_controllerGlobalAwarenessTable.size() << ","
         << triggerSeq << ","
         << status << "\n";
@@ -2848,7 +3288,7 @@ SendRegChallenge(uint32_t rsuIndex, uint32_t vehicleIndex)
     Ipv4Address vAddr = g_wirelessInterfaces.GetAddress(vehicleIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_CHALLENGE), 1);
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_CHALLENGE]          "
@@ -2976,7 +3416,7 @@ SendRegRequest(uint32_t vehicleIndex, uint32_t rsuIndex, const std::vector<uint8
     Ipv4Address rsuAddr = g_wirelessInterfaces.GetAddress(rsuWirelessIdx);
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_REQUEST), 1);
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_REQUEST]            "
@@ -3034,7 +3474,7 @@ SendRegForward(uint32_t rsuIndex, uint32_t vehicleId, uint64_t vin,
     Ipv4Address ctrlAddr = g_wiredInterfaces.GetAddress(N_RSUs);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_FORWARD), 1);
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_FORWARD]            "
@@ -3090,7 +3530,7 @@ SendRegResponse(uint32_t originRsuIndex, uint32_t vehicleId,
     Ipv4Address rsuAddr = g_wiredInterfaces.GetAddress(originRsuIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_RESPONSE), 1);
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_RESPONSE]           "
@@ -3149,7 +3589,7 @@ SendRegConfirm(uint32_t rsuIndex, uint32_t vehicleIndex,
     Ipv4Address vAddr = g_wirelessInterfaces.GetAddress(vehicleIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_CONFIRM), 1);
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_CONFIRM]            "
@@ -3713,6 +4153,10 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 incoming.observerCount    = p.observerCount;
                 incoming.rsuReportCount   = p.reportCount;
                 incoming.suspicionFlags   = p.suspicionFlags;
+                incoming.rssiVerifiedCount = p.rssiVerifiedCount;
+                incoming.rssiMismatchCount = p.rssiMismatchCount;
+                incoming.rssiUnverifiedCount = p.rssiUnverifiedCount;
+                incoming.rssiVerifiedProbability = p.rssiVerifiedProbability;
                 incoming.suspicionFlags  |= EvaluateTemporalBurstSignature(
                     p.servingRsuId,
                     p.claimedVehicleId,
@@ -3726,8 +4170,21 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                     p.servingRsuId,
                     p.claimedVehicleId,
                     p.observerCount,
-                    p.reportCount);
+                    p.reportCount,
+                    p.rssiVerifiedCount,
+                    p.rssiMismatchCount,
+                    p.rssiUnverifiedCount);
                 incoming.trustScore       = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
+                if (ShouldBlockLightweightGlobalRecord(
+                        incoming,
+                        "rsu_batch_awareness_payload",
+                        triggerSeq))
+                {
+                    continue;
+                }
+                RecordUnblockedLightweightGlobalMiss(
+                    incoming,
+                    "plausible_rsu_approval_without_lightweight_block");
 
                 auto existing = g_controllerGlobalAwarenessTable.find(incoming.claimedVehicleId);
                 bool isNew    = (existing == g_controllerGlobalAwarenessTable.end());
@@ -3738,6 +4195,16 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                         incoming.firstSeenTime   = existing->second.firstSeenTime;
                         incoming.rsuReportCount += existing->second.rsuReportCount;
                         incoming.observerCount  += existing->second.observerCount;
+                        incoming.rssiVerifiedCount += existing->second.rssiVerifiedCount;
+                        incoming.rssiMismatchCount += existing->second.rssiMismatchCount;
+                        incoming.rssiUnverifiedCount += existing->second.rssiUnverifiedCount;
+                        uint32_t rssiEvidence =
+                            incoming.rssiVerifiedCount + incoming.rssiMismatchCount;
+                        incoming.rssiVerifiedProbability =
+                            (rssiEvidence > 0)
+                                ? static_cast<double>(incoming.rssiVerifiedCount) /
+                                      static_cast<double>(rssiEvidence)
+                                : 0.5;
                         incoming.suspicionFlags |= existing->second.suspicionFlags;
                         incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
                     }
@@ -3771,8 +4238,26 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 incoming.lastServingRsuId,
                 incoming.claimedVehicleId,
                 incoming.observerCount,
-                incoming.rsuReportCount);
+                incoming.rsuReportCount,
+                incoming.rssiVerifiedCount,
+                incoming.rssiMismatchCount,
+                incoming.rssiUnverifiedCount);
+            incoming.rssiVerifiedProbability =
+                (incoming.rssiVerifiedCount + incoming.rssiMismatchCount > 0)
+                    ? static_cast<double>(incoming.rssiVerifiedCount) /
+                          static_cast<double>(incoming.rssiVerifiedCount + incoming.rssiMismatchCount)
+                    : 0.5;
             incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
+            if (ShouldBlockLightweightGlobalRecord(
+                    incoming,
+                    "rsu_regional_awareness_payload",
+                    triggerSeq))
+            {
+                return;
+            }
+            RecordUnblockedLightweightGlobalMiss(
+                incoming,
+                "plausible_rsu_approval_without_lightweight_block");
             auto existing = g_controllerGlobalAwarenessTable.find(incoming.claimedVehicleId);
             bool isNewRecord = (existing == g_controllerGlobalAwarenessTable.end());
 
@@ -3783,6 +4268,16 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                     incoming.firstSeenTime = existing->second.firstSeenTime;
                     incoming.rsuReportCount += existing->second.rsuReportCount;
                     incoming.observerCount  += existing->second.observerCount;
+                    incoming.rssiVerifiedCount += existing->second.rssiVerifiedCount;
+                    incoming.rssiMismatchCount += existing->second.rssiMismatchCount;
+                    incoming.rssiUnverifiedCount += existing->second.rssiUnverifiedCount;
+                    uint32_t rssiEvidence =
+                        incoming.rssiVerifiedCount + incoming.rssiMismatchCount;
+                    incoming.rssiVerifiedProbability =
+                        (rssiEvidence > 0)
+                            ? static_cast<double>(incoming.rssiVerifiedCount) /
+                                  static_cast<double>(rssiEvidence)
+                            : 0.5;
                     incoming.suspicionFlags |= existing->second.suspicionFlags;
                     incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
                 }
@@ -4388,7 +4883,7 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
             phantom.lastBsm.positionZ           = 0.0;
             phantom.lastBsm.speed               = 3.0;
             phantom.lastBsm.heading             = 0.0;
-            phantom.observerCount               = 1u;
+            phantom.observerCount               = 0u;
             phantom.reportCount                 = 1u;
             phantom.suspicionFlags              = SUSPICION_NONE;
             phantom.dirty                       = true;
@@ -4663,6 +5158,7 @@ HandleChanHello(uint32_t rsuIndex, const ChanHelloTag& hello)
     sock->SendTo(ackPkt, 0,
                  InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleId),
                                    VEHICLE_PORT));
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(CHAN_ACK), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -4825,6 +5321,7 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     hs.ephPriv = ephPriv;
     hs.ephPub  = ephPub;
     hs.nonceV  = nonceV;
+    hs.startTime = Simulator::Now().GetSeconds();
     g_vehicleChannelState[vehicleIndex].pending[rsuIndex] = hs;
 
     ChanHelloTag helloTag;
@@ -4849,6 +5346,7 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     sock->SendTo(pkt, 0,
                  InetSocketAddress(g_wirelessInterfaces.GetAddress(rsuWirelessIdx),
                                    RSU_PORT));
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(CHAN_HELLO), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -5557,12 +6055,41 @@ LogReceivedPacket(const std::string& receiverRole,
         {
             UpdateRsuRegionalAwareness(receiverId, decryptedReport, triggerSeq);
         }
-        else if (hasDecryptedReport)
+        else
         {
-            std::cout << "[Security] V2RSU awareness update BLOCKED for vehicle="
-                      << tag.GetRealNodeId()
-                      << " at RSU=" << receiverId
-                      << " (token not accepted)\n";
+            SecureChannelTag blockedScTag;
+            bool hasSecureEnvelope = packet->PeekPacketTag(blockedScTag);
+            V2RsuAwarenessReportTag rejectedReport;
+            bool hasRejectedReport = false;
+            if (hasDecryptedReport)
+            {
+                rejectedReport = decryptedReport;
+                hasRejectedReport = true;
+            }
+            else
+            {
+                hasRejectedReport = packet->PeekPacketTag(rejectedReport);
+            }
+
+            if (hasDecryptedReport)
+            {
+                std::cout << "[Security] V2RSU awareness update BLOCKED for vehicle="
+                          << tag.GetRealNodeId()
+                          << " at RSU=" << receiverId
+                          << " (token not accepted)\n";
+            }
+
+            if (!hasSecureEnvelope || hasDecryptedReport)
+            {
+                RecordLightweightV2RsuRejection(
+                    receiverId,
+                    tag,
+                    rejectedReport,
+                    hasRejectedReport,
+                    hasSecureEnvelope ? "v2rsu_token_rejected"
+                                      : "forged_v2rsu_no_secure_channel",
+                    static_cast<uint32_t>(packet->GetSize()));
+            }
         }
         // Note: plaintext V2RSU packets (no SecureChannelTag) are fully blocked at the
         // sender (SendV2RsuAwarenessPacket drops if no session).  Any that somehow
@@ -5703,8 +6230,19 @@ LogReceivedPacket(const std::string& receiverRole,
 
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
     MetricsOnReceive(isSybil, delay, countForPDR);
+    if (hasTag)
+    {
+        MetricsOnReceiveForMessage(messageType, delay, countForPDR);
+    }
 
-    if (g_secMetrics)
+    bool isDetectionMetricsCandidate =
+        hasTag &&
+        (messageType == static_cast<uint32_t>(V2V_BEACON) ||
+         messageType == static_cast<uint32_t>(V2RSU_REPORT) ||
+         messageType == static_cast<uint32_t>(RSU2CONTROLLER_REPORT) ||
+         messageType == static_cast<uint32_t>(SYBIL_INJECTION));
+
+    if (g_secMetrics && isDetectionMetricsCandidate)
     {
         g_secMetrics->OnPacketReceived(
             hasTag ? tag.GetRealNodeId()     : 0,
@@ -5794,7 +6332,7 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
         packet->AddPacketTag(baseTag);
         packet->AddPacketTag(csTag);
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
-        MetricsOnTransmit(1);
+        MetricsOnTransmitForMessage(static_cast<uint32_t>(RSU2CONTROLLER_REPORT), 1);
         std::cout << "[Security] RSU2CTRL encrypted OK RSU=" << rsuIndex
                   << " records=" << batchTag.GetRecordCount()
                   << " ctBytes=" << ciphertext.size() << "\n";
@@ -5812,7 +6350,7 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(batchTag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(RSU2CONTROLLER_REPORT), 1);
 }
 
 static void
@@ -5868,7 +6406,7 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
         packet->AddPacketTag(baseTag);
         packet->AddPacketTag(csTag);
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
-        MetricsOnTransmit(1);
+        MetricsOnTransmitForMessage(static_cast<uint32_t>(CONTROLLER2RSU_COMMAND), 1);
         std::cout << "[Security] CTRL2RSU encrypted OK RSU=" << rsuIndex
                   << " target=" << target.realVehicleId << "\n";
         return;
@@ -5885,7 +6423,7 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(commandTag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
-    MetricsOnTransmit(1);
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(CONTROLLER2RSU_COMMAND), 1);
 }
 
 static void
@@ -5978,14 +6516,37 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
         packet->AddPacketTag(scTag);
 
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
-        MetricsOnTransmit(1);
+        MetricsOnTransmitForMessage(static_cast<uint32_t>(V2RSU_REPORT), 1);
         return;
     }
 
-    // ── No session yet — block the report completely ──────────────────────
-    std::cout << "[Security] BLOCKED V2RSU: no session V=" << vehicleIndex
-              << "->RSU=" << rsuIndex << " — report held until handshake completes."
-              << std::endl;
+    // ── No session yet — request secure handover, then block this report ───
+    // Mobility can bring a vehicle into a different RSU's area after the
+    // startup handshakes.  Start CHAN_HELLO on demand, but keep the current
+    // report blocked so V2RSU data never bypasses token authentication.
+    auto pendingIt = chanState.pending.find(rsuIndex);
+    bool pendingExpired = false;
+    if (pendingIt != chanState.pending.end() && channelHandshakeTimeout > 0.0)
+    {
+        double pendingAge = Simulator::Now().GetSeconds() - pendingIt->second.startTime;
+        pendingExpired = (pendingAge >= channelHandshakeTimeout);
+    }
+
+    if (pendingIt == chanState.pending.end() || pendingExpired)
+    {
+        SendChanHello(vehicleIndex, rsuIndex);
+        std::cout << "[Security] V2RSU handover: no session V=" << vehicleIndex
+                  << "->RSU=" << rsuIndex
+                  << " — CHAN_HELLO requested; report held until handshake completes."
+                  << std::endl;
+    }
+    else
+    {
+        std::cout << "[Security] BLOCKED V2RSU: pending session V=" << vehicleIndex
+                  << "->RSU=" << rsuIndex
+                  << " — report held until handshake completes."
+                  << std::endl;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6059,8 +6620,28 @@ SendRsuControllerReport(uint32_t rsuIndex)
     // Type 5: malicious RSU upserts fabricated Sybil records into its own regional
     // awareness table before reporting.  The controller receives and stores them as
     // legitimate vehicles, propagating the Sybil IDs upward.
-    if (sybil_attack_enabled && rsuIndex < g_rsuRegionalAwarenessTables.size())
+    bool maliciousRsuInjection =
+        sybil_attack_enabled &&
+        IsRsuMalicious(rsuIndex) &&
+        rsuIndex < g_rsuRegionalAwarenessTables.size();
+    if (maliciousRsuInjection)
+    {
         InjectSybilRecordsIntoRsuTable(rsuIndex, g_rsuRegionalAwarenessTables[rsuIndex]);
+
+        for (uint32_t k = 0; k < RsuSybilBudget(); ++k)
+        {
+            uint32_t sybilId = N_Vehicles + 100u + rsuIndex * N_SYBIL_RSU_MAX + k;
+            auto it = g_rsuRegionalAwarenessTables[rsuIndex].find(sybilId);
+            if (it == g_rsuRegionalAwarenessTables[rsuIndex].end())
+                continue;
+
+            LogRsuRegionalAwarenessEvent("malicious_rsu_phantom_injected",
+                                         rsuIndex,
+                                         it->second,
+                                         "phantom_from_malicious_rsu_clean_claim",
+                                         0);
+        }
+    }
 
     if (rsuIndex < g_rsuRegionalAwarenessTables.size() &&
         !g_rsuRegionalAwarenessTables[rsuIndex].empty())
@@ -6082,10 +6663,27 @@ SendRsuControllerReport(uint32_t rsuIndex)
 
         auto& regionalTable = g_rsuRegionalAwarenessTables[rsuIndex];
         RsuControllerBatchAwarenessTag batchTag(rsuIndex);
+        auto sendBatchIfNeeded = [&]() {
+            if (batchTag.GetRecordCount() == 0)
+                return;
+
+            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                      << "[SEND] [RSU2CONTROLLER_REPORT]   "
+                      << "RSU=" << rsuIndex
+                      << " Seq=" << g_seq
+                      << " -> Controller"
+                      << " BatchSize=" << batchTag.GetRecordCount()
+                      << " (batch packet)" << std::endl;
+            SendRsuControllerBatchPacket(sock, controllerIp, batchTag, rsuIndex, g_seq++);
+            batchTag = RsuControllerBatchAwarenessTag(rsuIndex);
+        };
         for (auto it = regionalTable.begin(); it != regionalTable.end(); ++it)
         {
             if (sendSnapshot || it->second.dirty || it->second.lastSeenTime >= windowStart)
             {
+                if (batchTag.GetRecordCount() >= MAX_RSU2CONTROLLER_RECORDS)
+                    sendBatchIfNeeded();
+
                 std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                           << "[SEND] [RSU2CONTROLLER_REPORT]   "
                           << "RSU=" << rsuIndex
@@ -6094,24 +6692,26 @@ SendRsuControllerReport(uint32_t rsuIndex)
                           << " Observers=" << it->second.observerCount
                           << " SuspicionFlags=" << it->second.suspicionFlags
                           << " (batched)" << std::endl;
-                batchTag.AddRecord(it->second);
+                bool added = batchTag.AddRecord(it->second);
+                if (!added)
+                {
+                    sendBatchIfNeeded();
+                    added = batchTag.AddRecord(it->second);
+                }
+                if (!added)
+                {
+                    std::cerr << "[RSU2Controller] ERROR: failed to add awareness record "
+                              << "claimedId=" << it->second.claimedVehicleId
+                              << " after flushing batch." << std::endl;
+                    continue;
+                }
                 it->second.dirty = false;
                 it->second.lastReportedToControllerTime = now;
                 MarkRsuObservationRowsReported(rsuIndex, it->second.claimedVehicleId,
                                                windowStart, now);
             }
         }
-        if (batchTag.GetRecordCount() > 0)
-        {
-            std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
-                      << "[SEND] [RSU2CONTROLLER_REPORT]   "
-                      << "RSU=" << rsuIndex
-                      << " Seq=" << g_seq
-                      << " -> Controller"
-                      << " BatchSize=" << batchTag.GetRecordCount()
-                      << " (single batch packet)" << std::endl;
-            SendRsuControllerBatchPacket(sock, controllerIp, batchTag, rsuIndex, g_seq++);
-        }
+        sendBatchIfNeeded();
 
         if (rsuIndex < g_rsuLastControllerAwarenessReportTime.size())
             g_rsuLastControllerAwarenessReportTime[rsuIndex] = now;
@@ -6145,7 +6745,8 @@ SendRsuControllerReport(uint32_t rsuIndex)
             proxy.lastBsm.positionX = it->second.lastPosition.x;
             proxy.lastBsm.positionY = it->second.lastPosition.y;
             proxy.lastBsm.positionZ = it->second.lastPosition.z;
-            proxy.observerCount    = 1;
+            proxy.observerCount    =
+                (it->second.claimedVehicleId < g_vehicleNodes.GetN()) ? 1u : 0u;
             proxy.reportCount      = 1;
             proxy.suspicionFlags   = SUSPICION_NONE;
             recordBatch.AddRecord(proxy);
@@ -6240,6 +6841,17 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
         g_controllerCommandTargets[rsuIndex].valid)
     {
         uint32_t controllerTarget = g_controllerCommandTargets[rsuIndex].realVehicleId;
+        if (controllerTarget >= g_vehicleNodes.GetN())
+        {
+            std::cout << "[Security] RSU2VEH blocked: controller target is phantom"
+                      << " RSU=" << rsuIndex
+                      << " TargetReal=" << controllerTarget
+                      << " TargetClaimed="
+                      << g_controllerCommandTargets[rsuIndex].claimedVehicleId
+                      << " — no vehicle downlink attempted\n";
+            g_controllerCommandTargets[rsuIndex].valid = false;
+            return;
+        }
         if (GetRsuRecordForRealVehicle(rsuIndex, controllerTarget, targetRecord))
         {
             vehicleIndex = controllerTarget;
@@ -6374,7 +6986,7 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
                 sock->SendTo(encPkt, 0,
                              InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleIndex),
                                                VEHICLE_PORT));
-                MetricsOnTransmit(1);
+                MetricsOnTransmitForMessage(static_cast<uint32_t>(RSU2VEHICLE_COMMAND), 1);
                 std::cout << "[Security] RSU2VEH encrypted OK RSU=" << rsuIndex
                           << " Vehicle=" << vehicleIndex << "\n";
                 return;
@@ -6382,13 +6994,12 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
         }
     }
 
-    // ── Fallback: no session key — send plaintext with warning ────────────
-    std::cout << "[Security] RSU2VEH WARNING: no session key RSU=" << rsuIndex
-              << " Vehicle=" << vehicleIndex << " — sending plaintext command\n";
-    SendTaggedPacket(sock,
-                     g_wirelessInterfaces.GetAddress(vehicleIndex),
-                     VEHICLE_PORT,
-                     tx);
+    // No RSU-vehicle session: keep the downlink closed instead of falling back
+    // to plaintext. V2RSU handover logic establishes this session before
+    // trusted records and commands should normally exist for this RSU.
+    std::cout << "[Security] RSU2VEH blocked: no session key RSU=" << rsuIndex
+              << " Vehicle=" << vehicleIndex
+              << " Source=" << source << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -6464,6 +7075,116 @@ ColorAndLabelNodes(AnimationInterface& anim,
 }
 
 // ===========================================================================
+// Config file loader
+// ---------------------------------------------------------------------------
+// Reads a key = value file (INI-style).  Lines starting with '#' or ';' are
+// comments.  Inline '#' comments are also stripped.  Returns a string map.
+// ===========================================================================
+
+static std::map<std::string, std::string>
+ParseConfigFile(const std::string& path)
+{
+    std::map<std::string, std::string> cfg;
+    std::ifstream f(path);
+    if (!f.is_open())
+    {
+        std::cerr << "[config] Cannot open config file: " << path << "\n";
+        return cfg;
+    }
+    std::string line;
+    while (std::getline(f, line))
+    {
+        auto start = line.find_first_not_of(" \t");
+        if (start == std::string::npos) continue;
+        line = line.substr(start);
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+
+        auto kend = key.find_last_not_of(" \t");
+        if (kend != std::string::npos) key = key.substr(0, kend + 1);
+
+        auto vstart = val.find_first_not_of(" \t");
+        auto vend   = val.find_last_not_of(" \t\r\n");
+        val = (vstart != std::string::npos) ? val.substr(vstart, vend - vstart + 1) : "";
+
+        // Strip inline comment
+        auto comment = val.find('#');
+        if (comment != std::string::npos)
+        {
+            val = val.substr(0, comment);
+            auto ve = val.find_last_not_of(" \t");
+            val = (ve != std::string::npos) ? val.substr(0, ve + 1) : "";
+        }
+
+        if (!key.empty()) cfg[key] = val;
+    }
+    std::cout << "[config] Loaded " << cfg.size() << " keys from: " << path << "\n";
+    return cfg;
+}
+
+static void
+ApplyConfigFile(const std::map<std::string, std::string>& cfg)
+{
+    auto getUint = [&](const std::string& k, uint32_t& v) {
+        auto it = cfg.find(k);
+        if (it != cfg.end()) v = static_cast<uint32_t>(std::stoul(it->second));
+    };
+    auto getDouble = [&](const std::string& k, double& v) {
+        auto it = cfg.find(k);
+        if (it != cfg.end()) v = std::stod(it->second);
+    };
+    auto getBool = [&](const std::string& k, bool& v) {
+        auto it = cfg.find(k);
+        if (it != cfg.end()) {
+            const std::string& s = it->second;
+            v = (s == "1" || s == "true" || s == "yes");
+        }
+    };
+
+    getUint  ("N_Vehicles",                      N_Vehicles);
+    getUint  ("N_RSUs",                          N_RSUs);
+    getDouble("simTime",                         simTime);
+    getBool  ("routing_test",                    routing_test);
+    getDouble("beaconInterval",                  beaconInterval);
+    getDouble("beaconJitterMax",                 beaconJitterMax);
+    getDouble("rsuReportInterval",               rsuReportInterval);
+    getBool  ("sybil_attack_enabled",            sybil_attack_enabled);
+    getUint  ("sybil_attack_type",               sybil_attack_type);
+    getUint  ("sybil_attack_percentage",         sybil_attack_percentage);
+    getUint  ("sybil_attacker_level",            sybil_attacker_level);
+    getBool  ("controller_malicious_assumption", controller_malicious_assumption);
+    getUint  ("proposed_method",                 proposed_method);
+    getDouble("rsuCoverageRange",                rsuCoverageRange);
+    getDouble("v2vReliableRange",                v2vReliableRange);
+    getDouble("rsuVehicleRecordTimeout",         rsuVehicleRecordTimeout);
+    getDouble("rsuVehicleTableSnapshotInterval", rsuVehicleTableSnapshotInterval);
+    getBool  ("awarenessSnapshotSharingEnabled", awarenessSnapshotSharingEnabled);
+    getUint  ("vehicleSnapshotEveryNReports",    vehicleSnapshotEveryNReports);
+    getUint  ("rsuSnapshotEveryNReports",        rsuSnapshotEveryNReports);
+    getDouble("awarenessReportOverlap",          awarenessReportOverlap);
+    getDouble("vehicleNeighborTimeout",          vehicleNeighborTimeout);
+    getDouble("rsuAwarenessTimeout",             rsuAwarenessTimeout);
+    getDouble("controllerAwarenessTimeout",      controllerAwarenessTimeout);
+    getDouble("channelHandshakeTimeout",         channelHandshakeTimeout);
+    getBool  ("boundedRoadMobility",             boundedRoadMobility);
+    getDouble("roadStartX",                      roadStartX);
+    getDouble("roadLength",                      roadLength);
+    getDouble("roadBaseY",                       roadBaseY);
+    getUint  ("roadLaneCount",                   roadLaneCount);
+    getDouble("laneSpacing",                     laneSpacing);
+    getDouble("rsuOffsetY",                      rsuOffsetY);
+    getDouble("vehicleSpacing",                  vehicleSpacing);
+    getDouble("minVehicleSpeed",                 minVehicleSpeed);
+    getDouble("maxVehicleSpeed",                 maxVehicleSpeed);
+    getDouble("mobilityUpdateInterval",          mobilityUpdateInterval);
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 
@@ -6472,20 +7193,40 @@ main(int argc, char* argv[])
 {
     CreateProjectDirectories();
 
+    // -----------------------------------------------------------------------
+    // Config file: pre-scan argv for --config=<path> before CommandLine::Parse
+    // so that command-line args can still override individual config values.
+    // -----------------------------------------------------------------------
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg(argv[i]);
+        const std::string prefix = "--config=";
+        if (arg.rfind(prefix, 0) == 0)
+        {
+            ApplyConfigFile(ParseConfigFile(arg.substr(prefix.size())));
+            break;
+        }
+    }
+
+    std::string configFile = "";  // consumed above; listed here so --help shows it
     CommandLine cmd;
     cmd.AddValue("SecEnabled",                 "Enable crypto, registration & token auth (false = plain network)", g_secEnabled);
+    cmd.AddValue("config",                     "Path to .cfg scenario file (key=value)",  configFile);
     cmd.AddValue("N_Vehicles",                 "Number of vehicle nodes",                N_Vehicles);
     cmd.AddValue("N_RSUs",                     "Number of RSU edge nodes",               N_RSUs);
     cmd.AddValue("simTime",                    "Simulation time in seconds",             simTime);
     cmd.AddValue("routing_test",               "Small 3-vehicle/2-RSU/1-SDN test network", routing_test);
     cmd.AddValue("beaconInterval",             "Vehicle beacon period",                  beaconInterval);
+    cmd.AddValue("beaconJitterMax",            "Maximum random V2V beacon timing jitter in seconds", beaconJitterMax);
     cmd.AddValue("rsuReportInterval",          "RSU→Controller report period",           rsuReportInterval);
     cmd.AddValue("sybil_attack_enabled",       "Enable Sybil attack behavior",           sybil_attack_enabled);
     cmd.AddValue("sybil_attack_type",          "Attack variant 0-6 (see sybil_attacks.h)",sybil_attack_type);
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
+    cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
-    cmd.AddValue("proposed_method",            "Detection method 0=rule 1=ML 2=FL 3=hybrid",proposed_method);
+    cmd.AddValue("proposed_method",            "Detection method 0=none 1=rule 2=ML 3=FL 4=hybrid",proposed_method);
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
+    cmd.AddValue("v2vReliableRange",           "Reliable local V2V beacon evaluation radius in metres", v2vReliableRange);
     cmd.AddValue("rsuVehicleRecordTimeout",    "Seconds before an RSU forgets a vehicle",rsuVehicleRecordTimeout);
     cmd.AddValue("rsuVehicleTableSnapshotInterval","Seconds between RSU table CSV snapshots",rsuVehicleTableSnapshotInterval);
     cmd.AddValue("awarenessSnapshotSharingEnabled","Enable periodic full awareness snapshots",awarenessSnapshotSharingEnabled);
@@ -6495,6 +7236,18 @@ main(int argc, char* argv[])
     cmd.AddValue("vehicleNeighborTimeout",     "Seconds before a vehicle expires a neighbor record",vehicleNeighborTimeout);
     cmd.AddValue("rsuAwarenessTimeout",        "Seconds before an RSU expires awareness rows/aggregates",rsuAwarenessTimeout);
     cmd.AddValue("controllerAwarenessTimeout", "Seconds before controller expires global awareness",controllerAwarenessTimeout);
+    cmd.AddValue("channelHandshakeTimeout",    "Seconds before retrying a pending V2RSU channel handshake",channelHandshakeTimeout);
+    cmd.AddValue("boundedRoadMobility",        "Keep vehicles inside a bounded multi-lane road corridor",boundedRoadMobility);
+    cmd.AddValue("roadStartX",                 "Bounded road start x-coordinate",roadStartX);
+    cmd.AddValue("roadLength",                 "Bounded road length in metres",roadLength);
+    cmd.AddValue("roadBaseY",                  "Bounded road centre y-coordinate",roadBaseY);
+    cmd.AddValue("roadLaneCount",              "Number of synthetic road lanes",roadLaneCount);
+    cmd.AddValue("laneSpacing",                "Lane centre spacing in metres",laneSpacing);
+    cmd.AddValue("rsuOffsetY",                 "RSU offset from road centre line in metres",rsuOffsetY);
+    cmd.AddValue("vehicleSpacing",             "Initial vehicle spacing in metres",vehicleSpacing);
+    cmd.AddValue("minVehicleSpeed",            "Minimum bounded-road vehicle speed in m/s",minVehicleSpeed);
+    cmd.AddValue("maxVehicleSpeed",            "Maximum bounded-road vehicle speed in m/s",maxVehicleSpeed);
+    cmd.AddValue("mobilityUpdateInterval",     "Seconds between bounded-road wrap checks",mobilityUpdateInterval);
     cmd.Parse(argc, argv);
 
     if (routing_test)
@@ -6504,6 +7257,8 @@ main(int argc, char* argv[])
         simTime    = std::min(simTime, 12.0);
     }
     if (N_RSUs == 0) N_RSUs = 1;
+    if (sybil_attacker_level < 1) sybil_attacker_level = 1;
+    if (sybil_attacker_level > 4) sybil_attacker_level = 4;
     g_rsuVehicleTables.assign(N_RSUs, std::map<uint32_t, RsuVehicleRecord>());
     g_controllerVehicleTable.clear();
     g_controllerCommandTargets.assign(N_RSUs, ControllerCommandTarget());
@@ -6565,41 +7320,44 @@ main(int argc, char* argv[])
     // Mobility
     // -----------------------------------------------------------------------
 
-    // Tier 1 — Vehicles: evenly spaced along a horizontal road (y=40).
-    // V0=(20,40)  V1=(60,40)  V2=(100,40)
-    // 40 m gaps stay within Cost231 propagation range at 5.9 GHz / 23 dBm.
-    // Each vehicle moves east at a slightly different speed so their separation
-    // is visible in NetAnim over the 12-second window.
+    // Tier 1 — Vehicles: bounded multi-lane road corridor.
+    // Vehicles keep using ConstantVelocityMobilityModel so BSM speed/heading,
+    // RSSI checks, attack placement, and NetAnim continue to use the same API.
     MobilityHelper vehicleMobility;
     vehicleMobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
     vehicleMobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                         "MinX",      DoubleValue(20.0),
-                                         "MinY",      DoubleValue(40.0),
-                                         "DeltaX",    DoubleValue(40.0),
+                                         "MinX",      DoubleValue(roadStartX),
+                                         "MinY",      DoubleValue(roadBaseY),
+                                         "DeltaX",    DoubleValue(vehicleSpacing),
                                          "DeltaY",    DoubleValue(0.0),
-                                         "GridWidth", UintegerValue(3),
+                                         "GridWidth", UintegerValue(std::max(1u, N_Vehicles)),
                                          "LayoutType",StringValue("RowFirst"));
     vehicleMobility.Install(g_vehicleNodes);
 
     for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
     {
         auto mob = g_vehicleNodes.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-        mob->SetVelocity(Vector(2.0 + i, 0.0, 0.0));   // 2, 3, 4 m/s east
+        if (boundedRoadMobility)
+        {
+            mob->SetPosition(InitialVehiclePosition(i));
+            mob->SetVelocity(Vector(VehicleSpeed(i), 0.0, 0.0));
+        }
+        else
+        {
+            mob->SetVelocity(Vector(2.0 + i, 0.0, 0.0));
+        }
     }
 
-    // Tier 2 — RSUs: fixed above the road, one per coverage zone.
-    // RSU-0=(40,100)  RSU-1=(100,100)
-    // Each RSU is ~60 m above its vehicle cluster, well within link budget.
+    // Tier 2 — RSUs: fixed above the road and evenly distributed along the
+    // bounded corridor.  Each RSU is placed at the centre of its road segment,
+    // e.g. 800 m / 8 RSUs -> about 100 m between RSUs.
     MobilityHelper rsuMobility;
     rsuMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    rsuMobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                     "MinX",      DoubleValue(40.0),
-                                     "MinY",      DoubleValue(100.0),
-                                     "DeltaX",    DoubleValue(60.0),
-                                     "DeltaY",    DoubleValue(0.0),
-                                     "GridWidth", UintegerValue(N_RSUs),
-                                     "LayoutType",StringValue("RowFirst"));
     rsuMobility.Install(g_rsuNodes);
+    for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
+    {
+        g_rsuNodes.Get(i)->GetObject<MobilityModel>()->SetPosition(InitialRsuPosition(i));
+    }
 
     // Tier 3 — SDN controller: centred above both RSUs.
     // SDN=(70,190) — wired backhaul, physical position is cosmetic only.
@@ -6707,8 +7465,8 @@ main(int argc, char* argv[])
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211p);
     wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                 "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                 "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                 "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                 "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                  "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac;
     wifiMac.SetType("ns3::AdhocWifiMac");
@@ -6716,8 +7474,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_172;
     wifi_172.SetStandard(WIFI_STANDARD_80211p);
     wifi_172.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_172;
     wifiMac_172.SetType("ns3::AdhocWifiMac");
@@ -6725,8 +7483,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_174;
     wifi_174.SetStandard(WIFI_STANDARD_80211p);
     wifi_174.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_174;
     wifiMac_174.SetType("ns3::AdhocWifiMac");
@@ -6734,8 +7492,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_176;
     wifi_176.SetStandard(WIFI_STANDARD_80211p);
     wifi_176.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_176;
     wifiMac_176.SetType("ns3::AdhocWifiMac");
@@ -6743,8 +7501,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_180;
     wifi_180.SetStandard(WIFI_STANDARD_80211p);
     wifi_180.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_180;
     wifiMac_180.SetType("ns3::AdhocWifiMac");
@@ -6752,8 +7510,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_182;
     wifi_182.SetStandard(WIFI_STANDARD_80211p);
     wifi_182.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_182;
     wifiMac_182.SetType("ns3::AdhocWifiMac");
@@ -6761,8 +7519,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_184;
     wifi_184.SetStandard(WIFI_STANDARD_80211p);
     wifi_184.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate12MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate12MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_184;
     wifiMac_184.SetType("ns3::AdhocWifiMac");
@@ -6845,21 +7603,27 @@ main(int argc, char* argv[])
     // Normal traffic scheduling
     // -----------------------------------------------------------------------
 
-    // Initial V-RSU secure channel: each vehicle handshakes only with its current
-    // nearest RSU.  If mobility later makes another RSU nearest, SendV2RsuReport()
-    // starts a new CHAN_HELLO on demand and defers the protected report until the
-    // new session is ready.  This avoids creating session keys with every RSU at
-    // startup.
+
+    Ptr<UniformRandomVariable> beaconJitterRv = CreateObject<UniformRandomVariable>();
+    beaconJitterRv->SetAttribute("Min", DoubleValue(0.0));
+    beaconJitterRv->SetAttribute("Max", DoubleValue(std::max(0.0, beaconJitterMax)));
+
+    // Secure channel warm-up: each vehicle handshakes only with the nearest RSU.
+    // Later handovers are handled on demand inside SendV2RsuAwarenessPacket(),
+    // which starts CHAN_HELLO and holds the report until a session exists.
+    
     if (g_secEnabled)
     {
-        for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
-        {
-            if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
-                continue;
-            uint32_t r = FindNearestRsu(i);
-            double t_hello = 0.5 + 0.04 * i;
-            Simulator::Schedule(Seconds(t_hello), &SendChanHello, i, r);
-        }
+    for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+    {
+        if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
+            continue;
+
+        uint32_t r = FindNearestRsu(i);
+        double t_hello = 0.5 + 0.04 * i;
+        Simulator::Schedule(Seconds(t_hello), &SendChanHello, i, r);
+
+    }
     }
 
     // Tier 1: V2V broadcast beacons + V2RSU reports
@@ -6885,7 +7649,8 @@ main(int argc, char* argv[])
             v2v->messageType   = static_cast<uint32_t>(V2V_BEACON);
             v2v->sequenceNumber = g_seq++;
 
-            Simulator::Schedule(Seconds(t + 0.05 * i),
+            double jitter = (beaconJitterMax > 0.0) ? beaconJitterRv->GetValue() : 0.0;
+            Simulator::Schedule(Seconds(t + 0.05 * i + jitter),
                                 &SendV2VBeaconTagged,
                                 vehicleSocket,
                                 Ipv4Address("10.1.1.255"),
@@ -6931,6 +7696,8 @@ main(int argc, char* argv[])
     Simulator::Schedule(Seconds(1.0), &FlushMetrics);
     if (rsuVehicleTableSnapshotInterval > 0.0)
         Simulator::Schedule(Seconds(rsuVehicleTableSnapshotInterval), &SnapshotRsuVehicleTables);
+    if (boundedRoadMobility && mobilityUpdateInterval > 0.0)
+        Simulator::Schedule(Seconds(mobilityUpdateInterval), &UpdateBoundedRoadMobility);
     g_secMetrics->ScheduleAll(simTime);
 
     // -----------------------------------------------------------------------
@@ -6950,7 +7717,8 @@ main(int argc, char* argv[])
     std::cout << "Attack enabled=" << sybil_attack_enabled
               << ", Type=" << sybil_attack_type
               << " (" << AttackTypeToString(g_activeAttackType) << ")"
-              << ", Percentage=" << sybil_attack_percentage << "%" << std::endl;
+              << ", Percentage=" << sybil_attack_percentage << "%"
+              << ", AttackerLevel=" << sybil_attacker_level << std::endl;
 
     if (g_activeAttackType != ATTACK_NONE)
     {
