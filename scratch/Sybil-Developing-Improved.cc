@@ -22,6 +22,7 @@
 #include "ns3/mobility-module.h"
 #include "ns3/netanim-module.h"
 #include "ns3/network-module.h"
+#include "ns3/ns2-mobility-helper.h"
 #include "ns3/wifi-module.h"
 #include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
 
@@ -79,6 +80,7 @@ double rsuAwarenessTimeout = 5.0;            ///< Expire RSU awareness rows/aggr
 double controllerAwarenessTimeout = 8.0;     ///< Expire SDN global awareness records after silence.
 double channelHandshakeTimeout = 1.0;        ///< Retry V2RSU CHAN_HELLO after pending timeout.
 bool boundedRoadMobility = true;             ///< Keep vehicles inside a bounded road corridor.
+uint32_t mobility_mode = 2;                  ///< 1=test, 2=programmed road, 3-5=SUMO/ns-2 traces.
 double roadStartX = 20.0;                    ///< Road corridor start x-coordinate.
 double roadLength = 800.0;                   ///< Road corridor length in metres.
 double roadBaseY = 40.0;                     ///< Centre y-coordinate of the road corridor.
@@ -89,6 +91,17 @@ double vehicleSpacing = 35.0;                ///< Initial spacing between vehicl
 double minVehicleSpeed = 8.0;                ///< Slowest vehicle speed in m/s.
 double maxVehicleSpeed = 16.0;               ///< Fastest vehicle speed in m/s.
 double mobilityUpdateInterval = 0.5;         ///< Seconds between bounded-road wrap checks.
+std::string mobilityTraceFile = "";          ///< Optional one-run override for the selected SUMO trace.
+std::string mobilityRsuPositionFile = "";    ///< Optional one-run override for selected SUMO RSU CSV.
+std::string mobilityMode3Name = "sumo_synthetic_urban";
+std::string mobilityMode3TraceFile = "sybil-attack/inputs/mobility/synthetic-urban/sumo_mobility.tcl";
+std::string mobilityMode3RsuPositionFile = "";
+std::string mobilityMode4Name = "sumo_colombo_small";
+std::string mobilityMode4TraceFile = "sybil-attack/inputs/mobility/colombo-small/colombo_small_mobility.tcl";
+std::string mobilityMode4RsuPositionFile = "sybil-attack/inputs/mobility/colombo-small/colombo_small_rsus_300m.csv";
+std::string mobilityMode5Name = "sumo_placeholder_third_trace";
+std::string mobilityMode5TraceFile = "";
+std::string mobilityMode5RsuPositionFile = "";
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
 std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_table_log.csv";
@@ -2137,6 +2150,246 @@ UpdateBoundedRoadMobility()
     double next = Simulator::Now().GetSeconds() + mobilityUpdateInterval;
     if (mobilityUpdateInterval > 0.0 && next < simTime)
         Simulator::Schedule(Seconds(mobilityUpdateInterval), &UpdateBoundedRoadMobility);
+}
+
+struct MobilityScenario
+{
+    uint32_t mode = 2;
+    std::string name = "programmed_bounded_road";
+    bool usesSumoTrace = false;
+    bool placeholder = false;
+    std::string traceFile;
+    std::string rsuPositionFile;
+};
+
+static MobilityScenario
+GetMobilityScenario(uint32_t mode)
+{
+    MobilityScenario scenario;
+    scenario.mode = mode;
+
+    switch (mode)
+    {
+    case 1:
+        scenario.name = "test_network_constant_velocity";
+        break;
+    case 2:
+        scenario.name = "programmed_bounded_road";
+        break;
+    case 3:
+        scenario.name = mobilityMode3Name;
+        scenario.usesSumoTrace = true;
+        scenario.traceFile = mobilityMode3TraceFile;
+        scenario.rsuPositionFile = mobilityMode3RsuPositionFile;
+        break;
+    case 4:
+        scenario.name = mobilityMode4Name;
+        scenario.usesSumoTrace = true;
+        scenario.traceFile = mobilityMode4TraceFile;
+        scenario.rsuPositionFile = mobilityMode4RsuPositionFile;
+        break;
+    case 5:
+        scenario.name = mobilityMode5Name;
+        scenario.usesSumoTrace = true;
+        scenario.placeholder = mobilityMode5TraceFile.empty();
+        scenario.traceFile = mobilityMode5TraceFile;
+        scenario.rsuPositionFile = mobilityMode5RsuPositionFile;
+        break;
+    default:
+        scenario.name = "unknown";
+        break;
+    }
+
+    if (scenario.usesSumoTrace && !mobilityTraceFile.empty())
+        scenario.traceFile = mobilityTraceFile;
+    if (scenario.usesSumoTrace && !mobilityRsuPositionFile.empty())
+        scenario.rsuPositionFile = mobilityRsuPositionFile;
+
+    return scenario;
+}
+
+static bool
+FileExists(const std::string& path)
+{
+    std::ifstream f(path.c_str());
+    return f.good();
+}
+
+static void
+InstallConstantVelocityVehicles(bool useBoundedRoad)
+{
+    MobilityHelper vehicleMobility;
+    vehicleMobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
+    vehicleMobility.SetPositionAllocator("ns3::GridPositionAllocator",
+                                         "MinX",      DoubleValue(roadStartX),
+                                         "MinY",      DoubleValue(roadBaseY),
+                                         "DeltaX",    DoubleValue(vehicleSpacing),
+                                         "DeltaY",    DoubleValue(0.0),
+                                         "GridWidth", UintegerValue(std::max(1u, N_Vehicles)),
+                                         "LayoutType",StringValue("RowFirst"));
+    vehicleMobility.Install(g_vehicleNodes);
+
+    for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+    {
+        Ptr<ConstantVelocityMobilityModel> mob =
+            g_vehicleNodes.Get(i)->GetObject<ConstantVelocityMobilityModel>();
+        if (!mob)
+            continue;
+
+        if (useBoundedRoad)
+        {
+            mob->SetPosition(InitialVehiclePosition(i));
+            mob->SetVelocity(Vector(VehicleSpeed(i), 0.0, 0.0));
+        }
+        else
+        {
+            mob->SetPosition(Vector(roadStartX + vehicleSpacing * i,
+                                    roadBaseY + 2.0 * static_cast<double>(i % 2u),
+                                    0.0));
+            mob->SetVelocity(Vector(2.0 + i, 0.0, 0.0));
+        }
+    }
+}
+
+static bool
+LoadRsuPositionsFromCsv(const std::string& path)
+{
+    if (path.empty())
+        return false;
+
+    std::ifstream f(path.c_str());
+    if (!f.is_open())
+        return false;
+
+    std::string line;
+    std::getline(f, line); // header
+    uint32_t loaded = 0;
+    while (std::getline(f, line))
+    {
+        if (line.empty())
+            continue;
+
+        std::stringstream ss(line);
+        std::string idStr, xStr, yStr;
+        if (!std::getline(ss, idStr, ',') ||
+            !std::getline(ss, xStr, ',') ||
+            !std::getline(ss, yStr, ','))
+            continue;
+
+        uint32_t rsuId = static_cast<uint32_t>(std::stoul(idStr));
+        if (rsuId >= g_rsuNodes.GetN())
+            continue;
+
+        double x = std::stod(xStr);
+        double y = std::stod(yStr);
+        g_rsuNodes.Get(rsuId)->GetObject<MobilityModel>()->SetPosition(Vector(x, y, 0.0));
+        ++loaded;
+    }
+
+    if (loaded > 0)
+    {
+        std::cout << "[Mobility] Loaded " << loaded
+                  << " RSU positions from " << path << "\n";
+        return true;
+    }
+    return false;
+}
+
+static void
+InstallInfrastructureMobility(const MobilityScenario& scenario)
+{
+    MobilityHelper rsuMobility;
+    rsuMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    rsuMobility.Install(g_rsuNodes);
+
+    bool loadedRsuCsv = LoadRsuPositionsFromCsv(scenario.rsuPositionFile);
+    for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
+    {
+        if (!loadedRsuCsv)
+            g_rsuNodes.Get(i)->GetObject<MobilityModel>()->SetPosition(InitialRsuPosition(i));
+    }
+
+    MobilityHelper controllerMobility;
+    controllerMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    controllerMobility.Install(g_controllerNode);
+
+    Vector controllerPos(70.0, 190.0, 0.0);
+    if (loadedRsuCsv && g_rsuNodes.GetN() > 0)
+    {
+        Vector sum(0.0, 0.0, 0.0);
+        for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
+        {
+            Vector p = g_rsuNodes.Get(i)->GetObject<MobilityModel>()->GetPosition();
+            sum.x += p.x;
+            sum.y += p.y;
+            sum.z += p.z;
+        }
+        controllerPos = Vector(sum.x / g_rsuNodes.GetN(),
+                               sum.y / g_rsuNodes.GetN() + 120.0,
+                               0.0);
+    }
+    g_controllerNode.Get(0)->GetObject<MobilityModel>()->SetPosition(controllerPos);
+}
+
+static void
+InstallSumoTraceMobility(const MobilityScenario& scenario)
+{
+    if (scenario.traceFile.empty())
+    {
+        std::cerr << "[Mobility] ERROR: mobility_mode=" << scenario.mode
+                  << " (" << scenario.name << ") has no SUMO/ns-2 trace yet.\n"
+                  << "Set mobilityMode" << scenario.mode << "TraceFile or mobilityTraceFile"
+                  << " in the config/command line when the scenario is ready.\n";
+        std::exit(1);
+    }
+    if (!FileExists(scenario.traceFile))
+    {
+        std::cerr << "[Mobility] ERROR: SUMO/ns-2 mobility trace not found: "
+                  << scenario.traceFile << "\n";
+        std::exit(1);
+    }
+
+    Ns2MobilityHelper ns2(scenario.traceFile);
+    ns2.Install(g_vehicleNodes.Begin(), g_vehicleNodes.End());
+    std::cout << "[Mobility] Loaded SUMO/ns-2 vehicle trace: "
+              << scenario.traceFile << "\n";
+}
+
+static void
+InstallSelectedMobility()
+{
+    if (mobility_mode < 1 || mobility_mode > 5)
+    {
+        std::cerr << "[Mobility] WARNING: invalid mobility_mode=" << mobility_mode
+                  << "; falling back to programmed road mobility.\n";
+        mobility_mode = 2;
+    }
+
+    MobilityScenario scenario = GetMobilityScenario(mobility_mode);
+    std::cout << "[Mobility] Mode=" << scenario.mode
+              << " (" << scenario.name << ")\n";
+
+    switch (mobility_mode)
+    {
+    case 1:
+        InstallConstantVelocityVehicles(false);
+        break;
+    case 2:
+        boundedRoadMobility = true;
+        InstallConstantVelocityVehicles(true);
+        break;
+    case 3:
+    case 4:
+    case 5:
+        boundedRoadMobility = false;
+        InstallSumoTraceMobility(scenario);
+        break;
+    default:
+        InstallConstantVelocityVehicles(true);
+        break;
+    }
+
+    InstallInfrastructureMobility(scenario);
 }
 
 static void
@@ -7145,6 +7398,10 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
             v = (s == "1" || s == "true" || s == "yes");
         }
     };
+    auto getStr = [&](const std::string& k, std::string& v) {
+        auto it = cfg.find(k);
+        if (it != cfg.end()) v = it->second;
+    };
 
     getUint  ("N_Vehicles",                      N_Vehicles);
     getUint  ("N_RSUs",                          N_RSUs);
@@ -7171,6 +7428,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("rsuAwarenessTimeout",             rsuAwarenessTimeout);
     getDouble("controllerAwarenessTimeout",      controllerAwarenessTimeout);
     getDouble("channelHandshakeTimeout",         channelHandshakeTimeout);
+    getUint  ("mobility_mode",                   mobility_mode);
     getBool  ("boundedRoadMobility",             boundedRoadMobility);
     getDouble("roadStartX",                      roadStartX);
     getDouble("roadLength",                      roadLength);
@@ -7182,6 +7440,22 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("minVehicleSpeed",                 minVehicleSpeed);
     getDouble("maxVehicleSpeed",                 maxVehicleSpeed);
     getDouble("mobilityUpdateInterval",          mobilityUpdateInterval);
+    getStr   ("mobilityTraceFile",               mobilityTraceFile);
+    getStr   ("mobilityRsuPositionFile",         mobilityRsuPositionFile);
+    getStr   ("mobilityMode3Name",               mobilityMode3Name);
+    getStr   ("mobilityMode3TraceFile",          mobilityMode3TraceFile);
+    getStr   ("mobilityMode3RsuPositionFile",    mobilityMode3RsuPositionFile);
+    getStr   ("mobilityMode4Name",               mobilityMode4Name);
+    getStr   ("mobilityMode4TraceFile",          mobilityMode4TraceFile);
+    getStr   ("mobilityMode4RsuPositionFile",    mobilityMode4RsuPositionFile);
+    getStr   ("mobilityMode5Name",               mobilityMode5Name);
+    getStr   ("mobilityMode5TraceFile",          mobilityMode5TraceFile);
+    getStr   ("mobilityMode5RsuPositionFile",    mobilityMode5RsuPositionFile);
+    // Backward-compatible aliases from the first mobility selector draft.
+    getStr   ("sumoMobilityTrace1",              mobilityMode3TraceFile);
+    getStr   ("sumoMobilityTrace2",              mobilityMode4TraceFile);
+    getStr   ("sumoMobilityTrace3",              mobilityMode5TraceFile);
+    getStr   ("sumoRsuPositionFile",             mobilityRsuPositionFile);
 }
 
 // ===========================================================================
@@ -7237,6 +7511,7 @@ main(int argc, char* argv[])
     cmd.AddValue("rsuAwarenessTimeout",        "Seconds before an RSU expires awareness rows/aggregates",rsuAwarenessTimeout);
     cmd.AddValue("controllerAwarenessTimeout", "Seconds before controller expires global awareness",controllerAwarenessTimeout);
     cmd.AddValue("channelHandshakeTimeout",    "Seconds before retrying a pending V2RSU channel handshake",channelHandshakeTimeout);
+    cmd.AddValue("mobility_mode",              "Mobility mode: 1=test 2=programmed road 3=SUMO trace1 4=SUMO trace2 5=SUMO trace3",mobility_mode);
     cmd.AddValue("boundedRoadMobility",        "Keep vehicles inside a bounded multi-lane road corridor",boundedRoadMobility);
     cmd.AddValue("roadStartX",                 "Bounded road start x-coordinate",roadStartX);
     cmd.AddValue("roadLength",                 "Bounded road length in metres",roadLength);
@@ -7248,6 +7523,17 @@ main(int argc, char* argv[])
     cmd.AddValue("minVehicleSpeed",            "Minimum bounded-road vehicle speed in m/s",minVehicleSpeed);
     cmd.AddValue("maxVehicleSpeed",            "Maximum bounded-road vehicle speed in m/s",maxVehicleSpeed);
     cmd.AddValue("mobilityUpdateInterval",     "Seconds between bounded-road wrap checks",mobilityUpdateInterval);
+    cmd.AddValue("mobilityTraceFile",          "Optional one-run SUMO/ns-2 trace override for selected mobility mode",mobilityTraceFile);
+    cmd.AddValue("mobilityRsuPositionFile",    "Optional one-run RSU CSV override for selected SUMO mobility mode",mobilityRsuPositionFile);
+    cmd.AddValue("mobilityMode3Name",          "Display name for mobility_mode=3",mobilityMode3Name);
+    cmd.AddValue("mobilityMode3TraceFile",     "SUMO/ns-2 mobility trace for mobility_mode=3",mobilityMode3TraceFile);
+    cmd.AddValue("mobilityMode3RsuPositionFile","Optional RSU CSV for mobility_mode=3",mobilityMode3RsuPositionFile);
+    cmd.AddValue("mobilityMode4Name",          "Display name for mobility_mode=4",mobilityMode4Name);
+    cmd.AddValue("mobilityMode4TraceFile",     "SUMO/ns-2 mobility trace for mobility_mode=4",mobilityMode4TraceFile);
+    cmd.AddValue("mobilityMode4RsuPositionFile","Optional RSU CSV for mobility_mode=4",mobilityMode4RsuPositionFile);
+    cmd.AddValue("mobilityMode5Name",          "Display name for mobility_mode=5 placeholder",mobilityMode5Name);
+    cmd.AddValue("mobilityMode5TraceFile",     "SUMO/ns-2 mobility trace for mobility_mode=5",mobilityMode5TraceFile);
+    cmd.AddValue("mobilityMode5RsuPositionFile","Optional RSU CSV for mobility_mode=5",mobilityMode5RsuPositionFile);
     cmd.Parse(argc, argv);
 
     if (routing_test)
@@ -7320,51 +7606,7 @@ main(int argc, char* argv[])
     // Mobility
     // -----------------------------------------------------------------------
 
-    // Tier 1 — Vehicles: bounded multi-lane road corridor.
-    // Vehicles keep using ConstantVelocityMobilityModel so BSM speed/heading,
-    // RSSI checks, attack placement, and NetAnim continue to use the same API.
-    MobilityHelper vehicleMobility;
-    vehicleMobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
-    vehicleMobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                         "MinX",      DoubleValue(roadStartX),
-                                         "MinY",      DoubleValue(roadBaseY),
-                                         "DeltaX",    DoubleValue(vehicleSpacing),
-                                         "DeltaY",    DoubleValue(0.0),
-                                         "GridWidth", UintegerValue(std::max(1u, N_Vehicles)),
-                                         "LayoutType",StringValue("RowFirst"));
-    vehicleMobility.Install(g_vehicleNodes);
-
-    for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
-    {
-        auto mob = g_vehicleNodes.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-        if (boundedRoadMobility)
-        {
-            mob->SetPosition(InitialVehiclePosition(i));
-            mob->SetVelocity(Vector(VehicleSpeed(i), 0.0, 0.0));
-        }
-        else
-        {
-            mob->SetVelocity(Vector(2.0 + i, 0.0, 0.0));
-        }
-    }
-
-    // Tier 2 — RSUs: fixed above the road and evenly distributed along the
-    // bounded corridor.  Each RSU is placed at the centre of its road segment,
-    // e.g. 800 m / 8 RSUs -> about 100 m between RSUs.
-    MobilityHelper rsuMobility;
-    rsuMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    rsuMobility.Install(g_rsuNodes);
-    for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
-    {
-        g_rsuNodes.Get(i)->GetObject<MobilityModel>()->SetPosition(InitialRsuPosition(i));
-    }
-
-    // Tier 3 — SDN controller: centred above both RSUs.
-    // SDN=(70,190) — wired backhaul, physical position is cosmetic only.
-    MobilityHelper controllerMobility;
-    controllerMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    controllerMobility.Install(g_controllerNode);
-    g_controllerNode.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(70.0, 190.0, 0.0));
+    InstallSelectedMobility();
 
     // -----------------------------------------------------------------------
     // Wireless channels — 7-channel 802.11p DSRC/WAVE (5.9 GHz band)

@@ -1,26 +1,89 @@
-# Ignore everything
+# Track only the simulation source, configs, helper scripts, and input data.
+# Generated results, plots, logs, and ns-3 build artifacts stay out of Git.
+
+# Ignore everything by default.
 *
-*:Zone.Identifier
 
-# Allow selected directories
-!scratch/
-!sybil-attack/
-
-# Track sybil-attack folder 
-!sybil-attack/**
-!sybil-attack/**/
-
-# Track selected files
-!scratch/Sybil-Developing.cc
-!scratch/Sybil-Developing-Improved.cc
-!scratch/sybil_metrics.h
-!scratch/sybil_attacks.h
-!scratch/sybil_types.h
-!scratch/sybil_crypto.h
-
-# Track repository docs/config
-!README.md
+# Repository metadata and top-level docs.
 !.gitignore
+!/README.md
 
-# Ignore Windows downloaded-file metadata even inside included folders
+# Main ns-3 simulation source.
+!scratch/
+!scratch/Sybil-Developing-Improved.cc
+!scratch/sybil_attacks.h
+!scratch/sybil_crypto.h
+!scratch/sybil_metrics.h
+!scratch/sybil_types.h
+
+# Project folder and tracked runtime inputs.
+!sybil-attack/
+!sybil-attack/configs/
+!sybil-attack/configs/**
+!sybil-attack/inputs/
+!sybil-attack/security/
+!sybil-attack/security/**
+!sybil-attack/scripts/
+!sybil-attack/scripts/**
+!sybil-attack/mobility_routing_test_report.md
+
+# Keep runtime CSVs loaded directly by the simulation.
+!sybil-attack/inputs/*.csv
+
+# Never track generated simulation outputs/results.
+sybil-attack/outputs/
+sybil-attack/outputs/**
+sybil-attack/**/outputs/
+sybil-attack/**/outputs/**
+sybil-attack/**/evaluation_runs/
+sybil-attack/**/evaluation_runs/**
+sybil-attack/**/visualizations/
+sybil-attack/**/visualizations/**
+
+# Common generated result/report artifacts.
+*.csv.tmp
+*.log
+*.pcap
+*.pcapng
+*.tr
+*.dat
+*.plt
+*.png
+*.svg
+*.pptx
+*.pdf
+
+# Generated XML is ignored by default; mobility scenario XML/TCL/SUMO files are
+# explicitly allowed below.
+*.xml
+*.tcl
+*.netccfg
+*.sumocfg
+
+# Mobility scenario assets required to reproduce SUMO/ns-2 mobility setup.
+!sybil-attack/inputs/mobility/
+!sybil-attack/inputs/mobility/**/
+!sybil-attack/inputs/mobility/**/*.csv
+!sybil-attack/inputs/mobility/**/*.xml
+!sybil-attack/inputs/mobility/**/*.tcl
+!sybil-attack/inputs/mobility/**/*.netccfg
+!sybil-attack/inputs/mobility/**/*.sumocfg
+
+# ns-3/build artifacts and local tooling.
+build/
+cmake-cache/
+__pycache__/
+.pytest_cache/
+.cache/
+.venv/
+.vscode/
+.waf*
+.lock-waf*
+
+# OS/editor/download noise.
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
 *:Zone.Identifier
