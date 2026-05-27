@@ -25,6 +25,7 @@
 #include "ns3/ns2-mobility-helper.h"
 #include "ns3/wifi-module.h"
 #include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
+#include "rssi_sybil_detection.h"
 
 #include <algorithm>
 #include <chrono>
@@ -34,6 +35,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -740,6 +742,12 @@ LightweightDecisionModeActive()
     return solution_mode == MODE_LIGHTWEIGHT;
 }
 
+static bool
+RssiSolutionModeActive()
+{
+    return solution_mode == MODE_BASELINE_RSSI;
+}
+
 static uint32_t
 MapLegacyProposedMethod(uint32_t legacyMode)
 {
@@ -781,7 +789,11 @@ ConfigureSolutionMode()
 
     std::cout << "[Solution] Mode=" << solution_mode
               << " (" << SolutionModeToString(solution_mode) << ")";
-    if (IsPlaceholderDetectionMode(solution_mode))
+    if (RssiSolutionModeActive())
+    {
+        std::cout << " active";
+    }
+    else if (IsPlaceholderDetectionMode(solution_mode))
     {
         std::cout << " placeholder; detection logic disabled until implemented";
     }
@@ -2448,6 +2460,21 @@ InstallSelectedMobility()
     }
 
     InstallInfrastructureMobility(scenario);
+}
+
+static void
+InitializeRssiSolution()
+{
+    if (!RssiSolutionModeActive())
+        return;
+
+    std::vector<RssiSybilDetector::RssiPos2D> rsuPos;
+    for (uint32_t u = 0; u < N_RSUs; ++u)
+    {
+        Vector p = g_rsuNodes.Get(u)->GetObject<MobilityModel>()->GetPosition();
+        rsuPos.push_back({p.x, p.y});
+    }
+    RssiSybilDetector::Init(N_RSUs, rsuPos);
 }
 
 static void
@@ -6578,6 +6605,38 @@ ReceivePacket(std::string receiverRole, uint32_t receiverId,
         SybilPacketTag tag;
         bool hasTag = packet->PeekPacketTag(tag);
         LogReceivedPacket(receiverRole, receiverId, channel, packet, tag, hasTag);
+
+        if (RssiSolutionModeActive() && receiverRole == "rsu_edge" && hasTag)
+        {
+            double rssiDbm = -80.0;
+            uint32_t realId = tag.GetRealNodeId();
+            if (realId < g_vehicleNodes.GetN() &&
+                receiverId < g_rsuNodes.GetN())
+            {
+                Ptr<MobilityModel> vehicleMob =
+                    g_vehicleNodes.Get(realId)->GetObject<MobilityModel>();
+                Ptr<MobilityModel> rsuMob =
+                    g_rsuNodes.Get(receiverId)->GetObject<MobilityModel>();
+                double dist = std::max(0.5, vehicleMob->GetDistanceFrom(rsuMob));
+                double pl = std::abs(RssiSybilDetector::kRef1mDbm)
+                          + 10.0 * RssiSybilDetector::kPathLossExp
+                          * std::log10(dist);
+                rssiDbm = RssiSybilDetector::kTxPowerDbm - pl;
+                static std::mt19937 rng_r(std::random_device{}());
+                static std::uniform_real_distribution<double> uni(0.0, 1.0);
+                double sigma_ch = 0.7071;
+                double rayleighGain =
+                    sigma_ch * std::sqrt(-2.0 * std::log(std::max(uni(rng_r), 1e-9)));
+                rssiDbm += 20.0 * std::log10(rayleighGain);
+            }
+
+            RssiSybilDetector::FeedObservation(
+                receiverId,
+                tag.GetClaimedNodeId(),
+                tag.GetRealNodeId(),
+                rssiDbm,
+                Simulator::Now().GetSeconds());
+        }
     }
 }
 
@@ -7095,6 +7154,9 @@ SendRsuControllerReport(uint32_t rsuIndex)
 static void
 SendControllerRsuCommand(uint32_t rsuIndex)
 {
+    if (RssiSolutionModeActive() && rsuIndex == 0)
+        RssiSybilDetector::RunDetection(0.0, 200.0, 20.0, 110.0, 65.0);
+
     // Type 6: malicious controller injects Sybil records into its global table.
     // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections
     // when N_RSUs > 1).  Records then flow back to RSUs via controller commands.
@@ -7673,6 +7735,7 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
 
     InstallSelectedMobility();
+    InitializeRssiSolution();
 
     // -----------------------------------------------------------------------
     // Wireless channels — 7-channel 802.11p DSRC/WAVE (5.9 GHz band)
@@ -8064,6 +8127,8 @@ main(int argc, char* argv[])
 
     WriteMetricsRow(simTime);
     WriteFinalSummary();
+    if (RssiSolutionModeActive())
+        RssiSybilDetector::PrintMetrics();
 
     return 0;
 }

@@ -15,6 +15,7 @@
 !scratch/sybil_crypto.h
 !scratch/sybil_metrics.h
 !scratch/sybil_types.h
+!scratch/rssi_sybil_detection.h
 
 # Project folder and tracked runtime inputs.
 !sybil-attack/
