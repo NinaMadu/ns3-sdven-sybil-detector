@@ -65,7 +65,9 @@ bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
 uint32_t sybil_attacker_level = 2;    ///< Attacker sophistication: 1=basic, 2=standard, 3=stealth, 4=advanced.
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
-uint32_t proposed_method = 0;         ///< Detection method: 0=none 1=rule-based 2=ML 3=FL 4=hybrid.
+const uint32_t kNoLegacyProposedMethod = std::numeric_limits<uint32_t>::max();
+uint32_t solution_mode = MODE_NO_DETECTION; ///< 1=FL placeholder 2=RSSI placeholder 3=ML placeholder 4=lightweight 5=full placeholder 6=none.
+uint32_t proposed_method = kNoLegacyProposedMethod; ///< Backward-compatible alias for old proposed_method values.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
 double v2vReliableRange = 100.0;      ///< Reliable local V2V beacon evaluation radius (metres).
@@ -735,7 +737,63 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
 static bool
 LightweightDecisionModeActive()
 {
-    return proposed_method == MODE_RULE_BASED || proposed_method == MODE_HYBRID;
+    return solution_mode == MODE_LIGHTWEIGHT;
+}
+
+static uint32_t
+MapLegacyProposedMethod(uint32_t legacyMode)
+{
+    switch (legacyMode)
+    {
+    case 0: return MODE_NO_DETECTION;
+    case 1: return MODE_LIGHTWEIGHT;
+    case 2: return MODE_BASELINE_ML;
+    case 3: return MODE_BASELINE_FL;
+    case 4: return MODE_FULL;
+    default: return legacyMode;
+    }
+}
+
+static std::string
+SolutionModeToString(uint32_t mode)
+{
+    switch (mode)
+    {
+    case MODE_BASELINE_FL: return "baseline1_fl_detection_placeholder";
+    case MODE_BASELINE_RSSI: return "baseline2_rssi_detection_placeholder";
+    case MODE_BASELINE_ML: return "baseline3_ml_detection_placeholder";
+    case MODE_LIGHTWEIGHT: return "lightweight_mode";
+    case MODE_FULL: return "full_mode_placeholder";
+    case MODE_NO_DETECTION: return "no_detection";
+    default: return "unknown";
+    }
+}
+
+static void
+ConfigureSolutionMode()
+{
+    if (!IsKnownDetectionMode(solution_mode))
+    {
+        std::cerr << "[Solution] WARNING: invalid solution_mode=" << solution_mode
+                  << "; falling back to no detection.\n";
+        solution_mode = MODE_NO_DETECTION;
+    }
+
+    std::cout << "[Solution] Mode=" << solution_mode
+              << " (" << SolutionModeToString(solution_mode) << ")";
+    if (IsPlaceholderDetectionMode(solution_mode))
+    {
+        std::cout << " placeholder; detection logic disabled until implemented";
+    }
+    else if (solution_mode == MODE_LIGHTWEIGHT)
+    {
+        std::cout << " active";
+    }
+    else
+    {
+        std::cout << " active baseline";
+    }
+    std::cout << std::endl;
 }
 
 static bool
@@ -7415,7 +7473,11 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getUint  ("sybil_attack_percentage",         sybil_attack_percentage);
     getUint  ("sybil_attacker_level",            sybil_attacker_level);
     getBool  ("controller_malicious_assumption", controller_malicious_assumption);
-    getUint  ("proposed_method",                 proposed_method);
+    uint32_t legacyProposedMethod = kNoLegacyProposedMethod;
+    getUint  ("proposed_method",                 legacyProposedMethod);
+    if (legacyProposedMethod != kNoLegacyProposedMethod)
+        solution_mode = MapLegacyProposedMethod(legacyProposedMethod);
+    getUint  ("solution_mode",                   solution_mode);
     getDouble("rsuCoverageRange",                rsuCoverageRange);
     getDouble("v2vReliableRange",                v2vReliableRange);
     getDouble("rsuVehicleRecordTimeout",         rsuVehicleRecordTimeout);
@@ -7498,7 +7560,8 @@ main(int argc, char* argv[])
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
     cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
-    cmd.AddValue("proposed_method",            "Detection method 0=none 1=rule 2=ML 3=FL 4=hybrid",proposed_method);
+    cmd.AddValue("solution_mode",              "Solution mode: 1=baseline FL placeholder 2=RSSI placeholder 3=ML placeholder 4=lightweight 5=full placeholder 6=no detection",solution_mode);
+    cmd.AddValue("proposed_method",            "Legacy alias: 0=none 1=old rule/lightweight 2=old ML 3=old FL 4=old hybrid/full",proposed_method);
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
     cmd.AddValue("v2vReliableRange",           "Reliable local V2V beacon evaluation radius in metres", v2vReliableRange);
     cmd.AddValue("rsuVehicleRecordTimeout",    "Seconds before an RSU forgets a vehicle",rsuVehicleRecordTimeout);
@@ -7535,6 +7598,9 @@ main(int argc, char* argv[])
     cmd.AddValue("mobilityMode5TraceFile",     "SUMO/ns-2 mobility trace for mobility_mode=5",mobilityMode5TraceFile);
     cmd.AddValue("mobilityMode5RsuPositionFile","Optional RSU CSV for mobility_mode=5",mobilityMode5RsuPositionFile);
     cmd.Parse(argc, argv);
+    if (proposed_method != kNoLegacyProposedMethod)
+        solution_mode = MapLegacyProposedMethod(proposed_method);
+    ConfigureSolutionMode();
 
     if (routing_test)
     {
@@ -7584,7 +7650,7 @@ main(int argc, char* argv[])
     InitializeMetricsCsvFiles();
 
     g_secMetrics = Create<SecurityEvaluationMetrics>();
-    g_secMetrics->Initialize(N_Vehicles, N_RSUs, proposed_method);
+    g_secMetrics->Initialize(N_Vehicles, N_RSUs, solution_mode);
 
     // -----------------------------------------------------------------------
     // Node creation

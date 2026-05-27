@@ -84,7 +84,7 @@ No-detection attack baseline:
 ./waf --run "Sybil-Developing-Improved --config=sybil-attack/configs/no_detection.cfg"
 ```
 
-Federated-learning detection scenario:
+Baseline1 FL placeholder scenario:
 
 ```bash
 ./waf --run "Sybil-Developing-Improved --config=sybil-attack/configs/sybil_fl_detection.cfg"
@@ -93,18 +93,23 @@ Federated-learning detection scenario:
 Manual command example:
 
 ```bash
-./waf --run "Sybil-Developing-Improved --routing_test=false --N_Vehicles=10 --N_RSUs=2 --simTime=60 --sybil_attack_enabled=true --sybil_attack_type=2 --sybil_attack_percentage=40 --proposed_method=3"
+./waf --run "Sybil-Developing-Improved --routing_test=false --N_Vehicles=10 --N_RSUs=2 --simTime=60 --sybil_attack_enabled=true --sybil_attack_type=2 --sybil_attack_percentage=40 --solution_mode=4"
 ```
 
-Detection mode currently uses `proposed_method`:
+Solution/detection mode uses `solution_mode`:
 
 ```text
-0 = none
-1 = rule-based
-2 = ML
-3 = FL
-4 = hybrid
+1 = Baseline1 FL Detection placeholder
+2 = Baseline2 RSSI Detection placeholder
+3 = Baseline3 ML Detection placeholder
+4 = Lightweight Mode
+5 = Full Mode placeholder
+6 = No Detection
 ```
+
+Only modes 4 and 6 are implemented at this stage. Placeholder modes are
+selectable and labelled in metrics, but they intentionally keep detection logic
+disabled so their behavior is not mixed with the lightweight solution.
 
 Mobility mode is selected with `mobility_mode`:
 

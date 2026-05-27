@@ -18,7 +18,7 @@
 //   2.  InitializeMetricsCsvFiles()
 //         — once, right after CreateProjectDirectories()
 //   3.  g_secMetrics = Create<SecurityEvaluationMetrics>();
-//       g_secMetrics->Initialize(N_Vehicles, N_RSUs, proposed_method);
+//       g_secMetrics->Initialize(N_Vehicles, N_RSUs, solution_mode);
 //         — after routing_test / N_RSUs adjustments, before Simulator::Run()
 //   4.  MetricsOnTransmit(expectedDeliveries)
 //         — inside SendTaggedPacket();  unicast=1, V2V-broadcast=nearby vehicles
@@ -157,18 +157,40 @@ SaturatingSub(uint64_t a, uint64_t b)
 }
 
 // =============================================================================
-// M5–M10  Detection mode constants
-// Must match proposed_method values in the simulation .cc
+// M5–M10  Solution/detection mode constants
+// Must match solution_mode values in the simulation .cc
 // =============================================================================
 
 enum DetectionMode
 {
-    MODE_NONE         = 0,   ///< No detection — pure baseline measurement.
-    MODE_RULE_BASED   = 1,
-    MODE_ML_LOCAL     = 2,
-    MODE_FL_FEDERATED = 3,
-    MODE_HYBRID       = 4
+    MODE_BASELINE_FL   = 1, ///< Placeholder: baseline FL detection.
+    MODE_BASELINE_RSSI = 2, ///< Placeholder: RSSI detection.
+    MODE_BASELINE_ML   = 3, ///< Placeholder: baseline ML detection.
+    MODE_LIGHTWEIGHT   = 4, ///< Implemented lightweight solution.
+    MODE_FULL          = 5, ///< Placeholder: full proposed solution.
+    MODE_NO_DETECTION  = 6  ///< Implemented no-detection baseline.
 };
+
+static inline bool
+IsImplementedDetectionMode(uint32_t mode)
+{
+    return mode == MODE_LIGHTWEIGHT;
+}
+
+static inline bool
+IsPlaceholderDetectionMode(uint32_t mode)
+{
+    return mode == MODE_BASELINE_FL ||
+           mode == MODE_BASELINE_RSSI ||
+           mode == MODE_BASELINE_ML ||
+           mode == MODE_FULL;
+}
+
+static inline bool
+IsKnownDetectionMode(uint32_t mode)
+{
+    return mode >= MODE_BASELINE_FL && mode <= MODE_NO_DETECTION;
+}
 
 // =============================================================================
 // M5–M10  Per-identity behavior record
@@ -412,14 +434,8 @@ struct ComplexityModel
     {
         switch (mode)
         {
-        case MODE_NONE:         return 0;
-        case MODE_RULE_BASED:   return MF_FLOPs(tier);
-        case MODE_ML_LOCAL:     return ML_FLOPs(tier);
-        case MODE_FL_FEDERATED: return FL_FLOPs(tier);
-        case MODE_HYBRID:
-            return (tier == "OBU") ? MF_FLOPs(tier) + ML_FLOPs(tier)
-                                   : ML_FLOPs(tier) + FL_FLOPs(tier);
-        default:                return MF_FLOPs(tier);
+        case MODE_LIGHTWEIGHT: return MF_FLOPs(tier);
+        default:               return 0;
         }
     }
 };
@@ -453,7 +469,7 @@ static const double MF_INFERENCE_OVERHEAD_MS  = 0.02;
 struct PendingRevocation
 {
     double   detectionTimeSec = 0.0;
-    uint32_t mode             = MODE_RULE_BASED;
+    uint32_t mode             = MODE_LIGHTWEIGHT;
 };
 
 struct LatencyTracker
@@ -475,9 +491,9 @@ struct LatencyTracker
         pending.erase(it);
 
         double inferenceMs = MF_INFERENCE_OVERHEAD_MS;
-        if (mode == MODE_ML_LOCAL)     inferenceMs = ML_INFERENCE_OVERHEAD_MS;
-        if (mode == MODE_FL_FEDERATED) inferenceMs = FL_INFERENCE_OVERHEAD_MS;
-        if (mode == MODE_HYBRID)       inferenceMs = FL_INFERENCE_OVERHEAD_MS;
+        if (mode == MODE_BASELINE_ML) inferenceMs = ML_INFERENCE_OVERHEAD_MS;
+        if (mode == MODE_BASELINE_FL) inferenceMs = FL_INFERENCE_OVERHEAD_MS;
+        if (mode == MODE_FULL)        inferenceMs = FL_INFERENCE_OVERHEAD_MS;
 
         return propagationMs + CRYPTO_LATENCY_MS + inferenceMs;
     }
@@ -559,7 +575,9 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
     {
         m_nVehicles      = nVehicles;
         m_nRsus          = nRsus;
-        m_proposedMethod = proposedMethod;
+        m_proposedMethod = IsKnownDetectionMode(proposedMethod)
+            ? proposedMethod
+            : MODE_NO_DETECTION;
         m_thresholdN     = thresholdN;
         m_thresholdT     = thresholdT;
         m_complexityModel.nRsus = nRsus;
@@ -569,7 +587,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         std::cout << "[Metrics] Initialized."
                   << " Vehicles=" << nVehicles
                   << " RSUs="     << nRsus
-                  << " Mode="     << ModeLabel(proposedMethod)
+                  << " Mode="     << ModeLabel(m_proposedMethod)
                   << " Threshold=" << thresholdT << "-of-" << thresholdN << "\n"
                   << "[Metrics] M5/M6 -> " << csvM5M6 << "\n"
                   << "[Metrics] M7    -> " << csvM7   << "\n"
@@ -645,12 +663,11 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         std::string tier     = RoleToTier(receiverRole);
         std::string modeStr  = ModeLabel(m_proposedMethod);
 
-        // M10: wall-clock measured around detector call.  In MODE_NONE the
-        // behavioral detector is intentionally disabled, so confidence and cost
-        // must stay zero for a true "no detection" experiment.
+        // M10: wall-clock measured around detector call.  Placeholder modes and
+        // no-detection mode intentionally keep confidence and cost at zero.
         double confidence  = 0.0;
         double wallClockMs = 0.0;
-        if (m_proposedMethod != MODE_NONE)
+        if (IsImplementedDetectionMode(m_proposedMethod))
         {
             auto t0 = std::chrono::high_resolution_clock::now();
             confidence = m_detector->ComputeConfidence(rec, m_proposedMethod);
@@ -658,8 +675,10 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
             wallClockMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
 
-        bool isFlagged = (confidence >= m_detector->GetThreshold());
-        if (m_explicitLightweightFlags.find(claimedNodeId) !=
+        bool isFlagged = IsImplementedDetectionMode(m_proposedMethod) &&
+                         (confidence >= m_detector->GetThreshold());
+        if (IsImplementedDetectionMode(m_proposedMethod) &&
+            m_explicitLightweightFlags.find(claimedNodeId) !=
             m_explicitLightweightFlags.end())
         {
             isFlagged = true;
@@ -723,7 +742,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                            bool               countConfusionNow,
                                            bool               flagFuturePackets)
     {
-        if (m_proposedMethod == MODE_NONE)
+        if (m_proposedMethod != MODE_LIGHTWEIGHT)
             return;
 
         if (flagFuturePackets)
@@ -798,7 +817,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                        const std::string& evidence,
                                        double             timestampSec)
     {
-        if (m_proposedMethod == MODE_NONE || !isActuallySybil)
+        if (m_proposedMethod != MODE_LIGHTWEIGHT || !isActuallySybil)
             return;
 
         m_windowMatrix.FN++;
@@ -979,13 +998,8 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                 &SecurityEvaluationMetrics::FlushWindow,
                                 this, t);
 
-        for (double t = flIntervalSec; t < simTimeArg - 0.5; t += flIntervalSec)
-            Simulator::Schedule(Seconds(t),
-                                &SecurityEvaluationMetrics::OnFLRound,
-                                this,
-                                -1.0,   // replace with real FL global loss when available
-                                0.0,    // replace with real MPC overhead ms when available
-                                false); // set true when FL is implemented
+        // FL baseline/full modes are menu placeholders for now.  Do not emit
+        // synthetic FL rounds until a real FL implementation is connected.
 
         Simulator::Schedule(Seconds(simTimeArg - 0.05),
                             &SecurityEvaluationMetrics::Finalize,
@@ -1027,12 +1041,13 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
     {
         switch (mode)
         {
-        case MODE_NONE:         return "no_detection";
-        case MODE_RULE_BASED:   return "MF_rule_based";
-        case MODE_ML_LOCAL:     return "ML_local";
-        case MODE_FL_FEDERATED: return "FL_federated";
-        case MODE_HYBRID:       return "ML_MF_hybrid";
-        default:                return "unknown";
+        case MODE_BASELINE_FL:   return "baseline1_fl_placeholder";
+        case MODE_BASELINE_RSSI: return "baseline2_rssi_placeholder";
+        case MODE_BASELINE_ML:   return "baseline3_ml_placeholder";
+        case MODE_LIGHTWEIGHT:   return "lightweight_mode";
+        case MODE_FULL:          return "full_mode_placeholder";
+        case MODE_NO_DETECTION:  return "no_detection";
+        default:                 return "unknown";
         }
     }
 
