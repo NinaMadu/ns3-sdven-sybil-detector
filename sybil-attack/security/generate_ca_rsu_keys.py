@@ -3,22 +3,19 @@ generate_ca_rsu_keys.py
 Generates:
   - CA ECDSA P-256 keypair          → sybil-attack/inputs/ca_keys.csv
   - RSU keypairs + CA-signed certs  → sybil-attack/inputs/rsu_keys.csv
-  - Controller keypair + per-RSU pre-shared keys
-                                    → sybil-attack/inputs/controller_keys.csv
+  - Controller PSK keys             → sybil-attack/inputs/controller_keys.csv
+  - Controller signing key + cert   → sybil-attack/inputs/controller_signing_keys.csv
 
 The CA acts as an offline trust anchor.  Its public key is pre-installed on
-every vehicle so vehicles can verify RSU certificates during the channel
-handshake (CHAN_ACK).
+every vehicle so vehicles can verify RSU and Controller certificates.
 
-The Controller↔RSU secure channel uses a pre-shared key derived offline via
-ECDH: ctrl_shared_key[rsu_id] = SHA-256( ECDH(controller_priv, rsu_pub) ).
-Both sides compute the same key: the RSU using ECDH(rsu_priv, controller_pub)
-and the Controller using ECDH(controller_priv, rsu_pub).  Only the derived
-symmetric key is loaded at runtime; the raw ECDH private keys are discarded.
+RSU↔Controller secure channel uses a pre-shared key:
+  ctrl_shared_key[rsu_id] = SHA-256( ECDH(controller_priv, rsu_pub) )
 
-Certificate format signed by CA:
-  ECDSA-P256( SHA256( rsu_id(4B big-endian) || rsu_pub(64B) ) )
-  Output is raw 64-byte r||s (not DER).
+Vehicle↔Controller E2E channel uses a separate controller SIGNING keypair.
+The controller sends its signing public key in CTRL2V_ACK, and vehicles verify
+it against the CA certificate:
+  ctrl_cert = CA_sign( SHA256( b"ctrl" + ctrl_sign_pub(64B) ) )
 
 Usage:
     python3 generate_ca_rsu_keys.py --rsus 2
@@ -69,12 +66,34 @@ def generate(n_rsus: int, out_dir: str) -> None:
         })
     print(f"[crypto_setup] CA keypair → {ca_path}")
 
-    # ── Controller keypair ────────────────────────────────────────────────────
-    # The controller's ECDH keypair is used offline only to derive per-RSU
-    # pre-shared keys.  Only the derived keys are stored; the raw controller
-    # private key is NOT needed at runtime and can be discarded after this script.
+    # ── Controller ECDH keypair (offline, for RSU PSK derivation only) ────────
     ctrl_priv = ec.generate_private_key(ec.SECP256R1())
     ctrl_pub  = ctrl_priv.public_key()
+
+    # ── Controller SIGNING keypair (loaded at runtime for V-Ctrl handshake) ───
+    # This is separate from the ECDH keypair used for PSK derivation.
+    # The signing public key is sent in CTRL2V_ACK and vehicles verify it
+    # against the CA certificate using the pre-installed g_caPubKey.
+    ctrl_sign_priv = ec.generate_private_key(ec.SECP256R1())
+    ctrl_sign_pub  = ctrl_sign_priv.public_key()
+    ctrl_sign_pub_bytes = raw_pub(ctrl_sign_pub)
+
+    # CA signs: SHA256( b"ctrl" (4B) || ctrl_sign_pub (64B) )
+    # Vehicle verifies: CryptoEcdsaVerify(caPub, SHA256("ctrl"+ctrlSignPub), ctrlCertSig)
+    ctrl_cert_data = b"ctrl" + ctrl_sign_pub_bytes
+    ctrl_cert_sig  = ecdsa_sign_raw(ca_priv, ctrl_cert_data)
+
+    ctrl_sign_path = os.path.join(out_dir, "controller_signing_keys.csv")
+    with open(ctrl_sign_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "ctrl_sign_pub_hex", "ctrl_sign_priv_hex", "ctrl_cert_sig_hex"])
+        w.writeheader()
+        w.writerow({
+            "ctrl_sign_pub_hex":  ctrl_sign_pub_bytes.hex(),
+            "ctrl_sign_priv_hex": raw_priv(ctrl_sign_priv).hex(),
+            "ctrl_cert_sig_hex":  ctrl_cert_sig.hex(),
+        })
+    print(f"[crypto_setup] Controller signing keypair + CA cert → {ctrl_sign_path}")
 
     # ── RSU keypairs + CA-signed certificates + Controller shared keys ─────────
     rsu_rows  = []
@@ -86,21 +105,18 @@ def generate(n_rsus: int, out_dir: str) -> None:
 
         # CA signs: SHA256( rsu_id(4B) || pub_rsu(64B) )
         cert_data = rsu_id.to_bytes(4, "big") + pub_bytes
-        cert_sig  = ecdsa_sign_raw(ca_priv, cert_data)   # raw r||s, 64 bytes
+        cert_sig  = ecdsa_sign_raw(ca_priv, cert_data)
 
-        # Controller↔RSU pre-shared key:
-        #   shared_xy = ECDH(controller_priv, rsu_pub)   [32-byte x-coordinate]
-        #   ctrl_shared_key = SHA-256(shared_xy)
-        # The RSU can compute the same value as ECDH(rsu_priv, controller_pub).
-        shared_xy        = ctrl_priv.exchange(ec.ECDH(), rsu_pub)   # 32 bytes
-        ctrl_shared_key  = hashlib.sha256(shared_xy).digest()        # 32 bytes
+        # Controller↔RSU pre-shared key via ECDH
+        shared_xy       = ctrl_priv.exchange(ec.ECDH(), rsu_pub)
+        ctrl_shared_key = hashlib.sha256(shared_xy).digest()
 
         rsu_rows.append({
             "rsu_id":              rsu_id,
-            "public_key_hex":      pub_bytes.hex(),           # 128 hex = 64 bytes
-            "private_key_hex":     raw_priv(rsu_priv).hex(),  #  64 hex = 32 bytes
-            "cert_sig_hex":        cert_sig.hex(),             # 128 hex = 64 bytes
-            "ctrl_shared_key_hex": ctrl_shared_key.hex(),     #  64 hex = 32 bytes
+            "public_key_hex":      pub_bytes.hex(),
+            "private_key_hex":     raw_priv(rsu_priv).hex(),
+            "cert_sig_hex":        cert_sig.hex(),
+            "ctrl_shared_key_hex": ctrl_shared_key.hex(),
         })
         ctrl_rows.append({
             "rsu_id":              rsu_id,
