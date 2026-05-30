@@ -174,15 +174,15 @@ enum DetectionMode
 static inline bool
 IsImplementedDetectionMode(uint32_t mode)
 {
-    return mode == MODE_LIGHTWEIGHT;
+    return mode == MODE_LIGHTWEIGHT ||
+           mode == MODE_BASELINE_FL ||
+           mode == MODE_BASELINE_RSSI;
 }
 
 static inline bool
 IsPlaceholderDetectionMode(uint32_t mode)
 {
-    return mode == MODE_BASELINE_FL ||
-           mode == MODE_BASELINE_RSSI ||
-           mode == MODE_BASELINE_ML ||
+    return mode == MODE_BASELINE_ML ||
            mode == MODE_FULL;
 }
 
@@ -688,15 +688,19 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                                     m_complexityModel);
         WriteM10Row(timestampSec, receiverId, tier, modeStr, wallClockMs, flops);
 
-        // M5/M6 confusion matrix
-        if      ( isActuallySybil &&  isFlagged) { m_windowMatrix.TP++; m_totalMatrix.TP++; }
-        else if (!isActuallySybil &&  isFlagged) { m_windowMatrix.FP++; m_totalMatrix.FP++;
-            std::cout << "[M6] FP at t=" << timestampSec
-                      << " claimedId="   << claimedNodeId << std::endl; }
-        else if ( isActuallySybil && !isFlagged) { m_windowMatrix.FN++; m_totalMatrix.FN++; }
-        else                                     { m_windowMatrix.TN++; m_totalMatrix.TN++; }
+        // M5/M6 confusion matrix — skipped for FL mode (RecordFLPacketDecision
+        // counts every per-packet inference decision directly to avoid double-counting).
+        if (m_proposedMethod != MODE_BASELINE_FL)
+        {
+            if      ( isActuallySybil &&  isFlagged) { m_windowMatrix.TP++; m_totalMatrix.TP++; }
+            else if (!isActuallySybil &&  isFlagged) { m_windowMatrix.FP++; m_totalMatrix.FP++;
+                std::cout << "[M6] FP at t=" << timestampSec
+                          << " claimedId="   << claimedNodeId << std::endl; }
+            else if ( isActuallySybil && !isFlagged) { m_windowMatrix.FN++; m_totalMatrix.FN++; }
+            else                                     { m_windowMatrix.TN++; m_totalMatrix.TN++; }
+        }
 
-        if (isFlagged)
+        if (isFlagged && m_proposedMethod != MODE_BASELINE_FL)
         {
             // M7: record detection start only on first flag for this identity;
             // subsequent packets from the same Sybil claimedId are already tracked.
@@ -829,6 +833,78 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                   << " counted=explicit_FN"
                   << " reason=identity_not_attributed_by_lightweight_budget"
                   << " t=" << timestampSec
+                  << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // RecordFLPacketDecision
+    //
+    // Called once per V2V beacon at the receiving vehicle when solution_mode
+    // is MODE_BASELINE_FL.  Counts every inference decision directly into the
+    // M5/M6 confusion matrix (TP/FP/TN/FN), bypassing OnPacketReceived's
+    // matrix update (which is suppressed for FL mode above).
+    //
+    // Also tracks first-detection latency (M7) and communication overhead (M8)
+    // for flagged identities, consistent with the other detection modes.
+    // -------------------------------------------------------------------------
+    void RecordFLPacketDecision(uint32_t           claimedId,
+                                bool               isActuallySybil,
+                                bool               predictedSybil,
+                                const std::string& tier,
+                                double             timestampSec)
+    {
+        if (m_proposedMethod != MODE_BASELINE_FL) return;
+
+        // M5/M6: per-packet confusion matrix
+        if      ( isActuallySybil &&  predictedSybil)
+        {
+            m_windowMatrix.TP++; m_totalMatrix.TP++;
+        }
+        else if (!isActuallySybil &&  predictedSybil)
+        {
+            m_windowMatrix.FP++; m_totalMatrix.FP++;
+            std::cout << "[M6] FL_FP at t=" << timestampSec
+                      << " claimedId=" << claimedId << std::endl;
+        }
+        else if ( isActuallySybil && !predictedSybil)
+        {
+            m_windowMatrix.FN++; m_totalMatrix.FN++;
+        }
+        else
+        {
+            m_windowMatrix.TN++; m_totalMatrix.TN++;
+        }
+
+        // M7: detection latency — record first detection per Sybil identity
+        if (predictedSybil &&
+            m_latencyTracker.pending.find(claimedId) == m_latencyTracker.pending.end())
+        {
+            m_latencyTracker.RecordDetectionStart(claimedId, m_proposedMethod, timestampSec);
+            double revDelaySec = 1.0 / 1000.0;
+            Simulator::Schedule(
+                Seconds(revDelaySec),
+                &SecurityEvaluationMetrics::OnRevocationComplete,
+                this,
+                claimedId,
+                isActuallySybil,
+                timestampSec + revDelaySec);
+        }
+
+        // M8: overhead for flagged packets (10 features × 4 bytes = 40 bytes)
+        if (predictedSybil)
+        {
+            m_windowOverhead.AddEvent(40u, m_thresholdN, m_thresholdT, tier);
+            m_totalOverhead.AddEvent(40u, m_thresholdN, m_thresholdT, tier);
+        }
+
+        std::cout << "[FL_DETECTION] t=" << timestampSec
+                  << " claimedId=" << claimedId
+                  << " tier=" << tier
+                  << " pred=" << (predictedSybil ? "SYBIL" : "normal")
+                  << " truth=" << (isActuallySybil ? "sybil" : "normal")
+                  << " result=" << (isActuallySybil == predictedSybil
+                                    ? (predictedSybil ? "TP" : "TN")
+                                    : (predictedSybil ? "FP" : "FN"))
                   << std::endl;
     }
 
@@ -998,8 +1074,8 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                 &SecurityEvaluationMetrics::FlushWindow,
                                 this, t);
 
-        // FL baseline/full modes are menu placeholders for now.  Do not emit
-        // synthetic FL rounds until a real FL implementation is connected.
+        // FL round scheduling is driven by RunFLRound() in the main .cc,
+        // called once per rsuReportInterval.  No additional scheduling needed here.
 
         Simulator::Schedule(Seconds(simTimeArg - 0.05),
                             &SecurityEvaluationMetrics::Finalize,
@@ -1041,8 +1117,8 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
     {
         switch (mode)
         {
-        case MODE_BASELINE_FL:   return "baseline1_fl_placeholder";
-        case MODE_BASELINE_RSSI: return "baseline2_rssi_placeholder";
+        case MODE_BASELINE_FL:   return "baseline1_fl_detection";
+        case MODE_BASELINE_RSSI: return "baseline2_rssi_detection";
         case MODE_BASELINE_ML:   return "baseline3_ml_placeholder";
         case MODE_LIGHTWEIGHT:   return "lightweight_mode";
         case MODE_FULL:          return "full_mode_placeholder";

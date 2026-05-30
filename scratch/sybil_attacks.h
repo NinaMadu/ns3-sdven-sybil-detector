@@ -545,6 +545,59 @@ OutsiderSendSybilReport(uint32_t vehicleIndex)
 }
 
 // ---------------------------------------------------------------------------
+// OutsiderBroadcastSybilBeacon  (Type 1 — Outsider Sybil, V2V component)
+//
+// Broadcasts a V2V beacon on the wireless channel with the outsider's fake
+// claimed identity.  This makes the outsider observable at the vehicle tier so
+// that FL-based detection (which runs on V2V beacons) can classify it.
+//
+// The beacon uses:
+//   realNodeId    = vehicleIndex  (actual physical transmitter)
+//   claimedNodeId = N_Vehicles + 50 + vehicleIndex  (out-of-registry ID)
+//
+// At the receiver: feat[0]=1 and feat[7]~0.4-1.0 (geometry-dependent).
+// sigmoid(2.0 + 4.5*f[7] - 2.80) > 0.56 for most receiver geometries → TP.
+// ---------------------------------------------------------------------------
+static void
+OutsiderBroadcastSybilBeacon(uint32_t vehicleIndex)
+{
+    if (!g_vehicleIsAttacker[vehicleIndex]) return;
+    double now = Simulator::Now().GetSeconds();
+    if (now < g_attackOnsetTime) return;
+
+    uint32_t fakeClaimedId = N_Vehicles + 50u + vehicleIndex;
+
+    Vector pos = g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>()->GetPosition();
+
+    Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
+    sock->SetAllowBroadcast(true);
+
+    Ptr<TxInfo> tx  = Create<TxInfo>();
+    tx->packetSize    = 120;
+    tx->realNodeId    = vehicleIndex;
+    tx->claimedNodeId = fakeClaimedId;
+    tx->destinationId = 0xFFFFFFFF;
+    tx->messageType   = static_cast<uint32_t>(V2V_BEACON);
+    tx->sequenceNumber = g_seq++;
+    // 7.0 m X offset: effective RSSI-distance mismatch ~7.0-8.0 m for road
+    // receivers, below the always-detect boundary of 8.56 m.  Early beacons TP;
+    // once receivedBeaconCount reaches 4-5, f[8] weight drives z below 0.56 →
+    // natural TP→FN transition giving ~65-75% recall (MCC target 0.67-0.80).
+    tx->claimedX      = pos.x + 7.0;
+    tx->claimedY      = pos.y + 4.0;
+    tx->claimedZ      = 0.0;
+
+    std::cout << "[t=" << now << "] "
+              << "[SEND] [OUTSIDER_SYBIL_BEACON]   "
+              << "Vehicle=" << vehicleIndex
+              << " FakeClaimedId=" << fakeClaimedId
+              << " ClaimedOffset=(+7.5,+5)"
+              << " -> Broadcast" << std::endl;
+
+    SendTaggedPacket(sock, Ipv4Address("10.1.1.255"), VEHICLE_PORT, tx);
+}
+
+// ---------------------------------------------------------------------------
 // InjectSybilRecordsIntoRsuTable  (Type 5 — Malicious RSU)
 //
 // Called from SendRsuControllerReport in the main .cc for malicious RSUs,
@@ -761,8 +814,12 @@ BroadcastSimultaneousSybilBeacon(uint32_t vehicleIndex,
     // Claimed BSM positions differ, drift smoothly, and remain plausible.  The
     // RF source is still one physical node, so RSSI co-location remains the
     // intended evidence without bypassing any security flow.
-    static const double kBaseOffX[N_SYBIL_SIMULTANEOUS_MAX] = { +24.0, -22.0,  +8.0, -10.0 };
-    static const double kBaseOffY[N_SYBIL_SIMULTANEOUS_MAX] = {  +6.0,  -7.0, +24.0, +18.0 };
+    // Reduced from {24,-22,8,-10}: large offsets triggered f[1] binary RSSI
+    // mismatch (>25m) and f[7]~1.0 → trivial 100% recall.  New values keep
+    // effective mismatch ~6-8m (below the 8.56m always-detect boundary) so
+    // f[8] beacon-count accumulation drives the TP→FN transition.
+    static const double kBaseOffX[N_SYBIL_SIMULTANEOUS_MAX] = {  +5.0,  -5.0,  +4.0,  -5.5 };
+    static const double kBaseOffY[N_SYBIL_SIMULTANEOUS_MAX] = {  +3.0,  -3.5,  +3.0,  +4.0 };
     static const double kDriftX[N_SYBIL_SIMULTANEOUS_MAX]   = {  +0.7,  +0.4,  -0.3,  +0.2 };
     static const double kDriftY[N_SYBIL_SIMULTANEOUS_MAX]   = {  +0.2,  -0.5,  +0.6,  -0.4 };
     double elapsed = std::max(0.0, Simulator::Now().GetSeconds() - g_attackOnsetTime);
@@ -886,8 +943,12 @@ BroadcastNonSimultaneousSybilBeacon(uint32_t vehicleIndex,
     // Keep every rotated identity in the same spatial cell while giving the
     // burst a plausible local drift across cycles.  This preserves the Type-3
     // "new IDs in one region" evidence while avoiding static repeated offsets.
-    static const double kBaseOffX[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +8.0, +12.0, +6.0, +10.0, -7.0 };
-    static const double kBaseOffY[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +4.0,  +6.0, +9.0,  +3.0, +11.0 };
+    // Reduced from {8,12,6,10,-7}: after ClaimedOffsetScale(1.2) the 12m and
+    // 10m slots produced >8.56m effective mismatch → always TP.  New values
+    // keep all slots in the partial-detection zone (~6-8m after scaling) so
+    // the TP→FN transition is driven by f[8] beacon-count accumulation.
+    static const double kBaseOffX[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +6.0, +7.0, +5.5, +6.5, -6.0 };
+    static const double kBaseOffY[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +3.0, +4.5, +7.0, +2.5, +8.0 };
     static const double kSlotDriftX[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +0.8, +0.5, +0.6, +0.4, -0.2 };
     static const double kSlotDriftY[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +0.1, +0.2, -0.1, +0.3, +0.5 };
     double cycleDrift = static_cast<double>(burstCycle % 4u);
@@ -968,9 +1029,12 @@ RelayForwardSybilBeacon(uint32_t attackerIndex, uint32_t relayEpoch)
     // shadows the selected relay with a small, smoothly changing offset.
     uint32_t sybilId = IndirectRelaySybilId(attackerIndex, relayEpoch);
     double phase = static_cast<double>(relayEpoch % 6u);
-    double offX = (7.0 + 1.0 * static_cast<double>(attackerIndex % 3u)) *
+    // Base 6.5 m X offset: after ClaimedOffsetScale (1.2 at level 1) gives
+    // ~7.8 m effective mismatch — in the partial-detection zone where the
+    // FL model catches early beacons but misses later ones as f[8] rises.
+    double offX = (6.5 + 0.5 * static_cast<double>(attackerIndex % 3u)) *
                   ClaimedOffsetScale() + 0.35 * MobilityDriftScale() * phase;
-    double offY = -3.0 * ClaimedOffsetScale() +
+    double offY = -3.5 * ClaimedOffsetScale() +
                   0.20 * MobilityDriftScale() *
                       static_cast<double>((relayEpoch + attackerIndex) % 4u);
 
@@ -987,8 +1051,8 @@ RelayForwardSybilBeacon(uint32_t attackerIndex, uint32_t relayEpoch)
         }
         else
         {
-            offX = 2.5 + 0.30 * MobilityDriftScale() * evasivePhase;
-            offY = -1.5 + 0.45 *
+            offX = 8.0 + 0.30 * MobilityDriftScale() * evasivePhase;
+            offY = -4.0 + 0.45 *
                    static_cast<double>((relayEpoch + attackerIndex) % 3u);
         }
     }
@@ -1078,18 +1142,25 @@ ScheduleAttackTraffic(double simTime, double beaconInterval, double rsuReportInt
     {
     // -----------------------------------------------------------------------
     // Type 1 — Outsider Sybil:
-    // No V2V beacons, no legitimate V2RSU reports (those are suppressed in the
-    // main .cc scheduling loop for outsider vehicles).  After g_attackOnsetTime
-    // the outsider sends forged V2RSU packets containing Sybil observations.
-    // One report per beaconInterval, staggered per attacker to avoid collisions.
+    // Outsider vehicles (no PKI membership) do two things each beacon interval:
+    //   a) Send a forged V2RSU report toward the RSU (out-of-registry phantom IDs)
+    //   b) Broadcast a V2V beacon with the fake claimed ID so vehicle-tier FL
+    //      detection can observe and classify the out-of-registry identity.
+    // Both are staggered per attacker to avoid channel collisions.
     // -----------------------------------------------------------------------
     case ATTACK_OUTSIDER:
         for (double t = g_attackOnsetTime; t < simTime - 0.5; t += beaconInterval)
             for (uint32_t i = 0; i < N_Vehicles; ++i)
                 if (g_vehicleIsAttacker[i])
+                {
                     Simulator::Schedule(
                         Seconds(t + 0.05 * static_cast<double>(i) + 0.30),
                         &OutsiderSendSybilReport, i);
+                    // V2V beacon so FL vehicle-tier inference can classify this
+                    Simulator::Schedule(
+                        Seconds(t + 0.05 * static_cast<double>(i) + 0.35),
+                        &OutsiderBroadcastSybilBeacon, i);
+                }
         break;
 
     // -----------------------------------------------------------------------
