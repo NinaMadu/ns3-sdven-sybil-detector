@@ -1119,7 +1119,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         {
         case MODE_BASELINE_FL:   return "baseline1_fl_detection";
         case MODE_BASELINE_RSSI: return "baseline2_rssi_detection";
-        case MODE_BASELINE_ML:   return "baseline3_ml_placeholder";
+        case MODE_BASELINE_ML:   return "baseline3_ml_adaboost_dpm";
         case MODE_LIGHTWEIGHT:   return "lightweight_mode";
         case MODE_FULL:          return "full_mode_placeholder";
         case MODE_NO_DETECTION:  return "no_detection";

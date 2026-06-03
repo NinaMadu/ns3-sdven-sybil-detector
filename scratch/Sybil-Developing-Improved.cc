@@ -27,6 +27,7 @@
 #include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
 #include "rssi_sybil_detection.h"
 #include "fl_sybil_detection.h"
+#include "ml_sybil_detection.h"
 
 #include <algorithm>
 #include <chrono>
@@ -755,6 +756,12 @@ FLSolutionModeActive()
     return solution_mode == MODE_BASELINE_FL;
 }
 
+static bool
+MlSolutionModeActive()
+{
+    return solution_mode == MODE_BASELINE_ML;
+}
+
 static uint32_t
 MapLegacyProposedMethod(uint32_t legacyMode)
 {
@@ -776,7 +783,7 @@ SolutionModeToString(uint32_t mode)
     {
     case MODE_BASELINE_FL: return "baseline1_fl_detection";
     case MODE_BASELINE_RSSI: return "baseline2_rssi_detection_placeholder";
-    case MODE_BASELINE_ML: return "baseline3_ml_detection_placeholder";
+    case MODE_BASELINE_ML: return "baseline3_ml_adaboost_dpm";
     case MODE_LIGHTWEIGHT: return "lightweight_mode";
     case MODE_FULL: return "full_mode_placeholder";
     case MODE_NO_DETECTION: return "no_detection";
@@ -803,6 +810,10 @@ ConfigureSolutionMode()
     else if (RssiSolutionModeActive())
     {
         std::cout << " active";
+    }
+    else if (MlSolutionModeActive())
+    {
+        std::cout << " active — AdaBoost DPM-eigenvalue baseline (end-of-run evaluation)";
     }
     else if (solution_mode == MODE_LIGHTWEIGHT)
     {
@@ -8228,6 +8239,8 @@ main(int argc, char* argv[])
     WriteFinalSummary();
     if (RssiSolutionModeActive())
         RssiSybilDetector::PrintMetrics();
+    if (MlSolutionModeActive())
+        MLSybilDetector::RunAndPrintMetrics();
 
     return 0;
 }
