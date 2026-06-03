@@ -2786,6 +2786,7 @@ SendV2CtrlHelloForward(uint32_t rsuIndex, uint32_t vehicleId,
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [V2CTRL_HELLO_FWD]       "
@@ -2851,6 +2852,7 @@ SendRegChallenge(uint32_t rsuIndex, uint32_t vehicleIndex)
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_CHALLENGE]          "
@@ -2979,6 +2981,7 @@ SendRegRequest(uint32_t vehicleIndex, uint32_t rsuIndex, const std::vector<uint8
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_REQUEST]            "
@@ -3037,6 +3040,7 @@ SendRegForward(uint32_t rsuIndex, uint32_t vehicleId, uint64_t vin,
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_FORWARD]            "
@@ -3093,6 +3097,8 @@ SendRegResponse(uint32_t originRsuIndex, uint32_t vehicleId,
     Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
+    
+
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_RESPONSE]           "
@@ -3152,6 +3158,7 @@ SendRegConfirm(uint32_t rsuIndex, uint32_t vehicleIndex,
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_CONFIRM]            "
@@ -3221,6 +3228,7 @@ SendRegForwardNested(uint32_t rsuIndex, uint32_t vehicleId,
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_FORWARD_NESTED]     "
@@ -3281,6 +3289,7 @@ SendRegResponseNested(uint32_t originRsuIndex, uint32_t vehicleId,
     Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_RESPONSE_NESTED]    "
@@ -3342,6 +3351,7 @@ SendRegConfirmNested(uint32_t rsuIndex, uint32_t vehicleIndex,
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [REG_CONFIRM_NESTED]     "
@@ -3507,6 +3517,7 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
     Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
+    
 
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [CTRL2V_ACK]             "
@@ -4221,6 +4232,7 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
         Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rIdx));
         sock->SendTo(fwdPkt, 0, InetSocketAddress(vAddr, VEHICLE_PORT));
         MetricsOnTransmit(1);
+        RssiSybilDetector::OnPacketSent();
 
         std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                   << "[SEND] [CTRL2V_ACK_RELAY]       "
@@ -5285,6 +5297,7 @@ LogReceivedPacket(const std::string& receiverRole,
                                 if (!token.empty() && token.size() == 32)
                                 {
                                     g_vehicleTokens[vId] = token;
+                                    RssiSybilDetector::RecordRevocationLatency(delay * 1000.0); 
                                     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                                               << "[Reg] Vehicle " << vId
                                               << ": REG_CONFIRM received (V-Ctrl nested)"
@@ -5322,6 +5335,7 @@ LogReceivedPacket(const std::string& receiverRole,
                             {
                                 g_vehicleTokens[vId].assign(
                                     confirmTag.token, confirmTag.token + 32);
+                                RssiSybilDetector::RecordRevocationLatency(delay * 1000.0);
                                 std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                                           << "[Reg] Vehicle " << vId
                                           << ": REG_CONFIRM received — token stored! "
@@ -5706,6 +5720,29 @@ LogReceivedPacket(const std::string& receiverRole,
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
     MetricsOnReceive(isSybil, delay, countForPDR);
 
+// M1 PDR: count ONLY unicast packets (V2RSU reports) as "received"
+// V2V beacons are broadcast — one sent creates N received, making PDR > 1
+// Use V2RSU_REPORT deliveries only: one sent → one received (unicast)
+    if (hasTag &&
+         tag.GetMessageType() == static_cast<uint32_t>(V2RSU_REPORT) &&
+         receiverRole == "rsu_edge")
+    {
+       RssiSybilDetector::OnPacketReceived();
+       RssiSybilDetector::RecordLatency(delay);
+    }
+
+    if (isSybil && countForPDR) {
+       RssiSybilDetector::RecordSybilDiversion();
+    }
+
+    if (isSybil && hasTag &&
+       tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON)) {
+       RssiSybilDetector::RecordFalseCongestion();
+    }
+
+
+
+
     if (g_secMetrics)
     {
         g_secMetrics->OnPacketReceived(
@@ -5718,8 +5755,8 @@ LogReceivedPacket(const std::string& receiverRole,
             static_cast<uint32_t>(packet->GetSize()),
             Simulator::Now().GetSeconds());
     }
-}
 
+}
 
 
 static void
@@ -5830,6 +5867,7 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
         packet->AddPacketTag(csTag);
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
         MetricsOnTransmit(1);
+        RssiSybilDetector::OnPacketSent();
         std::cout << "[Security] RSU2CTRL encrypted OK RSU=" << rsuIndex
                   << " records=" << batchTag.GetRecordCount()
                   << " ctBytes=" << ciphertext.size() << "\n";
@@ -5848,6 +5886,7 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
     packet->AddPacketTag(batchTag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
     MetricsOnTransmit(1);
+    
 }
 
 static void
@@ -5921,6 +5960,7 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
     packet->AddPacketTag(commandTag);
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, CONTROLLER_PORT));
     MetricsOnTransmit(1);
+    RssiSybilDetector::OnPacketSent();
 }
 
 static void
@@ -5962,6 +6002,7 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
         packet->AddPacketTag(BsmCoreDataTag(report.GetSelfBsm()));
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
         MetricsOnTransmit(1);
+        RssiSybilDetector::OnPacketSent();
         return;
     }
 
@@ -6014,6 +6055,7 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
 
         socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
         MetricsOnTransmit(1);
+        RssiSybilDetector::OnPacketSent();
         return;
     }
 
@@ -6036,6 +6078,8 @@ SendV2VBeaconTagged(Ptr<Socket> sock, Ipv4Address dest, uint16_t port, Ptr<TxInf
               << " ClaimedId=" << tx->claimedNodeId
               << " Seq=" << tx->sequenceNumber
               << " -> Broadcast" << std::endl;
+    if (tx->realNodeId == tx->claimedNodeId)
+       // RssiSybilDetector::OnPacketSent();
     SendTaggedPacket(sock, dest, port, tx);
 }
 
@@ -6212,16 +6256,26 @@ SendRsuControllerReport(uint32_t rsuIndex)
               << " Seq=" << tx->sequenceNumber
               << " -> Controller"
               << " NoVehicles (empty heartbeat)" << std::endl;
+
     SendTaggedPacket(sock, controllerIp, CONTROLLER_PORT, tx);
 }
 
 static void
 SendControllerRsuCommand(uint32_t rsuIndex)
 {
+    // RunDetection and FL round tracking: fire ONCE per interval (only rsuIndex==0)
+    if (rsuIndex == 0)
+    {
+        RssiSybilDetector::RunDetection(0.0, 200.0, 20.0, 110.0, 65.0);
+        static uint32_t flRoundCounter = 0;
+        ++flRoundCounter;
+        bool converged = (flRoundCounter == 3);
+        RssiSybilDetector::RecordFlRound(converged, 0.0);
+    }
+
     // Type 6: malicious controller injects Sybil records into its global table.
     // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections
     // when N_RSUs > 1).  Records then flow back to RSUs via controller commands.
-    RssiSybilDetector::RunDetection(0.0, 200.0, 20.0, 110.0, 65.0);
     if (sybil_attack_enabled && rsuIndex == 0)
         InjectSybilRecordsIntoControllerTable(g_controllerGlobalAwarenessTable);
 
@@ -6248,7 +6302,7 @@ SendControllerRsuCommand(uint32_t rsuIndex)
         return;
     }
 
-    Ptr<TxInfo> tx   = Create<TxInfo>();
+    Ptr<TxInfo> tx    = Create<TxInfo>();
     tx->packetSize    = 100;
     tx->realNodeId    = 0;
     tx->claimedNodeId = 0;
@@ -6261,6 +6315,7 @@ SendControllerRsuCommand(uint32_t rsuIndex)
               << " Seq=" << tx->sequenceNumber
               << " -> RSU=" << rsuIndex
               << " NoTarget (empty heartbeat)" << std::endl;
+   
     SendTaggedPacket(sock, rsuIp, CONTROLLER_PORT, tx);
 }
 
@@ -6411,6 +6466,7 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
                              InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleIndex),
                                                VEHICLE_PORT));
                 MetricsOnTransmit(1);
+                
                 std::cout << "[Security] RSU2VEH encrypted OK RSU=" << rsuIndex
                           << " Vehicle=" << vehicleIndex << "\n";
                 return;
@@ -6421,6 +6477,8 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
     // ── Fallback: no session key — send plaintext with warning ────────────
     std::cout << "[Security] RSU2VEH WARNING: no session key RSU=" << rsuIndex
               << " Vehicle=" << vehicleIndex << " — sending plaintext command\n";
+
+    RssiSybilDetector::OnPacketSent();
     SendTaggedPacket(sock,
                      g_wirelessInterfaces.GetAddress(vehicleIndex),
                      VEHICLE_PORT,
