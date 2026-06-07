@@ -1382,6 +1382,49 @@ extern double                   v2vReliableRange;
 // Master security toggle — false disables all crypto, registration, token auth.
 // DEFINED in Sybil-Developing-Improved.cc; controlled via --SecEnabled=true/false.
 extern bool g_secEnabled;
+extern uint32_t solution_mode;
+
+enum CryptoMechanismMode
+{
+    CRYPTO_MECHANISM_OFF = 0,
+    CRYPTO_MECHANISM_LIGHTWEIGHT = 1,
+    CRYPTO_MECHANISM_FULL = 2
+};
+
+inline CryptoMechanismMode
+GetCryptoMechanismMode()
+{
+    if (!g_secEnabled)
+        return CRYPTO_MECHANISM_OFF;
+
+    switch (solution_mode)
+    {
+    case MODE_LIGHTWEIGHT:
+        return CRYPTO_MECHANISM_LIGHTWEIGHT;
+    case MODE_FULL:
+        return CRYPTO_MECHANISM_FULL;
+    default:
+        return CRYPTO_MECHANISM_OFF;
+    }
+}
+
+inline bool
+CryptoMechanismActive()
+{
+    return GetCryptoMechanismMode() != CRYPTO_MECHANISM_OFF;
+}
+
+inline bool
+LightweightCryptoMechanismActive()
+{
+    return GetCryptoMechanismMode() == CRYPTO_MECHANISM_LIGHTWEIGHT;
+}
+
+inline bool
+FullCryptoMechanismActive()
+{
+    return GetCryptoMechanismMode() == CRYPTO_MECHANISM_FULL;
+}
 
 // Vehicle ECDSA key material — DEFINED in Sybil-Developing-Improved.cc,
 // populated by LoadVehicleKeys() before Simulator::Run().
@@ -1533,7 +1576,7 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
 
         // --- V2V Signature ---
         uint32_t senderIdx = tx->realNodeId;
-        if (g_secEnabled &&
+        if (LightweightCryptoMechanismActive() &&
             senderIdx < g_vehiclePrivKeys.size() && !g_vehiclePrivKeys[senderIdx].empty())
         {
             std::vector<uint8_t> payload  = SerializeBsmForSigning(bsm);
@@ -1552,7 +1595,7 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
                 packet->AddPacketTag(sigTag);
             }
         }
-        else if (!g_secEnabled)
+        else if (!CryptoMechanismActive())
         {
             std::cout << "[Latency] V2V_BEACON  vehicle/" << senderIdx
                       << "  sign  0.000\n";

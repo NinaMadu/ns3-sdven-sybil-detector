@@ -4506,8 +4506,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             return;
         }
 
-        // No-security path: no CtrlSecureTag, log 0.000 decrypt latency.
-        if (!g_secEnabled)
+        // No-crypto path: no CtrlSecureTag, log 0.000 decrypt latency.
+        if (!CryptoMechanismActive())
             std::cout << "[Latency] RSU2CTRL_REPORT  sdn_controller/0"
                       << "  decrypt  0.000\n";
 
@@ -5223,9 +5223,9 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
     }
     else
     {
-        // No-security / legacy unencrypted path
+        // No-crypto / legacy unencrypted path
         if (!packet->PeekPacketTag(commandTag)) return;
-        if (!g_secEnabled)
+        if (!CryptoMechanismActive())
             std::cout << "[Latency] CTRL2RSU_CMD  rsu_edge/" << receiverId
                       << "  decrypt  0.000\n";
     }
@@ -5725,6 +5725,27 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     MetricsOnTransmitForMessage(static_cast<uint32_t>(CHAN_HELLO), 1);
 }
 
+static void
+StartCryptoVehicleRsuSession(uint32_t vehicleIndex, uint32_t rsuIndex)
+{
+    switch (GetCryptoMechanismMode())
+    {
+    case CRYPTO_MECHANISM_LIGHTWEIGHT:
+        SendChanHello(vehicleIndex, rsuIndex);
+        break;
+
+    case CRYPTO_MECHANISM_FULL:
+        std::cout << "[Security] Full-mode V-RSU crypto handshake is not implemented yet"
+                  << " Vehicle=" << vehicleIndex
+                  << " RSU=" << rsuIndex << "\n";
+        break;
+
+    case CRYPTO_MECHANISM_OFF:
+    default:
+        break;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EnsureVehicleRsuSession — on-demand V-RSU secure channel creation.
 //
@@ -5735,7 +5756,7 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
 static bool
 EnsureVehicleRsuSession(uint32_t vehicleIndex, uint32_t rsuIndex, const std::string& reason)
 {
-    if (!g_secEnabled) return true;  // no session needed in plain-network mode
+    if (!CryptoMechanismActive()) return true;  // no session needed in plain-network mode
     if (vehicleIndex >= g_vehicleChannelState.size() || rsuIndex >= N_RSUs)
         return false;
 
@@ -5758,7 +5779,7 @@ EnsureVehicleRsuSession(uint32_t vehicleIndex, uint32_t rsuIndex, const std::str
               << " RSU=" << rsuIndex
               << " reason=" << reason
               << " — starting CHAN_HELLO on demand\n";
-    Simulator::ScheduleNow(&SendChanHello, vehicleIndex, rsuIndex);
+    Simulator::ScheduleNow(&StartCryptoVehicleRsuSession, vehicleIndex, rsuIndex);
     return false;
 }
 
@@ -6216,13 +6237,13 @@ LogReceivedPacket(const std::string& receiverRole,
         tag.GetMessageType() == static_cast<uint32_t>(RSU2VEHICLE_COMMAND) &&
         receiverRole == "vehicle")
     {
-        // ── No-security path ───────────────────────────────────────────────
-        if (!g_secEnabled)
+        // ── No-crypto path ───────────────────────────────────────────────
+        if (!CryptoMechanismActive())
         {
             std::cout << "[Latency] RSU2VEH_CMD  vehicle/" << receiverId
                       << "  decrypt  0.000\n";
         }
-        else
+        else if (LightweightCryptoMechanismActive())
         {
         RsuVehicleSecureTag envTag;
         if (packet->PeekPacketTag(envTag))
@@ -6271,7 +6292,7 @@ LogReceivedPacket(const std::string& receiverRole,
                 }
             }
         }
-        } // end g_secEnabled
+        } // end crypto enabled
     }
 
     // --- Early decryption pass for encrypted V2RSU reports ---
@@ -6289,8 +6310,8 @@ LogReceivedPacket(const std::string& receiverRole,
         uint32_t vId = tag.GetRealNodeId();
         uint32_t rId = receiverId;
 
-        // ── No-security path: accept plaintext report directly ───────────────
-        if (!g_secEnabled)
+        // ── No-crypto path: accept plaintext report directly ───────────────
+        if (!CryptoMechanismActive())
         {
             uint32_t payloadSz = packet->GetSize();
             std::vector<uint8_t> plain(payloadSz);
@@ -6311,9 +6332,9 @@ LogReceivedPacket(const std::string& receiverRole,
                 tokenAccepted      = true;
             }
         }
-        else
+        else if (LightweightCryptoMechanismActive())
         {
-        // ── Security ON: decrypt + token auth ───────────────────────────────
+        // ── Lightweight crypto ON: decrypt + token auth ─────────────────────
         SecureChannelTag scTag;
         if (packet->PeekPacketTag(scTag))
         {
@@ -6410,7 +6431,7 @@ LogReceivedPacket(const std::string& receiverRole,
                 }
             }
         }
-        } // end g_secEnabled
+        } // end lightweight crypto enabled
     }
 
     // Edge aggregation: count V2RSU_REPORTs reaching each RSU.
@@ -6515,7 +6536,7 @@ LogReceivedPacket(const std::string& receiverRole,
             std::vector<uint8_t> hash     = CryptoSha256(payload);
             std::vector<uint8_t> pubKey(sigTag.pub_key, sigTag.pub_key + 64);
             std::vector<uint8_t> sigBytes(sigTag.sig,   sigTag.sig     + 64);
-            if (g_secEnabled)
+            if (LightweightCryptoMechanismActive())
             {
                 auto __t0 = std::chrono::high_resolution_clock::now();
                 v2vSigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
@@ -6551,7 +6572,7 @@ LogReceivedPacket(const std::string& receiverRole,
                           << std::endl;
             }
         }
-        else if (!g_secEnabled)
+        else if (!CryptoMechanismActive())
         {
             // No signature tag in plain-network mode — log 0.000 verify latency.
             std::cout << "[Latency] V2V_BEACON  vehicle/" << receiverId
@@ -6761,8 +6782,8 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
                            static_cast<uint32_t>(RSU2CONTROLLER_REPORT),
                            sequenceNumber);
 
-    // ── Encrypted path: pre-shared key established ────────────────────────
-    if (g_secEnabled &&
+    // ── Lightweight encrypted path: pre-shared key established ────────────
+    if (LightweightCryptoMechanismActive() &&
         rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
     {
         uint32_t tagSz = batchTag.GetSerializedSize();
@@ -6805,13 +6826,16 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
         return;
     }
 
-    // ── Plaintext path (no-security or no key loaded) ─────────────────────
-    if (!g_secEnabled)
+    // ── Plaintext path (no crypto or no lightweight key loaded) ───────────
+    if (!CryptoMechanismActive())
         std::cout << "[Latency] RSU2CTRL_REPORT  rsu_edge/" << rsuIndex
                   << "  encrypt  0.000\n";
-    else
+    else if (LightweightCryptoMechanismActive())
         std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
                   << "; sending unencrypted RSU→Controller report.\n";
+    else
+        std::cerr << "[Security] WARNING: Full-mode RSU→Controller crypto is not implemented; "
+                  << "sending unencrypted report for now.\n";
     Ptr<Packet> packet = Create<Packet>(260 + batchTag.GetRecordCount() * 144);
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(batchTag);
@@ -6835,8 +6859,8 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
                                        target.claimedVehicleId,
                                        Simulator::Now().GetSeconds());
 
-    // ── Encrypted path ─────────────────────────────────────────────────────
-    if (g_secEnabled &&
+    // ── Lightweight encrypted path ────────────────────────────────────────
+    if (LightweightCryptoMechanismActive() &&
         rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
     {
         uint32_t tagSz = commandTag.GetSerializedSize();
@@ -6878,13 +6902,16 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
         return;
     }
 
-    // ── Plaintext path (no-security or no key loaded) ─────────────────────
-    if (!g_secEnabled)
+    // ── Plaintext path (no crypto or no lightweight key loaded) ───────────
+    if (!CryptoMechanismActive())
         std::cout << "[Latency] CTRL2RSU_CMD  sdn_controller/0"
                   << "  encrypt  0.000\n";
-    else
+    else if (LightweightCryptoMechanismActive())
         std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
                   << "; sending unencrypted Controller→RSU command.\n";
+    else
+        std::cerr << "[Security] WARNING: Full-mode Controller→RSU crypto is not implemented; "
+                  << "sending unencrypted command for now.\n";
     Ptr<Packet> packet = Create<Packet>(140);
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(commandTag);
@@ -6914,8 +6941,8 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
                        static_cast<uint32_t>(V2RSU_REPORT), sequenceNumber,
                        position.x, position.y, position.z);
 
-    // ── No-security path: send plaintext report directly ─────────────────
-    if (!g_secEnabled)
+    // ── No-crypto path: send plaintext report directly ───────────────────
+    if (!CryptoMechanismActive())
     {
         uint32_t reportSz = report.GetSerializedSize();
         std::vector<uint8_t> plaintext(33 + reportSz, 0);
@@ -6934,7 +6961,15 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
         return;
     }
 
-    // ── Encrypted path: session key is established ────────────────────────
+    if (FullCryptoMechanismActive())
+    {
+        std::cerr << "[Security] Full-mode V2RSU report crypto is not implemented; "
+                  << "holding report vehicle=" << vehicleIndex
+                  << " rsu=" << rsuIndex << "\n";
+        return;
+    }
+
+    // ── Lightweight encrypted path: session key is established ────────────
     auto& chanState = g_vehicleChannelState[vehicleIndex];
     if (chanState.HasSession(rsuIndex))
     {
@@ -7394,8 +7429,8 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
               << " -> Vehicle=" << vehicleIndex
               << " Source=" << source << std::endl;
 
-    // ── No-security path ─────────────────────────────────────────────────
-    if (!g_secEnabled)
+    // ── No-crypto path ───────────────────────────────────────────────────
+    if (!CryptoMechanismActive())
     {
         std::cout << "[Latency] RSU2VEH_CMD  rsu_edge/" << rsuIndex
                   << "  encrypt  0.000\n";
@@ -7406,7 +7441,15 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
         return;
     }
 
-    // ── Encrypted path: use session key if established ────────────────────
+    if (FullCryptoMechanismActive())
+    {
+        std::cerr << "[Security] Full-mode RSU→Vehicle command crypto is not implemented; "
+                  << "holding command RSU=" << rsuIndex
+                  << " vehicle=" << vehicleIndex << "\n";
+        return;
+    }
+
+    // ── Lightweight encrypted path: use session key if established ────────
     if (rsuIndex < g_rsuSessionKeys.size())
     {
         auto keyIt = g_rsuSessionKeys[rsuIndex].find(vehicleIndex);
@@ -8079,7 +8122,7 @@ main(int argc, char* argv[])
     // Later handovers are handled on demand inside SendV2RsuAwarenessPacket(),
     // which starts CHAN_HELLO and holds the report until a session exists.
     
-    if (g_secEnabled)
+    if (CryptoMechanismActive())
     {
     for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
     {
@@ -8088,7 +8131,7 @@ main(int argc, char* argv[])
 
         uint32_t r = FindNearestRsu(i);
         double t_hello = 0.5 + 0.04 * i;
-        Simulator::Schedule(Seconds(t_hello), &SendChanHello, i, r);
+        Simulator::Schedule(Seconds(t_hello), &StartCryptoVehicleRsuSession, i, r);
 
     }
     }
