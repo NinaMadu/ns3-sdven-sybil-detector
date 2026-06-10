@@ -86,6 +86,8 @@ double vehicleNeighborTimeout = 3.0;         ///< Expire vehicle neighbor record
 double rsuAwarenessTimeout = 5.0;            ///< Expire RSU awareness rows/aggregates after silence.
 double controllerAwarenessTimeout = 8.0;     ///< Expire SDN global awareness records after silence.
 double channelHandshakeTimeout = 1.0;        ///< Retry V2RSU CHAN_HELLO after pending timeout.
+double cloudPresenceSyncInterval = 1.0;      ///< Seconds between controller cache syncs from cloud presence table.
+double cloudPresenceTimeout = 8.0;           ///< Seconds before global vehicle presence rows expire.
 bool boundedRoadMobility = true;             ///< Keep vehicles inside a bounded road corridor.
 uint32_t mobility_mode = 2;                  ///< 1=test, 2=programmed road, 3-5=SUMO/ns-2 traces.
 double roadStartX = 20.0;                    ///< Road corridor start x-coordinate.
@@ -241,6 +243,8 @@ std::vector<std::vector<uint8_t>> g_rsuCtrlSharedKeys;
 // Per-direction replay-protection counters for the RSU↔Controller channel.
 std::vector<uint32_t> g_rsuCtrlTxSeqNums;   // RSU→Controller, per RSU
 std::vector<uint32_t> g_ctrlRsuTxSeqNums;   // Controller→RSU, per RSU
+std::vector<std::vector<std::vector<uint8_t> > > g_controllerSharedKeys;
+std::vector<std::vector<uint32_t> > g_controllerTxSeqNums;
 
 // Registration / token infrastructure globals.
 std::vector<uint8_t>                                          g_tokenMasterKey;
@@ -332,9 +336,24 @@ struct ControllerCommandTarget
     double   issuedTime      = 0.0;
 };
 
+struct VehiclePresenceRow
+{
+    uint32_t vehicleId = 0;
+    uint32_t realVehicleId = 0;
+    uint32_t servingRsuId = 0;
+    uint32_t servingControllerId = 0;
+    double lastSeenTime = 0.0;
+    Vector lastPosition;
+    bool tokenValid = true;
+    bool online = true;
+    uint32_t updatedByControllerId = 0;
+};
+
 static std::vector<std::map<uint32_t, RsuVehicleRecord> > g_rsuVehicleTables;
 static std::map<uint32_t, ControllerVehicleRecord> g_controllerVehicleTable;
 static std::vector<ControllerCommandTarget> g_controllerCommandTargets;
+static std::map<uint32_t, VehiclePresenceRow> g_cloudVehiclePresenceTable;
+static std::vector<std::map<uint32_t, VehiclePresenceRow> > g_controllerPresenceCaches;
 static std::vector<std::map<uint32_t, NeighborAwarenessRecord> > g_vehicleNeighborTables;
 static std::vector<std::map<uint32_t, std::vector<RsuVehicleObservationRow> > > g_rsuVehicleObservationTables;
 static std::vector<std::map<uint32_t, RsuRegionalAwarenessRecord> > g_rsuRegionalAwarenessTables;
@@ -4198,6 +4217,153 @@ PurgeStaleControllerGlobalAwarenessRecords()
     }
 }
 
+static ControllerVehicleRecord
+PresenceRowToControllerVehicleRecord(const VehiclePresenceRow& row)
+{
+    ControllerVehicleRecord record;
+    record.realVehicleId = row.realVehicleId;
+    record.claimedVehicleId = row.vehicleId;
+    record.servingRsuId = row.servingRsuId;
+    record.lastSeenTime = row.lastSeenTime;
+    record.lastPosition = row.lastPosition;
+    record.distanceToRsu = 0.0;
+    return record;
+}
+
+static void
+PurgeStaleCloudPresenceRows()
+{
+    double now = Simulator::Now().GetSeconds();
+    for (auto it = g_cloudVehiclePresenceTable.begin();
+         it != g_cloudVehiclePresenceTable.end(); )
+    {
+        if (now - it->second.lastSeenTime > cloudPresenceTimeout)
+        {
+            std::cout << "[CloudPresence] expired vehicle=" << it->first
+                      << " last_rsu=" << it->second.servingRsuId
+                      << " last_controller=" << it->second.servingControllerId
+                      << " age=" << (now - it->second.lastSeenTime)
+                      << std::endl;
+            it = g_cloudVehiclePresenceTable.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    for (uint32_t controllerId = 0;
+         controllerId < g_controllerPresenceCaches.size();
+         ++controllerId)
+    {
+        auto& cache = g_controllerPresenceCaches[controllerId];
+        for (auto it = cache.begin(); it != cache.end(); )
+        {
+            if (now - it->second.lastSeenTime > cloudPresenceTimeout)
+                it = cache.erase(it);
+            else
+                ++it;
+        }
+    }
+}
+
+static void
+UpdateCloudPresenceRow(const VehiclePresenceRow& row)
+{
+    if (g_controllerPresenceCaches.size() < N_Controllers)
+        g_controllerPresenceCaches.resize(N_Controllers);
+
+    auto existing = g_cloudVehiclePresenceTable.find(row.vehicleId);
+    bool isNew = (existing == g_cloudVehiclePresenceTable.end());
+    if (isNew || row.lastSeenTime >= existing->second.lastSeenTime)
+    {
+        g_cloudVehiclePresenceTable[row.vehicleId] = row;
+        if (row.updatedByControllerId < g_controllerPresenceCaches.size())
+            g_controllerPresenceCaches[row.updatedByControllerId][row.vehicleId] = row;
+
+        std::cout << "[CloudPresence] "
+                  << (isNew ? "insert" : "update")
+                  << " vehicle=" << row.vehicleId
+                  << " real=" << row.realVehicleId
+                  << " rsu=" << row.servingRsuId
+                  << " controller=" << row.servingControllerId
+                  << " last_seen=" << row.lastSeenTime
+                  << std::endl;
+    }
+}
+
+static void
+UpdateCloudPresenceFromGlobalAwareness(const ControllerGlobalAwarenessRecord& record,
+                                       uint32_t receivingControllerId,
+                                       bool tokenValid)
+{
+    VehiclePresenceRow row;
+    row.vehicleId = record.claimedVehicleId;
+    row.realVehicleId = record.realVehicleId;
+    row.servingRsuId = record.lastServingRsuId;
+    row.servingControllerId = GetControllerIndexForRsu(record.lastServingRsuId);
+    row.lastSeenTime = record.lastSeenTime;
+    row.lastPosition = Vector(record.lastBsm.positionX,
+                              record.lastBsm.positionY,
+                              record.lastBsm.positionZ);
+    row.tokenValid = tokenValid;
+    row.online = true;
+    row.updatedByControllerId = receivingControllerId;
+    UpdateCloudPresenceRow(row);
+}
+
+static void
+UpdateCloudPresenceFromControllerRecord(const ControllerVehicleRecord& record,
+                                        uint32_t receivingControllerId,
+                                        bool tokenValid)
+{
+    VehiclePresenceRow row;
+    row.vehicleId = record.claimedVehicleId;
+    row.realVehicleId = record.realVehicleId;
+    row.servingRsuId = record.servingRsuId;
+    row.servingControllerId = GetControllerIndexForRsu(record.servingRsuId);
+    row.lastSeenTime = record.lastSeenTime;
+    row.lastPosition = record.lastPosition;
+    row.tokenValid = tokenValid;
+    row.online = true;
+    row.updatedByControllerId = receivingControllerId;
+    UpdateCloudPresenceRow(row);
+}
+
+static void
+SyncControllerPresenceCacheFromCloud(uint32_t controllerId)
+{
+    if (controllerId >= N_Controllers)
+        return;
+    if (g_controllerPresenceCaches.size() < N_Controllers)
+        g_controllerPresenceCaches.resize(N_Controllers);
+
+    PurgeStaleCloudPresenceRows();
+
+    uint32_t copied = 0;
+    auto& cache = g_controllerPresenceCaches[controllerId];
+    for (auto it = g_cloudVehiclePresenceTable.begin();
+         it != g_cloudVehiclePresenceTable.end();
+         ++it)
+    {
+        cache[it->first] = it->second;
+        ++copied;
+    }
+
+    std::cout << "[ControllerPresenceSync] controller=" << controllerId
+              << " cached_rows=" << copied
+              << " cloud_rows=" << g_cloudVehiclePresenceTable.size()
+              << std::endl;
+
+    if (cloudPresenceSyncInterval > 0.0 &&
+        Simulator::Now().GetSeconds() + cloudPresenceSyncInterval <= simTime)
+    {
+        Simulator::Schedule(Seconds(cloudPresenceSyncInterval),
+                            &SyncControllerPresenceCacheFromCloud,
+                            controllerId);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BuildCtrlAad — 12-byte AAD for the RSU↔Controller AES-256-GCM channel.
 //   rsuId:     RSU endpoint identifier (big-endian 4 bytes)
@@ -4218,6 +4384,57 @@ BuildCtrlAad(uint32_t rsuId, uint32_t direction, uint32_t seqNum)
     aad[8]  = (seqNum    >> 24) & 0xFF; aad[9]  = (seqNum    >> 16) & 0xFF;
     aad[10] = (seqNum    >>  8) & 0xFF; aad[11] =  seqNum           & 0xFF;
     return aad;
+}
+
+static std::vector<uint8_t>
+BuildControllerAad(uint32_t srcControllerId, uint32_t dstControllerId, uint32_t seqNum)
+{
+    std::vector<uint8_t> aad(12);
+    aad[0]  = (srcControllerId >> 24) & 0xFF; aad[1]  = (srcControllerId >> 16) & 0xFF;
+    aad[2]  = (srcControllerId >>  8) & 0xFF; aad[3]  =  srcControllerId        & 0xFF;
+    aad[4]  = (dstControllerId >> 24) & 0xFF; aad[5]  = (dstControllerId >> 16) & 0xFF;
+    aad[6]  = (dstControllerId >>  8) & 0xFF; aad[7]  =  dstControllerId        & 0xFF;
+    aad[8]  = (seqNum          >> 24) & 0xFF; aad[9]  = (seqNum          >> 16) & 0xFF;
+    aad[10] = (seqNum          >>  8) & 0xFF; aad[11] =  seqNum                 & 0xFF;
+    return aad;
+}
+
+static void
+InitializeControllerSharedKeys()
+{
+    g_controllerSharedKeys.assign(
+        N_Controllers,
+        std::vector<std::vector<uint8_t> >(N_Controllers, std::vector<uint8_t>()));
+    g_controllerTxSeqNums.assign(
+        N_Controllers,
+        std::vector<uint32_t>(N_Controllers, 0u));
+
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < N_Controllers; ++i)
+    {
+        for (uint32_t j = i + 1; j < N_Controllers; ++j)
+        {
+            std::vector<uint8_t> material = g_tokenMasterKey;
+            const char label[] = "controller-controller-lightweight-key";
+            material.insert(material.end(), label, label + sizeof(label) - 1);
+            material.push_back((i >> 24) & 0xFF);
+            material.push_back((i >> 16) & 0xFF);
+            material.push_back((i >>  8) & 0xFF);
+            material.push_back( i        & 0xFF);
+            material.push_back((j >> 24) & 0xFF);
+            material.push_back((j >> 16) & 0xFF);
+            material.push_back((j >>  8) & 0xFF);
+            material.push_back( j        & 0xFF);
+
+            std::vector<uint8_t> key = CryptoSha256(material);
+            g_controllerSharedKeys[i][j] = key;
+            g_controllerSharedKeys[j][i] = key;
+            loaded += 2;
+        }
+    }
+
+    std::cout << "[Security] Controller↔Controller shared keys ready for "
+              << loaded << " directed controller links.\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -4270,9 +4487,46 @@ BuildCtrlVehicleAad(uint32_t vehicleId, uint32_t seqNum)
     return aad;
 }
 
+static void SendControllerRsuCommandPacket(Ptr<Socket> socket,
+                                           Ipv4Address destinationIp,
+                                           uint32_t rsuIndex,
+                                           const ControllerVehicleRecord& target,
+                                           uint32_t sequenceNumber);
+static void SendControllerControllerCommand(uint32_t srcControllerId,
+                                            uint32_t dstControllerId,
+                                            uint32_t targetRsuId,
+                                            const ControllerVehicleRecord& target,
+                                            uint32_t sequenceNumber);
+
 static bool
 SelectControllerTargetForRsu(uint32_t rsuIndex, ControllerVehicleRecord& target)
 {
+    PurgeStaleCloudPresenceRows();
+    uint32_t controllerIndex = GetControllerIndexForRsu(rsuIndex);
+    if (controllerIndex < g_controllerPresenceCaches.size())
+    {
+        bool foundInPresenceCache = false;
+        double newestPresence = -1.0;
+        const auto& cache = g_controllerPresenceCaches[controllerIndex];
+        for (auto it = cache.begin(); it != cache.end(); ++it)
+        {
+            const VehiclePresenceRow& row = it->second;
+            if (row.online &&
+                row.tokenValid &&
+                row.servingRsuId == rsuIndex &&
+                row.realVehicleId < g_vehicleNodes.GetN() &&
+                (!foundInPresenceCache || row.lastSeenTime > newestPresence))
+            {
+                target = PresenceRowToControllerVehicleRecord(row);
+                newestPresence = row.lastSeenTime;
+                foundInPresenceCache = true;
+            }
+        }
+
+        if (foundInPresenceCache)
+            return true;
+    }
+
     PurgeStaleControllerVehicleRecords();
 
     bool found = false;
@@ -5380,6 +5634,84 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
 
     uint32_t msgType = tag.GetMessageType();
 
+    if (msgType == static_cast<uint32_t>(CONTROLLER2CONTROLLER_COMMAND))
+    {
+        ControllerSecureTag c2cTag;
+        if (!packet->PeekPacketTag(c2cTag))
+        {
+            std::cerr << "[Security] CTRL2CTRL: missing ControllerSecureTag\n";
+            return;
+        }
+        uint32_t src = c2cTag.srcControllerId;
+        uint32_t dst = c2cTag.dstControllerId;
+        if (src >= N_Controllers ||
+            dst >= N_Controllers ||
+            src >= g_controllerSharedKeys.size() ||
+            dst >= g_controllerSharedKeys[src].size() ||
+            g_controllerSharedKeys[src][dst].empty())
+        {
+            std::cerr << "[Security] CTRL2CTRL: no shared key src=" << src
+                      << " dst=" << dst << "\n";
+            return;
+        }
+
+        std::vector<uint8_t> iv(c2cTag.iv, c2cTag.iv + 12);
+        std::vector<uint8_t> aad = BuildControllerAad(src, dst, c2cTag.seqNum);
+        uint32_t pktSz = packet->GetSize();
+        std::vector<uint8_t> enc(pktSz);
+        packet->CopyData(enc.data(), pktSz);
+
+        auto __t0 = std::chrono::high_resolution_clock::now();
+        std::vector<uint8_t> plain =
+            CryptoAesGcmDecrypt(g_controllerSharedKeys[src][dst], iv, enc, aad);
+        auto __t1 = std::chrono::high_resolution_clock::now();
+        double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+        std::cout << "[Latency] CTRL2CTRL_CMD  sdn_controller/" << dst
+                  << "  decrypt  " << __ms << "\n";
+        if (plain.size() < 4)
+        {
+            std::cerr << "[Security] CTRL2CTRL GCM auth FAILED or payload too short"
+                      << " src=" << src << " dst=" << dst << "\n";
+            return;
+        }
+
+        TagBuffer tb(plain.data(), plain.data() + plain.size());
+        uint32_t targetRsuId = tb.ReadU32();
+        ControllerRsuCommandTag commandTag;
+        commandTag.Deserialize(tb);
+        if (targetRsuId >= N_RSUs || GetControllerIndexForRsu(targetRsuId) != dst)
+        {
+            std::cerr << "[Security] CTRL2CTRL: invalid forwarded RSU target="
+                      << targetRsuId << " for dst controller=" << dst << "\n";
+            return;
+        }
+
+        ControllerVehicleRecord target;
+        target.realVehicleId = commandTag.GetRealVehicleId();
+        target.claimedVehicleId = commandTag.GetClaimedVehicleId();
+        target.servingRsuId = targetRsuId;
+        target.lastSeenTime = commandTag.GetIssuedTime();
+        auto cacheIt = (dst < g_controllerPresenceCaches.size())
+            ? g_controllerPresenceCaches[dst].find(commandTag.GetClaimedVehicleId())
+            : std::map<uint32_t, VehiclePresenceRow>::iterator();
+        if (dst < g_controllerPresenceCaches.size() &&
+            cacheIt != g_controllerPresenceCaches[dst].end())
+        {
+            target = PresenceRowToControllerVehicleRecord(cacheIt->second);
+        }
+
+        Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(dst));
+        Ipv4Address rsuIp = g_wiredInterfaces.GetAddress(targetRsuId);
+        std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+                  << "[SEND] [CTRL2CTRL_FORWARD_DELIVER] "
+                  << "Controller=" << dst
+                  << " -> RSU=" << targetRsuId
+                  << " TargetVehicle=" << target.realVehicleId
+                  << " FromController=" << src << std::endl;
+        SendControllerRsuCommandPacket(sock, rsuIp, targetRsuId, target, g_seq++);
+        return;
+    }
+
     if (msgType == static_cast<uint32_t>(RSU2CONTROLLER_REPORT))
     {
         // ── Encrypted path: CtrlSecureTag present (direction == 0 = RSU→CTRL) ──
@@ -5418,6 +5750,7 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             batchTag.Deserialize(dtb);
             std::cout << "[Security] RSU2CTRL decrypted OK RSU=" << rIdx
                       << " records=" << batchTag.GetRecordCount() << "\n";
+            uint32_t receivingControllerId = GetControllerIndexForRsu(rIdx);
 
             PurgeStaleControllerGlobalAwarenessRecords();
             for (uint32_t n = 0; n < batchTag.GetRecordCount(); ++n)
@@ -5458,6 +5791,10 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                         isNew ? "global_awareness_learned" : "global_awareness_updated",
                         g_controllerGlobalAwarenessTable[incoming.claimedVehicleId],
                         "rsu_batch_awareness_payload_encrypted", triggerSeq);
+                    UpdateCloudPresenceFromGlobalAwareness(
+                        g_controllerGlobalAwarenessTable[incoming.claimedVehicleId],
+                        receivingControllerId,
+                        true);
                 }
             }
             return;
@@ -5548,6 +5885,10 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                         g_controllerGlobalAwarenessTable[incoming.claimedVehicleId],
                         "rsu_batch_awareness_payload",
                         triggerSeq);
+                    UpdateCloudPresenceFromGlobalAwareness(
+                        g_controllerGlobalAwarenessTable[incoming.claimedVehicleId],
+                        GetControllerIndexForRsu(p.servingRsuId),
+                        true);
                 }
             }
             return;
@@ -5622,6 +5963,10 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                                                  g_controllerGlobalAwarenessTable[incoming.claimedVehicleId],
                                                  "rsu_regional_awareness_payload",
                                                  triggerSeq);
+                UpdateCloudPresenceFromGlobalAwareness(
+                    g_controllerGlobalAwarenessTable[incoming.claimedVehicleId],
+                    GetControllerIndexForRsu(incoming.lastServingRsuId),
+                    true);
             }
             return;
         }
@@ -5639,6 +5984,10 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             g_controllerVehicleTable[record.claimedVehicleId] = record;
             LogControllerVehicleTableEvent("global_view_updated",
                                            record, false, "packet_payload_received", triggerSeq);
+            UpdateCloudPresenceFromControllerRecord(
+                record,
+                GetControllerIndexForRsu(record.servingRsuId),
+                true);
         }
     }
     else if (msgType == static_cast<uint32_t>(SYBIL_INJECTION))
@@ -5665,6 +6014,10 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             g_controllerVehicleTable[phantomId] = phantom;
             LogControllerVehicleTableEvent("global_view_updated",
                                            phantom, false, "phantom_from_malicious_rsu");
+            UpdateCloudPresenceFromControllerRecord(
+                phantom,
+                GetControllerIndexForRsu(reportingRsuId),
+                false);
         }
     }
     else if (msgType == static_cast<uint32_t>(V2CTRL_HELLO))
@@ -7934,6 +8287,93 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
 }
 
 static void
+SendControllerControllerCommand(uint32_t srcControllerId,
+                                uint32_t dstControllerId,
+                                uint32_t targetRsuId,
+                                const ControllerVehicleRecord& target,
+                                uint32_t sequenceNumber)
+{
+    if (srcControllerId >= N_Controllers ||
+        dstControllerId >= N_Controllers ||
+        srcControllerId == dstControllerId)
+    {
+        return;
+    }
+    if (srcControllerId >= g_controllerNode.GetN() ||
+        dstControllerId >= g_controllerNode.GetN())
+    {
+        return;
+    }
+    if (srcControllerId >= g_controllerSharedKeys.size() ||
+        dstControllerId >= g_controllerSharedKeys[srcControllerId].size() ||
+        g_controllerSharedKeys[srcControllerId][dstControllerId].empty())
+    {
+        std::cerr << "[Security] CTRL2CTRL: no shared key src=" << srcControllerId
+                  << " dst=" << dstControllerId << "\n";
+        return;
+    }
+
+    ControllerRsuCommandTag commandTag(target.realVehicleId,
+                                       target.claimedVehicleId,
+                                       Simulator::Now().GetSeconds());
+    uint32_t commandSz = commandTag.GetSerializedSize();
+    std::vector<uint8_t> plaintext(4 + commandSz, 0);
+    TagBuffer tb(plaintext.data(), plaintext.data() + plaintext.size());
+    tb.WriteU32(targetRsuId);
+    commandTag.Serialize(tb);
+
+    uint32_t seq = g_controllerTxSeqNums[srcControllerId][dstControllerId]++;
+    std::vector<uint8_t> iv = CryptoRandBytes(12);
+    std::vector<uint8_t> aad = BuildControllerAad(srcControllerId, dstControllerId, seq);
+
+    auto __t0 = std::chrono::high_resolution_clock::now();
+    std::vector<uint8_t> ciphertext =
+        CryptoAesGcmEncrypt(g_controllerSharedKeys[srcControllerId][dstControllerId],
+                            iv,
+                            plaintext,
+                            aad);
+    auto __t1 = std::chrono::high_resolution_clock::now();
+    double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+    std::cout << "[Latency] CTRL2CTRL_CMD  sdn_controller/" << srcControllerId
+              << "  encrypt  " << __ms << "\n";
+    if (ciphertext.empty())
+    {
+        std::cerr << "[Security] CTRL2CTRL encrypt failed src=" << srcControllerId
+                  << " dst=" << dstControllerId << "\n";
+        return;
+    }
+
+    uint32_t srcNodeId = N_Vehicles + N_RSUs + srcControllerId;
+    SybilPacketTag baseTag(srcNodeId,
+                           srcNodeId,
+                           dstControllerId,
+                           static_cast<uint32_t>(CONTROLLER2CONTROLLER_COMMAND),
+                           sequenceNumber);
+    ControllerSecureTag c2cTag;
+    c2cTag.srcControllerId = srcControllerId;
+    c2cTag.dstControllerId = dstControllerId;
+    c2cTag.seqNum = seq;
+    std::memcpy(c2cTag.iv, iv.data(), 12);
+
+    Ptr<Packet> packet = Create<Packet>(ciphertext.data(), ciphertext.size());
+    packet->AddPacketTag(baseTag);
+    packet->AddPacketTag(c2cTag);
+
+    Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(srcControllerId));
+    Ipv4Address dstIp =
+        g_wiredInterfaces.GetAddress(GetControllerWiredInterfaceIndex(dstControllerId));
+    sock->SendTo(packet, 0, InetSocketAddress(dstIp, CONTROLLER_PORT));
+    MetricsOnTransmitForMessage(static_cast<uint32_t>(CONTROLLER2CONTROLLER_COMMAND), 1);
+
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [CONTROLLER2CONTROLLER_COMMAND] "
+              << "Controller=" << srcControllerId
+              << " -> Controller=" << dstControllerId
+              << " -> RSU=" << targetRsuId
+              << " TargetVehicle=" << target.realVehicleId << std::endl;
+}
+
+static void
 SendV2RsuAwarenessPacket(Ptr<Socket> socket,
                          Ipv4Address destinationIp,
                          uint32_t destinationPort,
@@ -8318,18 +8758,37 @@ SendControllerRsuCommand(uint32_t rsuIndex)
 
     if (hasTarget)
     {
+        uint32_t targetController = GetControllerIndexForRsu(target.servingRsuId);
         std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                   << "[SEND] [CONTROLLER2RSU_COMMAND]  "
                   << "Controller=" << controllerIndex
                   << " Seq=" << g_seq
                   << " -> RSU=" << rsuIndex
                   << " TargetVehicle=" << target.realVehicleId
-                  << " TargetClaimed=" << target.claimedVehicleId << std::endl;
+                  << " TargetClaimed=" << target.claimedVehicleId
+                  << " Path=cloud_cache:C" << controllerIndex
+                  << "->C" << targetController
+                  << "->RSU" << target.servingRsuId
+                  << "->Vehicle" << target.realVehicleId
+                  << std::endl;
         LogControllerVehicleTableEvent("command_issued",
                                        target,
                                        true,
-                                       "payload_sent_to_serving_rsu");
-        SendControllerRsuCommandPacket(sock, rsuIp, rsuIndex, target, g_seq++);
+                                       (targetController == controllerIndex)
+                                           ? "payload_sent_to_serving_rsu"
+                                           : "payload_forwarded_to_remote_controller");
+        if (targetController == controllerIndex)
+        {
+            SendControllerRsuCommandPacket(sock, rsuIp, rsuIndex, target, g_seq++);
+        }
+        else
+        {
+            SendControllerControllerCommand(controllerIndex,
+                                            targetController,
+                                            target.servingRsuId,
+                                            target,
+                                            g_seq++);
+        }
         return;
     }
 
@@ -8713,6 +9172,8 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("vehicleNeighborTimeout",          vehicleNeighborTimeout);
     getDouble("rsuAwarenessTimeout",             rsuAwarenessTimeout);
     getDouble("controllerAwarenessTimeout",      controllerAwarenessTimeout);
+    getDouble("cloudPresenceSyncInterval",       cloudPresenceSyncInterval);
+    getDouble("cloudPresenceTimeout",            cloudPresenceTimeout);
     getDouble("channelHandshakeTimeout",         channelHandshakeTimeout);
     getUint  ("mobility_mode",                   mobility_mode);
     getBool  ("boundedRoadMobility",             boundedRoadMobility);
@@ -8802,6 +9263,8 @@ main(int argc, char* argv[])
     cmd.AddValue("vehicleNeighborTimeout",     "Seconds before a vehicle expires a neighbor record",vehicleNeighborTimeout);
     cmd.AddValue("rsuAwarenessTimeout",        "Seconds before an RSU expires awareness rows/aggregates",rsuAwarenessTimeout);
     cmd.AddValue("controllerAwarenessTimeout", "Seconds before controller expires global awareness",controllerAwarenessTimeout);
+    cmd.AddValue("cloudPresenceSyncInterval",  "Seconds between controller cache syncs from cloud presence table",cloudPresenceSyncInterval);
+    cmd.AddValue("cloudPresenceTimeout",       "Seconds before cloud vehicle presence rows expire",cloudPresenceTimeout);
     cmd.AddValue("channelHandshakeTimeout",    "Seconds before retrying a pending V2RSU channel handshake",channelHandshakeTimeout);
     cmd.AddValue("mobility_mode",              "Mobility mode: 1=test 2=programmed road 3=SUMO trace1 4=SUMO trace2 5=SUMO trace3",mobility_mode);
     cmd.AddValue("boundedRoadMobility",        "Keep vehicles inside a bounded multi-lane road corridor",boundedRoadMobility);
@@ -8857,6 +9320,8 @@ main(int argc, char* argv[])
     g_rsuVehicleTables.assign(N_RSUs, std::map<uint32_t, RsuVehicleRecord>());
     g_controllerVehicleTable.clear();
     g_controllerCommandTargets.assign(N_RSUs, ControllerCommandTarget());
+    g_cloudVehiclePresenceTable.clear();
+    g_controllerPresenceCaches.assign(N_Controllers, std::map<uint32_t, VehiclePresenceRow>());
     g_rsuReportCount.assign(N_RSUs, 0u);
     ResetAwarenessTables();
 
@@ -8874,6 +9339,7 @@ main(int argc, char* argv[])
     LoadControllerSigningKey();
     // Load vehicle VINs, VIN whitelist, and token master key.
     LoadVinData();
+    InitializeControllerSharedKeys();
 
 
 
@@ -9236,6 +9702,16 @@ main(int argc, char* argv[])
         {
             Simulator::Schedule(Seconds(0.25 + 0.02 * i),
                                 &SyncRsuTokenCommitmentsFromIpfs,
+                                i);
+        }
+    }
+
+    if (cloudPresenceSyncInterval > 0.0)
+    {
+        for (uint32_t i = 0; i < g_controllerNode.GetN(); ++i)
+        {
+            Simulator::Schedule(Seconds(0.35 + 0.03 * i),
+                                &SyncControllerPresenceCacheFromCloud,
                                 i);
         }
     }

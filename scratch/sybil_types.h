@@ -60,7 +60,8 @@ enum MessageType
     REG_RESPONSE            = 12,  ///< Controller→RSU: token for registered vehicle
     REG_CONFIRM             = 13,  ///< RSU→Vehicle: deliver token
     V2CTRL_HELLO            = 14,  ///< Vehicle→RSU→Controller: initiate V-Ctrl E2E channel
-    CTRL2V_ACK              = 15   ///< Controller→RSU→Vehicle: complete V-Ctrl handshake
+    CTRL2V_ACK              = 15,  ///< Controller→RSU→Vehicle: complete V-Ctrl handshake
+    CONTROLLER2CONTROLLER_COMMAND = 16 ///< Controller-to-controller command forward
 };
 
 inline std::string
@@ -83,6 +84,7 @@ MessageTypeToString(uint32_t messageType)
     case REG_CONFIRM:            return "reg_confirm";
     case V2CTRL_HELLO:           return "v2ctrl_hello";
     case CTRL2V_ACK:             return "ctrl2v_ack";
+    case CONTROLLER2CONTROLLER_COMMAND: return "controller2controller_command";
     default:                     return "unknown";
     }
 }
@@ -611,6 +613,59 @@ class CtrlSecureTag : public Tag
     void Print(std::ostream& os) const override
     {
         os << "CtrlSecureTag rsu=" << rsuId << " dir=" << direction << " seq=" << seqNum;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// ControllerSecureTag — 24 bytes, attached to encrypted Controller↔Controller
+// packets.
+//
+// Fields:
+//   srcControllerId — sending controller
+//   dstControllerId — receiving controller
+//   seqNum          — per-pair monotonic counter (replay protection)
+//   iv[12]          — AES-256-GCM nonce
+// ---------------------------------------------------------------------------
+
+class ControllerSecureTag : public Tag
+{
+  public:
+    static constexpr uint32_t IV_BYTES = 12;
+
+    uint32_t srcControllerId = 0;
+    uint32_t dstControllerId = 0;
+    uint32_t seqNum = 0;
+    uint8_t  iv[IV_BYTES] = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::ControllerSecureTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<ControllerSecureTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return ControllerSecureTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 4 + 4 + 4 + IV_BYTES; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(srcControllerId);
+        i.WriteU32(dstControllerId);
+        i.WriteU32(seqNum);
+        i.Write(iv, IV_BYTES);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        srcControllerId = i.ReadU32();
+        dstControllerId = i.ReadU32();
+        seqNum = i.ReadU32();
+        i.Read(iv, IV_BYTES);
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "ControllerSecureTag src=" << srcControllerId
+           << " dst=" << dstControllerId
+           << " seq=" << seqNum;
     }
 };
 
