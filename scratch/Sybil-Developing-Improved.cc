@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -58,6 +59,7 @@ static void LogControllerGlobalAwarenessEvent(
 
 uint32_t N_Vehicles = 8;              ///< Number of vehicle nodes.
 uint32_t N_RSUs = 2;                  ///< Number of RSU edge nodes.
+uint32_t N_Controllers = 1;           ///< Number of SDN controller nodes.
 double simTime = 12.0;                ///< Total simulation time (seconds).
 double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
 double beaconJitterMax = 0.02;        ///< Maximum random V2V beacon timing jitter (seconds).
@@ -92,6 +94,9 @@ double roadBaseY = 40.0;                     ///< Centre y-coordinate of the roa
 uint32_t roadLaneCount = 2;                  ///< Number of synthetic lanes.
 double laneSpacing = 4.0;                    ///< Spacing between lane centre lines.
 double rsuOffsetY = 60.0;                    ///< RSU offset from road centre line in metres.
+bool passiveEvidenceOverlapTopology = false; ///< Cluster RSUs so multiple RSUs can overhear one V2V beacon.
+double passiveEvidenceRsuSpacing = 60.0;     ///< RSU spacing for passive evidence overlap topology.
+double tokenCommitmentSyncInterval = 1.0;    ///< Seconds between RSU IPFS token-commitment syncs.
 double vehicleSpacing = 35.0;                ///< Initial spacing between vehicles.
 double minVehicleSpeed = 8.0;                ///< Slowest vehicle speed in m/s.
 double maxVehicleSpeed = 16.0;               ///< Fastest vehicle speed in m/s.
@@ -113,6 +118,7 @@ std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_tab
 std::string rsuVehicleTableCsv = "sybil-attack/outputs/rsu_vehicle_table_log.csv";
 std::string rsuVehicleObservationCsv = "sybil-attack/outputs/rsu_vehicle_observation_rows_log.csv";
 std::string rsuRegionalAwarenessCsv = "sybil-attack/outputs/rsu_regional_awareness_log.csv";
+std::string rsuPassiveBeaconEvidenceCsv = "sybil-attack/outputs/rsu_passive_beacon_evidence_log.csv";
 std::string controllerVehicleTableCsv = "sybil-attack/outputs/controller_vehicle_table_log.csv";
 std::string controllerGlobalAwarenessCsv = "sybil-attack/outputs/controller_global_awareness_log.csv";
 std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
@@ -130,6 +136,85 @@ Ipv4InterfaceContainer   g_wirelessInterfaces;
 Ipv4InterfaceContainer   g_wiredInterfaces;
 uint32_t                 g_seq = 0;
 std::vector<uint32_t>    g_rsuReportCount;   // sized to N_RSUs in main()
+std::vector<uint32_t>    g_rsuControllerAssignment;
+
+static uint32_t
+GetControllerIndexForRsu(uint32_t rsuIndex)
+{
+    if (g_rsuControllerAssignment.empty())
+        return 0;
+    if (rsuIndex < g_rsuControllerAssignment.size())
+        return std::min(g_rsuControllerAssignment[rsuIndex],
+                        std::max(1u, N_Controllers) - 1u);
+    return 0;
+}
+
+static uint32_t
+GetControllerWiredInterfaceIndex(uint32_t controllerIndex)
+{
+    return N_RSUs + std::min(controllerIndex, std::max(1u, N_Controllers) - 1u);
+}
+
+static Ipv4Address
+GetControllerIpForRsu(uint32_t rsuIndex)
+{
+    return g_wiredInterfaces.GetAddress(
+        GetControllerWiredInterfaceIndex(GetControllerIndexForRsu(rsuIndex)));
+}
+
+static Ptr<Node>
+GetControllerNodeForRsu(uint32_t rsuIndex)
+{
+    uint32_t controllerIndex = GetControllerIndexForRsu(rsuIndex);
+    if (controllerIndex >= g_controllerNode.GetN())
+        controllerIndex = 0;
+    return g_controllerNode.Get(controllerIndex);
+}
+
+static uint32_t
+GetControllerSimulationIdForRsu(uint32_t rsuIndex)
+{
+    return N_Vehicles + N_RSUs + GetControllerIndexForRsu(rsuIndex);
+}
+
+static void
+InitializeRsuControllerAssignments()
+{
+    N_Controllers = std::max(1u, N_Controllers);
+    g_rsuControllerAssignment.assign(N_RSUs, 0u);
+
+    for (uint32_t rsuIndex = 0; rsuIndex < N_RSUs; ++rsuIndex)
+    {
+        uint32_t controllerIndex =
+            (N_RSUs == 0)
+                ? 0
+                : std::min(N_Controllers - 1u,
+                           (rsuIndex * N_Controllers) / std::max(1u, N_RSUs));
+        g_rsuControllerAssignment[rsuIndex] = controllerIndex;
+    }
+}
+
+static void
+PrintControllerZoneAssignments()
+{
+    std::cout << "[Topology] SDN controllers=" << N_Controllers << " zones:";
+    for (uint32_t controllerIndex = 0; controllerIndex < N_Controllers; ++controllerIndex)
+    {
+        std::cout << " C" << controllerIndex << "={";
+        bool first = true;
+        for (uint32_t rsuIndex = 0; rsuIndex < g_rsuControllerAssignment.size(); ++rsuIndex)
+        {
+            if (g_rsuControllerAssignment[rsuIndex] != controllerIndex)
+                continue;
+            if (!first)
+                std::cout << ",";
+            std::cout << "RSU" << rsuIndex;
+            first = false;
+        }
+        std::cout << "}";
+    }
+    std::cout << std::endl;
+}
 
 // Vehicle ECDSA key material — loaded from vehicle_keys.csv before Simulator::Run().
 std::vector<std::vector<uint8_t>> g_vehiclePrivKeys;  // 32 bytes per vehicle
@@ -162,11 +247,52 @@ std::vector<uint8_t>                                          g_tokenMasterKey;
 std::map<uint64_t, uint32_t>                                  g_validVins;
 std::map<uint32_t, std::vector<uint8_t>>                      g_controllerTokenStore;
 std::map<uint32_t, std::vector<uint8_t>>                      g_globalTokenStore;
+uint32_t                                                      controllerRegistrationThreshold = 2;
 std::vector<uint64_t>                                         g_vehicleVins;
 std::vector<std::vector<uint8_t>>                             g_vehicleTokens;
 std::vector<std::map<uint32_t, std::vector<uint8_t>>>         g_vehiclePendingRegNonces;
 std::vector<std::map<uint32_t, std::vector<uint8_t>>>         g_rsuPendingChallenges;
 std::vector<std::map<uint32_t, uint32_t>>                     g_rsuVehicleTxSeqNums;
+
+struct ControllerLocalRegistrationState
+{
+    std::map<uint32_t, std::string> registrationCidByVehicle;
+    std::map<uint32_t, std::vector<uint8_t> > tokenStore;
+};
+
+struct ControllerRegistrationEndorsement
+{
+    uint32_t controllerId = 0;
+    std::string signatureHex;
+};
+
+struct ControllerRegistrationQuorumState
+{
+    uint32_t vehicleId = 0;
+    uint32_t originRsuId = 0;
+    uint64_t vin = 0;
+    double gpsX = 0.0;
+    double gpsY = 0.0;
+    double requestTime = 0.0;
+    std::string registrationCid;
+    std::map<uint32_t, ControllerRegistrationEndorsement> endorsements;
+    bool approved = false;
+};
+
+struct ControllerTokenCommitmentRecord
+{
+    uint32_t vehicleId = 0;
+    std::string registrationCid;
+    std::string tokenHashHex;
+    std::string tokenRecordCid;
+};
+
+static std::vector<ControllerLocalRegistrationState> g_controllerLocalRegistrationStates;
+static std::map<std::string, ControllerRegistrationQuorumState> g_controllerRegistrationQuorums;
+static std::map<uint32_t, ControllerTokenCommitmentRecord> g_controllerTokenCommitments;
+static std::string g_latestTokenManifestCid;
+static std::vector<std::map<uint32_t, std::string> > g_rsuTokenRecordCidCache;
+static std::vector<std::map<uint32_t, std::string> > g_rsuTokenHashCache;
 
 // Vehicle↔Controller E2E secure channel globals.
 std::vector<std::vector<uint8_t>>         g_vehicleCertSigs;         // CA sig per vehicle (64B)
@@ -242,6 +368,23 @@ struct TrajectorySample
     double heading;
 };
 
+struct RsuPassiveBeaconEvidenceRecord
+{
+    uint32_t rsuId = 0;
+    uint32_t realVehicleId = 0;
+    uint32_t claimedVehicleId = 0;
+    uint32_t observableSourceId = 0;
+    uint32_t sequenceNumber = 0;
+    double observationTime = 0.0;
+    BsmCoreData bsm;
+    double claimedDistanceToRsu = 0.0;
+    double rssiEstimatedDistance = -1.0;
+    double rssiDbm = -999.0;
+    bool signatureValid = false;
+    uint32_t suspicionFlags = SUSPICION_NONE;
+    std::string evidenceCid;
+};
+
 // Latest RSSI (dBm) received by each vehicle observer for each claimed ID.
 // Written by WifiMonitorSnifferRx (PHY level); read by UpdateVehicleNeighborRecord.
 static std::vector<std::map<uint32_t, double> > g_vehicleLastRssiByClaimedId;
@@ -255,6 +398,8 @@ static std::vector<std::map<uint32_t, uint32_t> > g_rssiCoLocationFlags;
 static std::vector<std::map<uint32_t, std::deque<TrajectorySample> > > g_vehicleTrajectoryWindows;
 static std::vector<std::map<uint32_t, uint32_t> > g_trajectoryShadowingFlags;
 static std::vector<std::set<uint32_t> > g_sdnUnsupportedRsuApprovals;
+static std::vector<std::map<uint32_t, std::vector<RsuPassiveBeaconEvidenceRecord> > >
+    g_rsuPassiveBeaconEvidenceTables;
 
 static void
 ResetAwarenessTables()
@@ -280,6 +425,8 @@ ResetAwarenessTables()
         N_Vehicles, std::map<uint32_t, std::deque<TrajectorySample> >());
     g_trajectoryShadowingFlags.assign(N_Vehicles, std::map<uint32_t, uint32_t>());
     g_sdnUnsupportedRsuApprovals.assign(N_RSUs, std::set<uint32_t>());
+    g_rsuPassiveBeaconEvidenceTables.assign(
+        N_RSUs, std::map<uint32_t, std::vector<RsuPassiveBeaconEvidenceRecord> >());
     g_vehicleLastRssiByClaimedId.assign(N_Vehicles, std::map<uint32_t, double>());
 }
 
@@ -340,6 +487,14 @@ static const double kRssiRefDbm        = -17.817; ///< RSSI at 1 m (dBm) — exa
 static const double kPathLossExp       =  3.3772;  ///< Effective exponent = B/10 from Cost231
 static const double kRssiDistMismatchM =  25.0;    ///< Mismatch threshold (metres)
 
+static void
+RecordRsuPassiveBeaconEvidence(uint32_t rsuIndex,
+                               const SybilPacketTag& tag,
+                               const BsmCoreData& bsm,
+                               bool signatureValid,
+                               uint32_t triggerSeq,
+                               double measuredRssiDbm);
+
 static double
 RssiToDistance(double rssiDbm)
 {
@@ -347,6 +502,619 @@ RssiToDistance(double rssiDbm)
     if (pl <= 0.0)
         return 0.0;  // signal stronger than reference → transmitter at negligible range
     return std::pow(10.0, pl / (10.0 * kPathLossExp));
+}
+
+static std::string
+TrimShellOutput(std::string s)
+{
+    while (!s.empty() &&
+           (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t'))
+        s.pop_back();
+    return s;
+}
+
+static std::string
+RunCommandCapture(const std::string& command)
+{
+    std::string output;
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe)
+        return output;
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+        output += buffer;
+    pclose(pipe);
+    return TrimShellOutput(output);
+}
+
+static std::string
+JsonBool(bool value)
+{
+    return value ? "true" : "false";
+}
+
+static std::string
+GetIpfsBinaryPath();
+
+static std::string
+BytesToHex(const std::vector<uint8_t>& bytes)
+{
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t b : bytes)
+    {
+        out.push_back(hex[(b >> 4) & 0x0F]);
+        out.push_back(hex[b & 0x0F]);
+    }
+    return out;
+}
+
+static uint32_t
+GetControllerRegistrationThreshold()
+{
+    uint32_t controllerCount = std::max(1u, N_Controllers);
+    if (controllerRegistrationThreshold == 0)
+        controllerRegistrationThreshold = std::min(2u, controllerCount);
+    return std::min(controllerRegistrationThreshold, controllerCount);
+}
+
+static std::string
+BuildControllerRegistrationJson(uint32_t vehicleId,
+                                uint32_t originRsuId,
+                                uint32_t primaryControllerId,
+                                uint64_t vin,
+                                double gpsX,
+                                double gpsY,
+                                double requestTime)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"controller_threshold_registration_request\",\n"
+       << "  \"vehicle_id\": " << vehicleId << ",\n"
+       << "  \"origin_rsu_id\": " << originRsuId << ",\n"
+       << "  \"primary_controller_id\": " << primaryControllerId << ",\n"
+       << "  \"vin\": " << vin << ",\n"
+       << "  \"gps_x\": " << gpsX << ",\n"
+       << "  \"gps_y\": " << gpsY << ",\n"
+       << "  \"request_time\": " << requestTime << "\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishControllerRegistrationToIpfs(uint32_t vehicleId,
+                                    uint32_t originRsuId,
+                                    uint32_t primaryControllerId,
+                                    uint64_t vin,
+                                    double gpsX,
+                                    double gpsY,
+                                    double requestTime)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-registration";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/veh" << vehicleId
+         << "_rsu" << originRsuId
+         << "_ctrl" << primaryControllerId
+         << "_t" << static_cast<uint64_t>(requestTime * 1000000.0)
+         << ".json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildControllerRegistrationJson(vehicleId,
+                                               originRsuId,
+                                               primaryControllerId,
+                                               vin,
+                                               gpsX,
+                                               gpsY,
+                                               requestTime);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: controller registration IPFS publish failed. "
+                  << "Evidence JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local://" + path.str();
+    return cid;
+}
+
+static std::vector<uint8_t>
+BuildControllerRegistrationEndorsementMessage(const std::string& registrationCid,
+                                              uint32_t controllerId,
+                                              uint32_t vehicleId,
+                                              uint32_t originRsuId)
+{
+    std::vector<uint8_t> msg(registrationCid.begin(), registrationCid.end());
+    msg.push_back((controllerId >> 24) & 0xFF);
+    msg.push_back((controllerId >> 16) & 0xFF);
+    msg.push_back((controllerId >>  8) & 0xFF);
+    msg.push_back( controllerId        & 0xFF);
+    msg.push_back((vehicleId >> 24) & 0xFF);
+    msg.push_back((vehicleId >> 16) & 0xFF);
+    msg.push_back((vehicleId >>  8) & 0xFF);
+    msg.push_back( vehicleId        & 0xFF);
+    msg.push_back((originRsuId >> 24) & 0xFF);
+    msg.push_back((originRsuId >> 16) & 0xFF);
+    msg.push_back((originRsuId >>  8) & 0xFF);
+    msg.push_back( originRsuId        & 0xFF);
+    return msg;
+}
+
+static bool
+ApproveControllerThresholdRegistration(uint32_t primaryControllerId,
+                                       uint32_t originRsuId,
+                                       uint32_t vehicleId,
+                                       uint64_t vin,
+                                       double gpsX,
+                                       double gpsY,
+                                       double requestTime,
+                                       std::string& registrationCidOut)
+{
+    if (g_controllerLocalRegistrationStates.size() < N_Controllers)
+        g_controllerLocalRegistrationStates.resize(N_Controllers);
+
+    std::string cid = PublishControllerRegistrationToIpfs(vehicleId,
+                                                          originRsuId,
+                                                          primaryControllerId,
+                                                          vin,
+                                                          gpsX,
+                                                          gpsY,
+                                                          requestTime);
+    registrationCidOut = cid;
+
+    ControllerRegistrationQuorumState& quorum = g_controllerRegistrationQuorums[cid];
+    if (quorum.registrationCid.empty())
+    {
+        quorum.vehicleId = vehicleId;
+        quorum.originRsuId = originRsuId;
+        quorum.vin = vin;
+        quorum.gpsX = gpsX;
+        quorum.gpsY = gpsY;
+        quorum.requestTime = requestTime;
+        quorum.registrationCid = cid;
+    }
+
+    uint32_t threshold = GetControllerRegistrationThreshold();
+    for (uint32_t controllerId = 0;
+         controllerId < N_Controllers && quorum.endorsements.size() < threshold;
+         ++controllerId)
+    {
+        std::vector<uint8_t> msg =
+            BuildControllerRegistrationEndorsementMessage(cid, controllerId, vehicleId, originRsuId);
+        std::vector<uint8_t> hash = CryptoSha256(msg);
+        std::vector<uint8_t> sig;
+        if (g_ctrlSignPrivKey.size() == 32)
+            sig = CryptoEcdsaSign(g_ctrlSignPrivKey, hash);
+        else
+            sig = CryptoSha256(hash);
+
+        ControllerRegistrationEndorsement endorsement;
+        endorsement.controllerId = controllerId;
+        endorsement.signatureHex = BytesToHex(sig);
+        quorum.endorsements[controllerId] = endorsement;
+        g_controllerLocalRegistrationStates[controllerId].registrationCidByVehicle[vehicleId] = cid;
+    }
+
+    quorum.approved = quorum.endorsements.size() >= threshold;
+    std::cout << "[ControllerThreshold] REG vehicle=" << vehicleId
+              << " cid=" << cid
+              << " endorsements=" << quorum.endorsements.size()
+              << "/" << threshold
+              << " approved=" << (quorum.approved ? "yes" : "no")
+              << std::endl;
+    return quorum.approved;
+}
+
+static std::vector<uint8_t>
+GenerateThresholdApprovedVehicleToken(uint32_t vehicleId, const std::string& registrationCid)
+{
+    std::vector<uint8_t> tokenInput = g_tokenMasterKey;
+    tokenInput.push_back((vehicleId >> 24) & 0xFF);
+    tokenInput.push_back((vehicleId >> 16) & 0xFF);
+    tokenInput.push_back((vehicleId >>  8) & 0xFF);
+    tokenInput.push_back( vehicleId        & 0xFF);
+    tokenInput.insert(tokenInput.end(), registrationCid.begin(), registrationCid.end());
+    return CryptoSha256(tokenInput);
+}
+
+static std::string
+BuildTokenCommitmentJson(uint32_t vehicleId,
+                         const std::string& registrationCid,
+                         const std::string& tokenHashHex)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"controller_threshold_token_commitment\",\n"
+       << "  \"vehicle_id\": " << vehicleId << ",\n"
+       << "  \"registration_cid\": \"" << registrationCid << "\",\n"
+       << "  \"token_hash\": \"" << tokenHashHex << "\",\n"
+       << "  \"issued_time\": " << Simulator::Now().GetSeconds() << "\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishTokenCommitmentToIpfs(uint32_t vehicleId,
+                             const std::string& registrationCid,
+                             const std::string& tokenHashHex)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-token-records";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/veh" << vehicleId
+         << "_t" << static_cast<uint64_t>(Simulator::Now().GetSeconds() * 1000000.0)
+         << ".json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildTokenCommitmentJson(vehicleId, registrationCid, tokenHashHex);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: token commitment IPFS publish failed. "
+                  << "Token JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local://" + path.str();
+    return cid;
+}
+
+static std::string
+ReadSmallTextFile(const std::string& path)
+{
+    std::ifstream in(path.c_str(), std::ios::in);
+    if (!in.good())
+        return "";
+
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+static std::string
+ExtractJsonStringField(const std::string& json, const std::string& fieldName)
+{
+    std::string key = "\"" + fieldName + "\"";
+    std::size_t keyPos = json.find(key);
+    if (keyPos == std::string::npos)
+        return "";
+
+    std::size_t colon = json.find(':', keyPos + key.size());
+    if (colon == std::string::npos)
+        return "";
+
+    std::size_t firstQuote = json.find('"', colon + 1);
+    if (firstQuote == std::string::npos)
+        return "";
+
+    std::size_t secondQuote = json.find('"', firstQuote + 1);
+    if (secondQuote == std::string::npos)
+        return "";
+
+    return json.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+}
+
+static std::string
+FetchTokenHashFromIpfsTokenRecord(const std::string& tokenRecordCid)
+{
+    if (tokenRecordCid.empty())
+        return "";
+
+    std::string json;
+    const std::string localPrefix = "local://";
+    if (tokenRecordCid.rfind(localPrefix, 0) == 0)
+    {
+        json = ReadSmallTextFile(tokenRecordCid.substr(localPrefix.size()));
+    }
+    else
+    {
+        json = RunCommandCapture(GetIpfsBinaryPath() + " cat " + tokenRecordCid + " 2>/dev/null");
+    }
+
+    return ExtractJsonStringField(json, "token_hash");
+}
+
+static std::string
+FetchJsonFromIpfsCid(const std::string& cid)
+{
+    if (cid.empty())
+        return "";
+
+    const std::string localPrefix = "local://";
+    if (cid.rfind(localPrefix, 0) == 0)
+        return ReadSmallTextFile(cid.substr(localPrefix.size()));
+
+    return RunCommandCapture(GetIpfsBinaryPath() + " cat " + cid + " 2>/dev/null");
+}
+
+static std::string
+BuildTokenManifestJson()
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"controller_threshold_token_manifest\",\n"
+       << "  \"issued_time\": " << Simulator::Now().GetSeconds() << ",\n"
+       << "  \"records\": [\n";
+
+    bool first = true;
+    for (auto it = g_controllerTokenCommitments.begin();
+         it != g_controllerTokenCommitments.end();
+         ++it)
+    {
+        if (!first)
+            os << ",\n";
+        first = false;
+        os << "    {\"vehicle_id\": " << it->first
+           << ", \"token_record_cid\": \"" << it->second.tokenRecordCid << "\"}";
+    }
+
+    os << "\n  ]\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishTokenManifestToIpfs()
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-token-manifests";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/token_manifest_t"
+         << static_cast<uint64_t>(Simulator::Now().GetSeconds() * 1000000.0)
+         << ".json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildTokenManifestJson();
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: token manifest IPFS publish failed. "
+                  << "Manifest JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local://" + path.str();
+    return cid;
+}
+
+static std::map<uint32_t, std::string>
+ParseTokenManifestRecordCids(const std::string& manifestJson)
+{
+    std::map<uint32_t, std::string> records;
+    std::size_t pos = 0;
+    const std::string vehicleKey = "\"vehicle_id\"";
+    const std::string cidKey = "\"token_record_cid\"";
+
+    while ((pos = manifestJson.find(vehicleKey, pos)) != std::string::npos)
+    {
+        std::size_t colon = manifestJson.find(':', pos + vehicleKey.size());
+        if (colon == std::string::npos)
+            break;
+
+        std::size_t digit = manifestJson.find_first_of("0123456789", colon + 1);
+        if (digit == std::string::npos)
+            break;
+
+        std::size_t endDigit = manifestJson.find_first_not_of("0123456789", digit);
+        uint32_t vehicleId = static_cast<uint32_t>(
+            std::strtoul(manifestJson.substr(digit, endDigit - digit).c_str(), nullptr, 10));
+
+        std::size_t cidPos = manifestJson.find(cidKey, endDigit);
+        if (cidPos == std::string::npos)
+            break;
+        std::size_t cidColon = manifestJson.find(':', cidPos + cidKey.size());
+        std::size_t firstQuote = manifestJson.find('"', cidColon + 1);
+        std::size_t secondQuote = manifestJson.find('"', firstQuote + 1);
+        if (cidColon == std::string::npos ||
+            firstQuote == std::string::npos ||
+            secondQuote == std::string::npos)
+            break;
+
+        records[vehicleId] = manifestJson.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+        pos = secondQuote + 1;
+    }
+
+    return records;
+}
+
+static void
+PublishUpdatedTokenManifest()
+{
+    g_latestTokenManifestCid = PublishTokenManifestToIpfs();
+    std::cout << "[ControllerTokenManifest] cid=" << g_latestTokenManifestCid
+              << " records=" << g_controllerTokenCommitments.size()
+              << std::endl;
+}
+
+static void
+SyncRsuTokenCommitmentsFromIpfs(uint32_t rsuId)
+{
+    if (rsuId >= N_RSUs)
+        return;
+
+    if (g_rsuTokenRecordCidCache.size() < N_RSUs)
+        g_rsuTokenRecordCidCache.resize(N_RSUs);
+    if (g_rsuTokenHashCache.size() < N_RSUs)
+        g_rsuTokenHashCache.resize(N_RSUs);
+
+    uint32_t updated = 0;
+    if (!g_latestTokenManifestCid.empty())
+    {
+        std::string manifestJson = FetchJsonFromIpfsCid(g_latestTokenManifestCid);
+        std::map<uint32_t, std::string> recordCids =
+            ParseTokenManifestRecordCids(manifestJson);
+
+        for (auto it = recordCids.begin(); it != recordCids.end(); ++it)
+        {
+            uint32_t vehicleId = it->first;
+            const std::string& tokenRecordCid = it->second;
+            bool alreadyFresh =
+                g_rsuTokenRecordCidCache[rsuId][vehicleId] == tokenRecordCid &&
+                !g_rsuTokenHashCache[rsuId][vehicleId].empty();
+
+            if (alreadyFresh)
+                continue;
+
+            std::string tokenHashHex = FetchTokenHashFromIpfsTokenRecord(tokenRecordCid);
+            if (tokenHashHex.empty())
+                continue;
+
+            g_rsuTokenRecordCidCache[rsuId][vehicleId] = tokenRecordCid;
+            g_rsuTokenHashCache[rsuId][vehicleId] = tokenHashHex;
+            ++updated;
+        }
+    }
+
+    if (updated > 0)
+    {
+        std::cout << "[RSUTokenSync] RSU " << rsuId
+                  << " synced " << updated
+                  << " token commitment(s) from manifest="
+                  << g_latestTokenManifestCid << std::endl;
+    }
+
+    if (tokenCommitmentSyncInterval > 0.0 &&
+        Simulator::Now().GetSeconds() + tokenCommitmentSyncInterval <= simTime)
+    {
+        Simulator::Schedule(Seconds(tokenCommitmentSyncInterval),
+                            &SyncRsuTokenCommitmentsFromIpfs,
+                            rsuId);
+    }
+}
+
+static void
+StoreThresholdApprovedToken(uint32_t vehicleId,
+                            const std::string& registrationCid,
+                            const std::vector<uint8_t>& token)
+{
+    std::string tokenHashHex = BytesToHex(CryptoSha256(token));
+    std::string tokenRecordCid =
+        PublishTokenCommitmentToIpfs(vehicleId, registrationCid, tokenHashHex);
+
+    ControllerTokenCommitmentRecord commitment;
+    commitment.vehicleId = vehicleId;
+    commitment.registrationCid = registrationCid;
+    commitment.tokenHashHex = tokenHashHex;
+    commitment.tokenRecordCid = tokenRecordCid;
+    g_controllerTokenCommitments[vehicleId] = commitment;
+    PublishUpdatedTokenManifest();
+
+    g_globalTokenStore[vehicleId] = token;
+    g_controllerTokenStore[vehicleId] = token;
+
+    if (g_controllerLocalRegistrationStates.size() < N_Controllers)
+        g_controllerLocalRegistrationStates.resize(N_Controllers);
+    auto quorumIt = g_controllerRegistrationQuorums.find(registrationCid);
+    if (quorumIt != g_controllerRegistrationQuorums.end())
+    {
+        for (auto it = quorumIt->second.endorsements.begin();
+             it != quorumIt->second.endorsements.end();
+             ++it)
+        {
+            uint32_t controllerId = it->first;
+            if (controllerId < g_controllerLocalRegistrationStates.size())
+                g_controllerLocalRegistrationStates[controllerId].tokenStore[vehicleId] = token;
+        }
+    }
+
+    std::cout << "[ControllerToken] vehicle=" << vehicleId
+              << " token_hash=" << tokenHashHex
+              << " token_record_cid=" << tokenRecordCid
+              << std::endl;
+}
+
+static std::string
+BuildPassiveBeaconEvidenceJson(const RsuPassiveBeaconEvidenceRecord& rec)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"rsu_passive_v2v_beacon_evidence\",\n"
+       << "  \"rsu_id\": " << rec.rsuId << ",\n"
+       << "  \"real_vehicle_id\": " << rec.realVehicleId << ",\n"
+       << "  \"claimed_vehicle_id\": " << rec.claimedVehicleId << ",\n"
+       << "  \"observable_source_id\": " << rec.observableSourceId << ",\n"
+       << "  \"sequence_number\": " << rec.sequenceNumber << ",\n"
+       << "  \"observation_time\": " << rec.observationTime << ",\n"
+       << "  \"bsm\": {\n"
+       << "    \"temporary_id\": " << rec.bsm.temporaryId << ",\n"
+       << "    \"message_count\": " << rec.bsm.messageCount << ",\n"
+       << "    \"timestamp\": " << rec.bsm.timestamp << ",\n"
+       << "    \"x\": " << rec.bsm.positionX << ",\n"
+       << "    \"y\": " << rec.bsm.positionY << ",\n"
+       << "    \"z\": " << rec.bsm.positionZ << ",\n"
+       << "    \"speed\": " << rec.bsm.speed << ",\n"
+       << "    \"heading\": " << rec.bsm.heading << "\n"
+       << "  },\n"
+       << "  \"claimed_distance_to_rsu_m\": " << rec.claimedDistanceToRsu << ",\n"
+       << "  \"rssi_estimated_distance_m\": " << rec.rssiEstimatedDistance << ",\n"
+       << "  \"rssi_dbm\": " << rec.rssiDbm << ",\n"
+       << "  \"signature_valid\": " << JsonBool(rec.signatureValid) << ",\n"
+       << "  \"suspicion_flags\": " << rec.suspicionFlags << "\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+GetIpfsBinaryPath()
+{
+    const char* envPath = std::getenv("SYBIL_IPFS_BIN");
+    if (envPath && *envPath)
+        return std::string(envPath);
+
+    const std::string localPath = ".codex-tools/bin/ipfs";
+    std::ifstream localIpfs(localPath.c_str());
+    if (localIpfs.good())
+        return localPath;
+
+    return "ipfs";
+}
+
+static std::string
+PublishPassiveBeaconEvidenceToIpfs(const RsuPassiveBeaconEvidenceRecord& rec)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-evidence";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/rsu" << rec.rsuId
+         << "_claimed" << rec.claimedVehicleId
+         << "_seq" << rec.sequenceNumber
+         << "_t" << static_cast<uint64_t>(rec.observationTime * 1000000.0)
+         << ".json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildPassiveBeaconEvidenceJson(rec);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: real IPFS publish failed. Install/start IPFS "
+                  << "and ensure `ipfs add -Q` works. Evidence JSON files are still "
+                  << "written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    return cid;
 }
 static const double kTrajectoryWindowSec = 5.0;
 static const double kTrajectoryAlignmentSec = 0.35;
@@ -1076,6 +1844,35 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
 
     uint32_t claimedId = tag.GetClaimedNodeId();
     RecordRssiCoLocationObservation(observerIndex, claimedId, signalNoise.signal);
+
+    if (observerIndex >= N_Vehicles)
+    {
+        uint32_t rsuIndex = observerIndex - N_Vehicles;
+        if (rsuIndex < N_RSUs)
+        {
+            BsmCoreDataTag bsmTag;
+            if (packet->PeekPacketTag(bsmTag))
+            {
+                bool sigValid = true;
+                V2VSignatureTag sigTag;
+                if (packet->PeekPacketTag(sigTag) && LightweightCryptoMechanismActive())
+                {
+                    BsmCoreData bsm = bsmTag.GetBsm();
+                    std::vector<uint8_t> payload = SerializeBsmForSigning(bsm);
+                    std::vector<uint8_t> hash = CryptoSha256(payload);
+                    std::vector<uint8_t> pubKey(sigTag.pub_key, sigTag.pub_key + 64);
+                    std::vector<uint8_t> sigBytes(sigTag.sig, sigTag.sig + 64);
+                    sigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
+                }
+                RecordRsuPassiveBeaconEvidence(rsuIndex,
+                                               tag,
+                                               bsmTag.GetBsm(),
+                                               sigValid,
+                                               tag.GetSequenceNumber(),
+                                               signalNoise.signal);
+            }
+        }
+    }
 
     // Store latest RSSI per vehicle observer for RSSI-distance verification.
     // Only vehicle observers (not RSUs) perform the per-neighbor distance check.
@@ -2067,6 +2864,17 @@ InitializeRsuRegionalAwarenessCsv()
 }
 
 static void
+InitializeRsuPassiveBeaconEvidenceCsv()
+{
+    std::ofstream out(rsuPassiveBeaconEvidenceCsv.c_str(), std::ios::out);
+    out << "time,event,rsu_id,real_vehicle_id,claimed_vehicle_id,observable_source_id,"
+        << "sequence_number,bsm_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,"
+        << "claimed_distance_to_rsu_m,rssi_estimated_distance_m,rssi_dbm,"
+        << "signature_valid,suspicion_flags,evidence_count_for_claimed_id,"
+        << "ipfs_cid,trigger_seq,status\n";
+}
+
+static void
 InitializeControllerGlobalAwarenessCsv()
 {
     std::ofstream out(controllerGlobalAwarenessCsv.c_str(), std::ios::out);
@@ -2115,6 +2923,38 @@ LogRssiVerification(uint32_t observerVehicleId,
         << record.suspicionFlags << "\n";
 }
 
+static void
+LogRsuPassiveBeaconEvidenceEvent(const std::string& event,
+                                 const RsuPassiveBeaconEvidenceRecord& rec,
+                                 uint32_t evidenceCountForClaimedId,
+                                 const std::string& status,
+                                 uint32_t triggerSeq = 0)
+{
+    std::ofstream out(rsuPassiveBeaconEvidenceCsv.c_str(), std::ios::app);
+    out << Simulator::Now().GetSeconds() << ","
+        << event << ","
+        << rec.rsuId << ","
+        << rec.realVehicleId << ","
+        << rec.claimedVehicleId << ","
+        << rec.observableSourceId << ","
+        << rec.sequenceNumber << ","
+        << rec.bsm.timestamp << ","
+        << rec.bsm.positionX << ","
+        << rec.bsm.positionY << ","
+        << rec.bsm.positionZ << ","
+        << rec.bsm.speed << ","
+        << rec.bsm.heading << ","
+        << rec.claimedDistanceToRsu << ","
+        << rec.rssiEstimatedDistance << ","
+        << rec.rssiDbm << ","
+        << (rec.signatureValid ? 1 : 0) << ","
+        << rec.suspicionFlags << ","
+        << evidenceCountForClaimedId << ","
+        << rec.evidenceCid << ","
+        << triggerSeq << ","
+        << status << "\n";
+}
+
 // ---------------------------------------------------------------------------
 // Distance-based RSU selection — called at actual fire time so vehicle
 // movement is reflected.  Returns the nearest RSU index.
@@ -2144,6 +2984,97 @@ DistanceBetween(const Vector& a, const Vector& b)
     double dy = a.y - b.y;
     double dz = a.z - b.z;
     return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+static void
+RecordRsuPassiveBeaconEvidence(uint32_t rsuIndex,
+                               const SybilPacketTag& tag,
+                               const BsmCoreData& bsm,
+                               bool signatureValid,
+                               uint32_t triggerSeq,
+                               double measuredRssiDbm)
+{
+    if (!LightweightDecisionModeActive())
+        return;
+    if (rsuIndex >= N_RSUs || rsuIndex >= g_rsuNodes.GetN())
+        return;
+
+    RsuPassiveBeaconEvidenceRecord rec;
+    rec.rsuId = rsuIndex;
+    rec.realVehicleId = tag.GetRealNodeId();
+    rec.claimedVehicleId = tag.GetClaimedNodeId();
+    rec.observableSourceId = tag.GetObservableSourceId();
+    rec.sequenceNumber = tag.GetSequenceNumber();
+    rec.observationTime = Simulator::Now().GetSeconds();
+    rec.bsm = bsm;
+    rec.signatureValid = signatureValid;
+
+    Ptr<MobilityModel> rsuMob = g_rsuNodes.Get(rsuIndex)->GetObject<MobilityModel>();
+    Vector rsuPos = rsuMob ? rsuMob->GetPosition() : Vector(0.0, 0.0, 0.0);
+    Vector claimedPos(bsm.positionX, bsm.positionY, bsm.positionZ);
+    rec.claimedDistanceToRsu = DistanceBetween(rsuPos, claimedPos);
+
+    double physicalDistance = rec.claimedDistanceToRsu;
+    if (rec.realVehicleId < g_vehicleNodes.GetN())
+    {
+        Ptr<MobilityModel> vehicleMob =
+            g_vehicleNodes.Get(rec.realVehicleId)->GetObject<MobilityModel>();
+        if (vehicleMob && rsuMob)
+            physicalDistance = std::max(0.5, vehicleMob->GetDistanceFrom(rsuMob));
+    }
+    rec.rssiDbm = (measuredRssiDbm > -998.0)
+                      ? measuredRssiDbm
+                      : kRssiRefDbm -
+                            10.0 * kPathLossExp *
+                                std::log10(std::max(0.5, physicalDistance));
+    rec.rssiEstimatedDistance = RssiToDistance(rec.rssiDbm);
+
+    if (!signatureValid)
+        rec.suspicionFlags |= SUSPICION_INVALID_V2V_SIGNATURE;
+    if (rec.realVehicleId != rec.claimedVehicleId || rec.claimedVehicleId >= N_Vehicles)
+        rec.suspicionFlags |= SUSPICION_ID_MISMATCH;
+    if (rec.claimedDistanceToRsu > rsuCoverageRange)
+        rec.suspicionFlags |= SUSPICION_RANGE_ANOMALY;
+    if (std::fabs(rec.rssiEstimatedDistance - rec.claimedDistanceToRsu) >
+        kRssiDistMismatchM)
+    {
+        rec.suspicionFlags |= SUSPICION_RSSI_DISTANCE_MISMATCH;
+    }
+
+    uint32_t observerIndex = N_Vehicles + rsuIndex;
+    rec.suspicionFlags |= GetRssiCoLocationFlags(observerIndex, rec.claimedVehicleId);
+    rec.suspicionFlags |= EvaluateTemporalBurstSignature(
+        rsuIndex,
+        rec.claimedVehicleId,
+        rec.observationTime,
+        rec.bsm.positionX,
+        rec.bsm.positionY,
+        g_rsuFirstSeenClaimedIds,
+        g_rsuTemporalNewIdEvents,
+        "RSU_PASSIVE_BEACON");
+
+    rec.evidenceCid = PublishPassiveBeaconEvidenceToIpfs(rec);
+
+    auto& records = g_rsuPassiveBeaconEvidenceTables[rsuIndex][rec.claimedVehicleId];
+    records.push_back(rec);
+    static const uint32_t kMaxPassiveEvidenceRowsPerId = 50;
+    if (records.size() > kMaxPassiveEvidenceRowsPerId)
+        records.erase(records.begin());
+
+    LogRsuPassiveBeaconEvidenceEvent("passive_v2v_beacon_observed",
+                                     records.back(),
+                                     static_cast<uint32_t>(records.size()),
+                                     rec.evidenceCid.empty() ? "ipfs_publish_failed_or_unavailable"
+                                                             : "ipfs_published",
+                                     triggerSeq);
+
+    std::cout << "[RSU_PASSIVE_EVIDENCE] RSU=" << rsuIndex
+              << " ClaimedId=" << rec.claimedVehicleId
+              << " RealId=" << rec.realVehicleId
+              << " Seq=" << rec.sequenceNumber
+              << " Flags=" << rec.suspicionFlags
+              << " CID=" << (rec.evidenceCid.empty() ? "(none)" : rec.evidenceCid)
+              << std::endl;
 }
 
 static double
@@ -2186,6 +3117,17 @@ static Vector
 InitialRsuPosition(uint32_t rsuIndex)
 {
     uint32_t rsuCount = std::max(1u, N_RSUs);
+
+    if (passiveEvidenceOverlapTopology)
+    {
+        double vehicleSpan = vehicleSpacing * static_cast<double>(std::max(1u, N_Vehicles) - 1u);
+        double clusterCenterX = roadStartX + std::min(roadLength * 0.5, vehicleSpan * 0.5);
+        double clusterWidth = passiveEvidenceRsuSpacing * static_cast<double>(rsuCount - 1u);
+        double x = clusterCenterX - 0.5 * clusterWidth +
+                   passiveEvidenceRsuSpacing * static_cast<double>(rsuIndex);
+        return Vector(x, roadBaseY + rsuOffsetY, 0.0);
+    }
+
     double usableLength = std::max(roadLength, vehicleSpacing);
     double spacing = usableLength / static_cast<double>(rsuCount);
     double x = roadStartX + spacing * (static_cast<double>(rsuIndex) + 0.5);
@@ -2394,22 +3336,32 @@ InstallInfrastructureMobility(const MobilityScenario& scenario)
     controllerMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     controllerMobility.Install(g_controllerNode);
 
-    Vector controllerPos(70.0, 190.0, 0.0);
-    if (loadedRsuCsv && g_rsuNodes.GetN() > 0)
+    for (uint32_t c = 0; c < g_controllerNode.GetN(); ++c)
     {
         Vector sum(0.0, 0.0, 0.0);
+        uint32_t count = 0;
         for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
         {
+            if (GetControllerIndexForRsu(i) != c)
+                continue;
             Vector p = g_rsuNodes.Get(i)->GetObject<MobilityModel>()->GetPosition();
             sum.x += p.x;
             sum.y += p.y;
             sum.z += p.z;
+            ++count;
         }
-        controllerPos = Vector(sum.x / g_rsuNodes.GetN(),
-                               sum.y / g_rsuNodes.GetN() + 120.0,
-                               0.0);
+
+        Vector controllerPos(roadStartX + 80.0 * static_cast<double>(c),
+                             roadBaseY + rsuOffsetY + 120.0,
+                             0.0);
+        if (count > 0)
+        {
+            controllerPos = Vector(sum.x / count,
+                                   sum.y / count + 120.0,
+                                   0.0);
+        }
+        g_controllerNode.Get(c)->GetObject<MobilityModel>()->SetPosition(controllerPos);
     }
-    g_controllerNode.Get(0)->GetObject<MobilityModel>()->SetPosition(controllerPos);
 }
 
 static void
@@ -3591,12 +4543,12 @@ SendV2CtrlHelloForward(uint32_t rsuIndex, uint32_t vehicleId,
 
     Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
     pkt->AddPacketTag(csTag);
-    SybilPacketTag sybTag(rsuIndex, rsuIndex, N_Vehicles + N_RSUs,
+    SybilPacketTag sybTag(rsuIndex, rsuIndex, GetControllerSimulationIdForRsu(rsuIndex),
                           static_cast<uint32_t>(V2CTRL_HELLO), ++g_seq,
                           0.0, 0.0, 0.0, rsuIndex);
     pkt->AddPacketTag(sybTag);
 
-    Ipv4Address ctrlAddr = g_wiredInterfaces.GetAddress(N_RSUs);
+    Ipv4Address ctrlAddr = GetControllerIpForRsu(rsuIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmit(1);
@@ -3842,12 +4794,12 @@ SendRegForward(uint32_t rsuIndex, uint32_t vehicleId, uint64_t vin,
 
     Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
     pkt->AddPacketTag(csTag);
-    SybilPacketTag sybTag(rsuIndex, rsuIndex, N_Vehicles + N_RSUs,
+    SybilPacketTag sybTag(rsuIndex, rsuIndex, GetControllerSimulationIdForRsu(rsuIndex),
                           static_cast<uint32_t>(REG_FORWARD), ++g_seq,
                           0.0, 0.0, 0.0, rsuIndex);
     pkt->AddPacketTag(sybTag);
 
-    Ipv4Address ctrlAddr = g_wiredInterfaces.GetAddress(N_RSUs);
+    Ipv4Address ctrlAddr = GetControllerIpForRsu(rsuIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_FORWARD), 1);
@@ -3898,13 +4850,14 @@ SendRegResponse(uint32_t originRsuIndex, uint32_t vehicleId,
 
     Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
     pkt->AddPacketTag(csTag);
-    SybilPacketTag sybTag(N_Vehicles + N_RSUs, N_Vehicles + N_RSUs, originRsuIndex,
+    uint32_t controllerNodeId = GetControllerSimulationIdForRsu(originRsuIndex);
+    SybilPacketTag sybTag(controllerNodeId, controllerNodeId, originRsuIndex,
                           static_cast<uint32_t>(REG_RESPONSE), ++g_seq,
-                          0.0, 0.0, 0.0, N_Vehicles + N_RSUs);
+                          0.0, 0.0, 0.0, controllerNodeId);
     pkt->AddPacketTag(sybTag);
 
     Ipv4Address rsuAddr = g_wiredInterfaces.GetAddress(originRsuIndex);
-    Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
+    Ptr<Socket> sock = CreateSenderSocket(GetControllerNodeForRsu(originRsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmitForMessage(static_cast<uint32_t>(REG_RESPONSE), 1);
 
@@ -4026,12 +4979,12 @@ SendRegForwardNested(uint32_t rsuIndex, uint32_t vehicleId,
 
     Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
     pkt->AddPacketTag(csTag);
-    SybilPacketTag sybTag(rsuIndex, rsuIndex, N_Vehicles + N_RSUs,
+    SybilPacketTag sybTag(rsuIndex, rsuIndex, GetControllerSimulationIdForRsu(rsuIndex),
                           static_cast<uint32_t>(REG_FORWARD), ++g_seq,
                           0.0, 0.0, 0.0, rsuIndex);
     pkt->AddPacketTag(sybTag);
 
-    Ipv4Address ctrlAddr = g_wiredInterfaces.GetAddress(N_RSUs);
+    Ipv4Address ctrlAddr = GetControllerIpForRsu(rsuIndex);
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(ctrlAddr, CONTROLLER_PORT));
     MetricsOnTransmit(1);
@@ -4074,7 +5027,8 @@ SendRegResponseNested(uint32_t originRsuIndex, uint32_t vehicleId,
     std::vector<uint8_t> ciphertext = CryptoAesGcmEncrypt(key, iv, plaintext, aad);
     auto __rreo1 = std::chrono::high_resolution_clock::now();
     double __rreoMs = std::chrono::duration<double, std::milli>(__rreo1 - __rreo0).count();
-    std::cout << "[Latency] REG_CONFIRM  sdn_controller/0"
+    std::cout << "[Latency] REG_CONFIRM  sdn_controller/"
+              << GetControllerIndexForRsu(originRsuIndex)
               << "  outer_encrypt(RSU-Ctrl)  " << __rreoMs << "\n";
     if (ciphertext.empty()) { std::cerr << "[Reg] REG_RESPONSE nested encrypt failed\n"; return; }
 
@@ -4086,13 +5040,14 @@ SendRegResponseNested(uint32_t originRsuIndex, uint32_t vehicleId,
 
     Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
     pkt->AddPacketTag(csTag);
-    SybilPacketTag sybTag(N_Vehicles + N_RSUs, N_Vehicles + N_RSUs, originRsuIndex,
+    uint32_t controllerNodeId = GetControllerSimulationIdForRsu(originRsuIndex);
+    SybilPacketTag sybTag(controllerNodeId, controllerNodeId, originRsuIndex,
                           static_cast<uint32_t>(REG_RESPONSE), ++g_seq,
-                          0.0, 0.0, 0.0, N_Vehicles + N_RSUs);
+                          0.0, 0.0, 0.0, controllerNodeId);
     pkt->AddPacketTag(sybTag);
 
     Ipv4Address rsuAddr = g_wiredInterfaces.GetAddress(originRsuIndex);
-    Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
+    Ptr<Socket> sock = CreateSenderSocket(GetControllerNodeForRsu(originRsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
 
@@ -4312,13 +5267,14 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
 
     Ptr<Packet> pkt = Create<Packet>(ciphertext.data(), ciphertext.size());
     pkt->AddPacketTag(csTag);
-    SybilPacketTag sybTag(N_Vehicles + N_RSUs, N_Vehicles + N_RSUs, rsuIndex,
+    uint32_t controllerNodeId = GetControllerSimulationIdForRsu(rsuIndex);
+    SybilPacketTag sybTag(controllerNodeId, controllerNodeId, rsuIndex,
                           static_cast<uint32_t>(CTRL2V_ACK), ++g_seq,
-                          0.0, 0.0, 0.0, N_Vehicles + N_RSUs);
+                          0.0, 0.0, 0.0, controllerNodeId);
     pkt->AddPacketTag(sybTag);
 
     Ipv4Address rsuAddr = g_wiredInterfaces.GetAddress(rsuIndex);
-    Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
+    Ptr<Socket> sock = CreateSenderSocket(GetControllerNodeForRsu(rsuIndex));
     sock->SendTo(pkt, 0, InetSocketAddress(rsuAddr, RSU_PORT));
     MetricsOnTransmit(1);
 
@@ -4448,7 +5404,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
             auto __t1 = std::chrono::high_resolution_clock::now();
             double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
-            std::cout << "[Latency] RSU2CTRL_REPORT  sdn_controller/0"
+            std::cout << "[Latency] RSU2CTRL_REPORT  sdn_controller/"
+                      << GetControllerIndexForRsu(rIdx)
                       << "  decrypt  " << __ms << "\n";
             if (plain.empty())
             {
@@ -4508,7 +5465,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
 
         // No-crypto path: no CtrlSecureTag, log 0.000 decrypt latency.
         if (!CryptoMechanismActive())
-            std::cout << "[Latency] RSU2CTRL_REPORT  sdn_controller/0"
+            std::cout << "[Latency] RSU2CTRL_REPORT  sdn_controller/"
+                      << GetControllerIndexForRsu(tag.GetRealNodeId())
                       << "  decrypt  0.000\n";
 
         // Primary path: batch awareness tag (all vehicle records in one packet).
@@ -4781,7 +5739,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             CryptoAesGcmDecrypt(g_rsuCtrlSharedKeys[rIdx], iv, enc, aad);
         auto __rfo1 = std::chrono::high_resolution_clock::now();
         double __rfOuterMs = std::chrono::duration<double, std::milli>(__rfo1 - __rfo0).count();
-        std::cout << "[Latency] REG_REQUEST  sdn_controller/0"
+        std::cout << "[Latency] REG_REQUEST  sdn_controller/"
+                  << GetControllerIndexForRsu(rIdx)
                   << "  outer_decrypt(RSU-Ctrl)  " << __rfOuterMs << "\n";
         if (plain.empty())
         {
@@ -4835,7 +5794,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 CryptoAesGcmDecrypt(vCtrlKey, innerIv, innerCipher, innerAad);
             auto __rfi1 = std::chrono::high_resolution_clock::now();
             double __rfInnerMs = std::chrono::duration<double, std::milli>(__rfi1 - __rfi0).count();
-            std::cout << "[Latency] REG_REQUEST  sdn_controller/0"
+            std::cout << "[Latency] REG_REQUEST  sdn_controller/"
+                      << GetControllerIndexForRsu(rIdx)
                       << "  inner_decrypt(V-Ctrl)  " << __rfInnerMs << "\n";
             if (innerPlain.empty())
             {
@@ -4900,23 +5860,37 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             {
                 std::cerr << "[Reg] Controller: token master key not loaded\n"; return;
             }
-            std::vector<uint8_t> tokenInput = g_tokenMasterKey;
-            tokenInput.push_back((vId >> 24) & 0xFF); tokenInput.push_back((vId >> 16) & 0xFF);
-            tokenInput.push_back((vId >>  8) & 0xFF); tokenInput.push_back( vId        & 0xFF);
+            std::string registrationCid;
+            bool thresholdApproved = ApproveControllerThresholdRegistration(
+                GetControllerIndexForRsu(originRsuId),
+                originRsuId,
+                vId,
+                vin,
+                reqTag.gpsX,
+                reqTag.gpsY,
+                reqTag.timestamp,
+                registrationCid);
+            if (!thresholdApproved)
+            {
+                std::cout << "[Reg] Controller: registration threshold NOT met vehicle="
+                          << vId << " cid=" << registrationCid << " — token denied\n";
+                return;
+            }
             auto __tg0 = std::chrono::high_resolution_clock::now();
-            std::vector<uint8_t> token = CryptoSha256(tokenInput);
+            std::vector<uint8_t> token =
+                GenerateThresholdApprovedVehicleToken(vId, registrationCid);
             auto __tg1 = std::chrono::high_resolution_clock::now();
             double __tgMs = std::chrono::duration<double, std::milli>(__tg1 - __tg0).count();
-            std::cout << "[Latency] REG_REQUEST  sdn_controller/0"
+            std::cout << "[Latency] REG_REQUEST  sdn_controller/"
+                      << GetControllerIndexForRsu(rIdx)
                       << "  token_generate  " << __tgMs << "\n";
 
-            // Write token to global store directly (simulation shared-memory).
-            g_globalTokenStore[vId]     = token;
-            g_controllerTokenStore[vId] = token;
+            StoreThresholdApprovedToken(vId, registrationCid, token);
 
             std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                       << "[Reg] Controller: token generated for vehicle=" << vId
-                      << " (VIN verified, V-Ctrl nested) → g_globalTokenStore updated\n";
+                      << " (threshold approved, CID=" << registrationCid
+                      << ") → token stores updated\n";
 
             // Encrypt token with V-Ctrl key for secure delivery to vehicle.
             // innerTokenBlob = iv(12) + seqNum(4B) + AES-GCM(V-Ctrl, token(32B))
@@ -4927,7 +5901,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             std::vector<uint8_t> tCipher = CryptoAesGcmEncrypt(vCtrlKey, tIv, token, tAad);
             auto __te1 = std::chrono::high_resolution_clock::now();
             double __teMs = std::chrono::duration<double, std::milli>(__te1 - __te0).count();
-            std::cout << "[Latency] REG_CONFIRM  sdn_controller/0"
+            std::cout << "[Latency] REG_CONFIRM  sdn_controller/"
+                      << GetControllerIndexForRsu(rIdx)
                       << "  inner_encrypt(V-Ctrl)  " << __teMs << "\n";
             if (tCipher.empty()) { std::cerr << "[Reg] Token V-Ctrl encrypt failed\n"; return; }
 
@@ -4981,16 +5956,29 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
             {
                 std::cerr << "[Reg] Controller: token master key not loaded\n"; return;
             }
-            std::vector<uint8_t> tokenInput = g_tokenMasterKey;
-            tokenInput.push_back((vId >> 24) & 0xFF); tokenInput.push_back((vId >> 16) & 0xFF);
-            tokenInput.push_back((vId >>  8) & 0xFF); tokenInput.push_back( vId        & 0xFF);
-            std::vector<uint8_t> token = CryptoSha256(tokenInput);
-
-            g_globalTokenStore[vId]     = token;
-            g_controllerTokenStore[vId] = token;
+            std::string registrationCid;
+            bool thresholdApproved = ApproveControllerThresholdRegistration(
+                GetControllerIndexForRsu(fwdTag.rsuId),
+                fwdTag.rsuId,
+                vId,
+                vin,
+                fwdTag.gpsX,
+                fwdTag.gpsY,
+                fwdTag.timestamp,
+                registrationCid);
+            if (!thresholdApproved)
+            {
+                std::cout << "[Reg] Controller: registration threshold NOT met vehicle="
+                          << vId << " cid=" << registrationCid << " — token denied\n";
+                return;
+            }
+            std::vector<uint8_t> token =
+                GenerateThresholdApprovedVehicleToken(vId, registrationCid);
+            StoreThresholdApprovedToken(vId, registrationCid, token);
 
             std::cout << "[Reg] Controller: token generated for vehicle=" << vId
-                      << " (VIN verified) → g_globalTokenStore updated\n";
+                      << " (threshold approved, CID=" << registrationCid
+                      << ") → token stores updated\n";
             SendRegResponse(fwdTag.rsuId, vId, token);
         }
     }
@@ -6377,20 +7365,43 @@ LogReceivedPacket(const std::string& receiverRole,
 
                         // ── Token authentication ──────────────────────────────
                         bool hasToken = (plaintext[0] != 0);
+                        std::string receivedTokenHashHex;
+                        std::string expectedTokenHashHex;
+                        std::string tokenRecordCid;
                         auto __ta0 = std::chrono::high_resolution_clock::now();
                         if (hasToken)
                         {
                             std::vector<uint8_t> recvTok(plaintext.begin() + 1,
                                                          plaintext.begin() + 33);
-                            auto tokenIt = g_globalTokenStore.find(vId);
-                            if (tokenIt != g_globalTokenStore.end() &&
-                                tokenIt->second == recvTok)
+                            receivedTokenHashHex = BytesToHex(CryptoSha256(recvTok));
+                            if (rId < g_rsuTokenRecordCidCache.size())
+                            {
+                                auto cidIt = g_rsuTokenRecordCidCache[rId].find(vId);
+                                if (cidIt != g_rsuTokenRecordCidCache[rId].end())
+                                    tokenRecordCid = cidIt->second;
+                            }
+                            if (rId < g_rsuTokenHashCache.size())
+                            {
+                                auto hashIt = g_rsuTokenHashCache[rId].find(vId);
+                                if (hashIt != g_rsuTokenHashCache[rId].end())
+                                    expectedTokenHashHex = hashIt->second;
+                            }
+                            if (!expectedTokenHashHex.empty() &&
+                                receivedTokenHashHex == expectedTokenHashHex)
                                 tokenAccepted = true;
                         }
                         auto __ta1 = std::chrono::high_resolution_clock::now();
                         double __authMs = std::chrono::duration<double, std::milli>(__ta1 - __ta0).count();
                         std::cout << "[Latency] V2RSU_REPORT  rsu_edge/" << rId
                                   << "  token_auth  " << __authMs << "\n";
+                        if (hasToken)
+                        {
+                            std::cout << "[Reg] RSU " << rId
+                                      << ": token commitment checked from synced cache"
+                                      << " vehicle=" << vId
+                                      << " cid=" << (tokenRecordCid.empty() ? "(none)" : tokenRecordCid)
+                                      << std::endl;
+                        }
 
                         if (hasToken && tokenAccepted)
                         {
@@ -6526,7 +7537,7 @@ LogReceivedPacket(const std::string& receiverRole,
     bool v2vSigValid = true;  // default: accept if no signature tag (keys not loaded yet)
     if (hasTag &&
         hasBsm &&
-        receiverRole == "vehicle" &&
+        (receiverRole == "vehicle" || receiverRole == "rsu_edge") &&
         messageType == static_cast<uint32_t>(V2V_BEACON))
     {
         V2VSignatureTag sigTag;
@@ -6542,13 +7553,13 @@ LogReceivedPacket(const std::string& receiverRole,
                 v2vSigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
                 auto __t1 = std::chrono::high_resolution_clock::now();
                 double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
-                std::cout << "[Latency] V2V_BEACON  vehicle/" << receiverId
+                std::cout << "[Latency] V2V_BEACON  " << receiverRole << "/" << receiverId
                           << "  verify  " << __ms << "\n";
             }
             else
             {
                 v2vSigValid = true;
-                std::cout << "[Latency] V2V_BEACON  vehicle/" << receiverId
+                std::cout << "[Latency] V2V_BEACON  " << receiverRole << "/" << receiverId
                           << "  verify  0.000\n";
             }
 
@@ -6556,7 +7567,7 @@ LogReceivedPacket(const std::string& receiverRole,
             {
                 std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                           << "[Security] V2V beacon sig VALID"
-                          << "  Receiver=vehicle/" << receiverId
+                          << "  Receiver=" << receiverRole << "/" << receiverId
                           << "  From=vehicle/" << tag.GetRealNodeId()
                           << "  Seq=" << tag.GetSequenceNumber()
                           << std::endl;
@@ -6565,7 +7576,7 @@ LogReceivedPacket(const std::string& receiverRole,
             {
                 std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                           << "[Security] V2V beacon sig INVALID *** DROP ***"
-                          << "  Receiver=vehicle/" << receiverId
+                          << "  Receiver=" << receiverRole << "/" << receiverId
                           << "  FromReal="  << tag.GetRealNodeId()
                           << "  Claimed="   << tag.GetClaimedNodeId()
                           << "  Seq="       << tag.GetSequenceNumber()
@@ -6575,7 +7586,7 @@ LogReceivedPacket(const std::string& receiverRole,
         else if (!CryptoMechanismActive())
         {
             // No signature tag in plain-network mode — log 0.000 verify latency.
-            std::cout << "[Latency] V2V_BEACON  vehicle/" << receiverId
+            std::cout << "[Latency] V2V_BEACON  " << receiverRole << "/" << receiverId
                       << "  verify  0.000\n";
         }
     }
@@ -6778,7 +7789,7 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
 {
     SybilPacketTag baseTag(rsuIndex,
                            rsuIndex,
-                           0,
+                           GetControllerSimulationIdForRsu(rsuIndex),
                            static_cast<uint32_t>(RSU2CONTROLLER_REPORT),
                            sequenceNumber);
 
@@ -6850,8 +7861,9 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
                                const ControllerVehicleRecord& target,
                                uint32_t sequenceNumber)
 {
-    SybilPacketTag baseTag(0,
-                           0,
+    uint32_t controllerNodeId = GetControllerSimulationIdForRsu(rsuIndex);
+    SybilPacketTag baseTag(controllerNodeId,
+                           controllerNodeId,
                            rsuIndex,
                            static_cast<uint32_t>(CONTROLLER2RSU_COMMAND),
                            sequenceNumber);
@@ -6877,7 +7889,8 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
             CryptoAesGcmEncrypt(g_rsuCtrlSharedKeys[rsuIndex], iv, plaintext, aad);
         auto __t1 = std::chrono::high_resolution_clock::now();
         double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
-        std::cout << "[Latency] CTRL2RSU_CMD  sdn_controller/0"
+        std::cout << "[Latency] CTRL2RSU_CMD  sdn_controller/"
+                  << GetControllerIndexForRsu(rsuIndex)
                   << "  encrypt  " << __ms << "\n";
 
         if (ciphertext.empty())
@@ -6904,7 +7917,8 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
 
     // ── Plaintext path (no crypto or no lightweight key loaded) ───────────
     if (!CryptoMechanismActive())
-        std::cout << "[Latency] CTRL2RSU_CMD  sdn_controller/0"
+        std::cout << "[Latency] CTRL2RSU_CMD  sdn_controller/"
+                  << GetControllerIndexForRsu(rsuIndex)
                   << "  encrypt  0.000\n";
     else if (LightweightCryptoMechanismActive())
         std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
@@ -7113,7 +8127,7 @@ SendRsuControllerReport(uint32_t rsuIndex)
     g_rsuReportCount[rsuIndex] = 0;   // reset window counter after reporting
 
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
-    Ipv4Address controllerIp = g_wiredInterfaces.GetAddress(N_RSUs);
+    Ipv4Address controllerIp = GetControllerIpForRsu(rsuIndex);
 
     PurgeStaleRsuVehicleRecords(rsuIndex);
     PurgeStaleRsuAwarenessRecords(rsuIndex);
@@ -7297,14 +8311,16 @@ SendControllerRsuCommand(uint32_t rsuIndex)
     ControllerVehicleRecord target;
     bool hasTarget = SelectControllerTargetForRsu(rsuIndex, target);
 
-    Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
+    Ptr<Socket> sock = CreateSenderSocket(GetControllerNodeForRsu(rsuIndex));
     Ipv4Address rsuIp = g_wiredInterfaces.GetAddress(rsuIndex);
+    uint32_t controllerIndex = GetControllerIndexForRsu(rsuIndex);
+    uint32_t controllerNodeId = GetControllerSimulationIdForRsu(rsuIndex);
 
     if (hasTarget)
     {
         std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                   << "[SEND] [CONTROLLER2RSU_COMMAND]  "
-                  << "Controller"
+                  << "Controller=" << controllerIndex
                   << " Seq=" << g_seq
                   << " -> RSU=" << rsuIndex
                   << " TargetVehicle=" << target.realVehicleId
@@ -7319,14 +8335,14 @@ SendControllerRsuCommand(uint32_t rsuIndex)
 
     Ptr<TxInfo> tx   = Create<TxInfo>();
     tx->packetSize    = 100;
-    tx->realNodeId    = 0;
-    tx->claimedNodeId = 0;
+    tx->realNodeId    = controllerNodeId;
+    tx->claimedNodeId = controllerNodeId;
     tx->destinationId = rsuIndex;
     tx->messageType   = static_cast<uint32_t>(CONTROLLER2RSU_COMMAND);
     tx->sequenceNumber = g_seq++;
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [CONTROLLER2RSU_COMMAND]  "
-              << "Controller"
+              << "Controller=" << controllerIndex
               << " Seq=" << tx->sequenceNumber
               << " -> RSU=" << rsuIndex
               << " NoTarget (empty heartbeat)" << std::endl;
@@ -7572,18 +8588,23 @@ ColorAndLabelNodes(AnimationInterface& anim,
         anim.UpdateNodeSize(node->GetId(), 22.0, 22.0);
     }
 
-    Ptr<Node> ctrl = controller.Get(0);
-    if (IsControllerMalicious())
+    for (uint32_t i = 0; i < controller.GetN(); ++i)
     {
-        anim.UpdateNodeDescription(ctrl, "SDN-Controller-Malicious");
-        anim.UpdateNodeColor(ctrl, 180, 0, 40);           // dark red
+        Ptr<Node> ctrl = controller.Get(i);
+        std::ostringstream label;
+        label << "SDN-C" << i;
+        if (IsControllerMalicious() && i == 0)
+        {
+            label << "-Malicious";
+            anim.UpdateNodeColor(ctrl, 180, 0, 40);       // dark red
+        }
+        else
+        {
+            anim.UpdateNodeColor(ctrl, 150, 60, 220);     // purple
+        }
+        anim.UpdateNodeDescription(ctrl, label.str());
+        anim.UpdateNodeSize(ctrl->GetId(), 24.0, 24.0);
     }
-    else
-    {
-        anim.UpdateNodeDescription(ctrl, "SDN-Controller");
-        anim.UpdateNodeColor(ctrl, 150, 60, 220);         // purple
-    }
-    anim.UpdateNodeSize(ctrl->GetId(), 24.0, 24.0);
 }
 
 // ===========================================================================
@@ -7664,6 +8685,8 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
 
     getUint  ("N_Vehicles",                      N_Vehicles);
     getUint  ("N_RSUs",                          N_RSUs);
+    getUint  ("N_Controllers",                   N_Controllers);
+    getUint  ("controllerRegistrationThreshold", controllerRegistrationThreshold);
     getDouble("simTime",                         simTime);
     getBool  ("routing_test",                    routing_test);
     getDouble("beaconInterval",                  beaconInterval);
@@ -7699,6 +8722,8 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getUint  ("roadLaneCount",                   roadLaneCount);
     getDouble("laneSpacing",                     laneSpacing);
     getDouble("rsuOffsetY",                      rsuOffsetY);
+    getBool  ("passiveEvidenceOverlapTopology",  passiveEvidenceOverlapTopology);
+    getDouble("passiveEvidenceRsuSpacing",       passiveEvidenceRsuSpacing);
     getDouble("vehicleSpacing",                  vehicleSpacing);
     getDouble("minVehicleSpeed",                 minVehicleSpeed);
     getDouble("maxVehicleSpeed",                 maxVehicleSpeed);
@@ -7751,6 +8776,9 @@ main(int argc, char* argv[])
     cmd.AddValue("config",                     "Path to .cfg scenario file (key=value)",  configFile);
     cmd.AddValue("N_Vehicles",                 "Number of vehicle nodes",                N_Vehicles);
     cmd.AddValue("N_RSUs",                     "Number of RSU edge nodes",               N_RSUs);
+    cmd.AddValue("N_Controllers",              "Number of SDN controller nodes",          N_Controllers);
+    cmd.AddValue("controllerRegistrationThreshold","Controller endorsements required before registration token issue", controllerRegistrationThreshold);
+    cmd.AddValue("tokenCommitmentSyncInterval","Seconds between RSU IPFS token commitment syncs", tokenCommitmentSyncInterval);
     cmd.AddValue("simTime",                    "Simulation time in seconds",             simTime);
     cmd.AddValue("routing_test",               "Small 3-vehicle/2-RSU/1-SDN test network", routing_test);
     cmd.AddValue("beaconInterval",             "Vehicle beacon period",                  beaconInterval);
@@ -7783,6 +8811,8 @@ main(int argc, char* argv[])
     cmd.AddValue("roadLaneCount",              "Number of synthetic road lanes",roadLaneCount);
     cmd.AddValue("laneSpacing",                "Lane centre spacing in metres",laneSpacing);
     cmd.AddValue("rsuOffsetY",                 "RSU offset from road centre line in metres",rsuOffsetY);
+    cmd.AddValue("passiveEvidenceOverlapTopology","Cluster RSUs so multiple RSUs can overhear the same V2V beacon", passiveEvidenceOverlapTopology);
+    cmd.AddValue("passiveEvidenceRsuSpacing",  "Spacing between clustered RSUs for passive evidence tests", passiveEvidenceRsuSpacing);
     cmd.AddValue("vehicleSpacing",             "Initial vehicle spacing in metres",vehicleSpacing);
     cmd.AddValue("minVehicleSpeed",            "Minimum bounded-road vehicle speed in m/s",minVehicleSpeed);
     cmd.AddValue("maxVehicleSpeed",            "Maximum bounded-road vehicle speed in m/s",maxVehicleSpeed);
@@ -7810,6 +8840,18 @@ main(int argc, char* argv[])
         simTime    = std::min(simTime, 12.0);
     }
     if (N_RSUs == 0) N_RSUs = 1;
+    if (N_Controllers == 0) N_Controllers = 1;
+    controllerRegistrationThreshold =
+        std::min(std::max(1u, controllerRegistrationThreshold), N_Controllers);
+    InitializeRsuControllerAssignments();
+    PrintControllerZoneAssignments();
+    g_controllerLocalRegistrationStates.assign(N_Controllers,
+                                               ControllerLocalRegistrationState());
+    g_controllerRegistrationQuorums.clear();
+    g_controllerTokenCommitments.clear();
+    g_latestTokenManifestCid.clear();
+    g_rsuTokenRecordCidCache.assign(N_RSUs, std::map<uint32_t, std::string>());
+    g_rsuTokenHashCache.assign(N_RSUs, std::map<uint32_t, std::string>());
     if (sybil_attacker_level < 1) sybil_attacker_level = 1;
     if (sybil_attacker_level > 4) sybil_attacker_level = 4;
     g_rsuVehicleTables.assign(N_RSUs, std::map<uint32_t, RsuVehicleRecord>());
@@ -7845,6 +8887,7 @@ main(int argc, char* argv[])
     InitializeRsuVehicleTableCsv();
     InitializeRsuVehicleObservationCsv();
     InitializeRsuRegionalAwarenessCsv();
+    InitializeRsuPassiveBeaconEvidenceCsv();
     InitializeControllerVehicleTableCsv();
     InitializeControllerGlobalAwarenessCsv();
     InitializeRssiVerificationCsv();
@@ -7859,7 +8902,7 @@ main(int argc, char* argv[])
 
     g_vehicleNodes.Create(N_Vehicles);
     g_rsuNodes.Create(N_RSUs);
-    g_controllerNode.Create(1);
+    g_controllerNode.Create(N_Controllers);
 
     NodeContainer wirelessNodes;
     wirelessNodes.Add(g_vehicleNodes);
@@ -8103,11 +9146,13 @@ main(int argc, char* argv[])
 
     for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
     {
+        InstallUdpReceiver(g_rsuNodes.Get(i), VEHICLE_PORT,    "rsu_edge", i, "wifi");
         InstallUdpReceiver(g_rsuNodes.Get(i), RSU_PORT,        "rsu_edge", i, "wifi");
         InstallUdpReceiver(g_rsuNodes.Get(i), CONTROLLER_PORT, "rsu_edge", i, "csma");
     }
 
-    InstallUdpReceiver(g_controllerNode.Get(0), CONTROLLER_PORT, "sdn_controller", 0, "csma");
+    for (uint32_t i = 0; i < g_controllerNode.GetN(); ++i)
+        InstallUdpReceiver(g_controllerNode.Get(i), CONTROLLER_PORT, "sdn_controller", i, "csma");
 
     // -----------------------------------------------------------------------
     // Normal traffic scheduling
@@ -8183,6 +9228,16 @@ main(int argc, char* argv[])
         // FL aggregation round fires once per RSU report cycle (same cadence as
         // the FL protocol's communication round in the paper).
         Simulator::Schedule(Seconds(t + 0.70), &RunFLRound);
+    }
+
+    if (g_secEnabled && tokenCommitmentSyncInterval > 0.0)
+    {
+        for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
+        {
+            Simulator::Schedule(Seconds(0.25 + 0.02 * i),
+                                &SyncRsuTokenCommitmentsFromIpfs,
+                                i);
+        }
     }
 
     // Tier 2→1: RSU→Vehicle command downlink
