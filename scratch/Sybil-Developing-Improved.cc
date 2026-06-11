@@ -90,6 +90,7 @@ double cloudPresenceSyncInterval = 1.0;      ///< Seconds between controller cac
 double cloudPresenceTimeout = 8.0;           ///< Seconds before global vehicle presence rows expire.
 bool boundedRoadMobility = true;             ///< Keep vehicles inside a bounded road corridor.
 uint32_t mobility_mode = 2;                  ///< 1=test, 2=programmed road, 3-5=SUMO/ns-2 traces.
+bool sumoAutoConfig = true;                  ///< Auto-set N_Vehicles/N_RSUs from SUMO trace files.
 double roadStartX = 20.0;                    ///< Road corridor start x-coordinate.
 double roadLength = 800.0;                   ///< Road corridor length in metres.
 double roadBaseY = 40.0;                     ///< Centre y-coordinate of the road corridor.
@@ -107,13 +108,13 @@ std::string mobilityTraceFile = "";          ///< Optional one-run override for 
 std::string mobilityRsuPositionFile = "";    ///< Optional one-run override for selected SUMO RSU CSV.
 std::string mobilityMode3Name = "sumo_synthetic_urban";
 std::string mobilityMode3TraceFile = "sybil-attack/inputs/mobility/synthetic-urban/sumo_mobility.tcl";
-std::string mobilityMode3RsuPositionFile = "";
+std::string mobilityMode3RsuPositionFile = "sybil-attack/inputs/mobility/synthetic-urban/synthetic_urban_rsus.csv";
 std::string mobilityMode4Name = "sumo_colombo_small";
 std::string mobilityMode4TraceFile = "sybil-attack/inputs/mobility/colombo-small/colombo_small_mobility.tcl";
 std::string mobilityMode4RsuPositionFile = "sybil-attack/inputs/mobility/colombo-small/colombo_small_rsus_300m.csv";
-std::string mobilityMode5Name = "sumo_placeholder_third_trace";
-std::string mobilityMode5TraceFile = "";
-std::string mobilityMode5RsuPositionFile = "";
+std::string mobilityMode5Name = "sumo_kuala_lumpur_bb";
+std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_mobility.tcl";
+std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_rsus_200m.csv";
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
 std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_table_log.csv";
@@ -3255,6 +3256,126 @@ FileExists(const std::string& path)
 {
     std::ifstream f(path.c_str());
     return f.good();
+}
+
+// Returns the number of vehicles found in a SUMO/ns-2 TCL mobility trace by
+// counting how many distinct $node_(N) indices appear in the file.
+static uint32_t
+CountSumoTraceVehicles(const std::string& traceFile)
+{
+    std::ifstream f(traceFile.c_str());
+    if (!f.is_open()) return 0;
+
+    const std::string prefix = "$node_(";
+    uint32_t maxId = 0;
+    bool found = false;
+    std::string line;
+    while (std::getline(f, line))
+    {
+        std::size_t pos = 0;
+        while ((pos = line.find(prefix, pos)) != std::string::npos)
+        {
+            pos += prefix.size();
+            std::size_t end = line.find(')', pos);
+            if (end == std::string::npos) break;
+            std::string idStr = line.substr(pos, end - pos);
+            bool allDigits = !idStr.empty();
+            for (char c : idStr) if (!std::isdigit(static_cast<unsigned char>(c))) { allDigits = false; break; }
+            if (allDigits)
+            {
+                uint32_t id = static_cast<uint32_t>(std::stoul(idStr));
+                if (!found || id > maxId) { maxId = id; found = true; }
+            }
+            pos = end + 1;
+        }
+    }
+    return found ? maxId + 1 : 0;
+}
+
+// Returns the number of data rows in a RSU position CSV (excluding header).
+static uint32_t
+CountRsuPositionCsvRows(const std::string& csvFile)
+{
+    if (csvFile.empty()) return 0;
+    std::ifstream f(csvFile.c_str());
+    if (!f.is_open()) return 0;
+    std::string line;
+    std::getline(f, line); // skip header
+    uint32_t count = 0;
+    while (std::getline(f, line))
+        if (!line.empty()) ++count;
+    return count;
+}
+
+// Returns the maximum simulation time found in a SUMO ns-2 trace file by
+// scanning all "$ns_ at <time>" lines. Returns 0 if none found.
+static double
+MaxSumoTraceTime(const std::string& traceFile)
+{
+    std::ifstream f(traceFile.c_str());
+    if (!f.is_open()) return 0.0;
+    const std::string prefix = "$ns_ at ";
+    double maxT = 0.0;
+    bool found = false;
+    std::string line;
+    while (std::getline(f, line))
+    {
+        std::size_t pos = line.find(prefix);
+        if (pos == std::string::npos) continue;
+        pos += prefix.size();
+        std::size_t end = line.find(' ', pos);
+        if (end == std::string::npos) end = line.size();
+        try {
+            double t = std::stod(line.substr(pos, end - pos));
+            if (!found || t > maxT) { maxT = t; found = true; }
+        } catch (...) {}
+    }
+    return found ? maxT : 0.0;
+}
+
+// For SUMO modes (3-5), reads the trace/RSU files to auto-set N_Vehicles,
+// N_RSUs, and simTime so users do not need to manually match these to the
+// trace content. Skipped when routing_test=true or sumoAutoConfig=false.
+static void
+AutoConfigureSumoMode()
+{
+    if (!sumoAutoConfig) return;
+    if (routing_test) return;
+    if (mobility_mode < 3 || mobility_mode > 5) return;
+
+    MobilityScenario scenario = GetMobilityScenario(mobility_mode);
+    if (!scenario.usesSumoTrace || scenario.traceFile.empty()) return;
+    if (!FileExists(scenario.traceFile)) return;
+
+    uint32_t traceVehicles = CountSumoTraceVehicles(scenario.traceFile);
+    if (traceVehicles > 0 && traceVehicles != N_Vehicles)
+    {
+        std::cout << "[Mobility] sumoAutoConfig: N_Vehicles " << N_Vehicles
+                  << " -> " << traceVehicles
+                  << " (from trace " << scenario.traceFile << ")\n";
+        N_Vehicles = traceVehicles;
+    }
+
+    if (!scenario.rsuPositionFile.empty() && FileExists(scenario.rsuPositionFile))
+    {
+        uint32_t csvRsus = CountRsuPositionCsvRows(scenario.rsuPositionFile);
+        if (csvRsus > 0 && csvRsus != N_RSUs)
+        {
+            std::cout << "[Mobility] sumoAutoConfig: N_RSUs " << N_RSUs
+                      << " -> " << csvRsus
+                      << " (from RSU CSV " << scenario.rsuPositionFile << ")\n";
+            N_RSUs = csvRsus;
+        }
+    }
+
+    double traceMaxTime = MaxSumoTraceTime(scenario.traceFile);
+    if (traceMaxTime > 0.0 && simTime < traceMaxTime)
+    {
+        std::cout << "[Mobility] sumoAutoConfig: simTime " << simTime
+                  << " -> " << traceMaxTime
+                  << " (from trace " << scenario.traceFile << ")\n";
+        simTime = traceMaxTime;
+    }
 }
 
 static void
@@ -9176,6 +9297,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("cloudPresenceTimeout",            cloudPresenceTimeout);
     getDouble("channelHandshakeTimeout",         channelHandshakeTimeout);
     getUint  ("mobility_mode",                   mobility_mode);
+    getBool  ("sumoAutoConfig",                  sumoAutoConfig);
     getBool  ("boundedRoadMobility",             boundedRoadMobility);
     getDouble("roadStartX",                      roadStartX);
     getDouble("roadLength",                      roadLength);
@@ -9267,6 +9389,7 @@ main(int argc, char* argv[])
     cmd.AddValue("cloudPresenceTimeout",       "Seconds before cloud vehicle presence rows expire",cloudPresenceTimeout);
     cmd.AddValue("channelHandshakeTimeout",    "Seconds before retrying a pending V2RSU channel handshake",channelHandshakeTimeout);
     cmd.AddValue("mobility_mode",              "Mobility mode: 1=test 2=programmed road 3=SUMO trace1 4=SUMO trace2 5=SUMO trace3",mobility_mode);
+    cmd.AddValue("sumoAutoConfig",             "Auto-set N_Vehicles/N_RSUs from SUMO trace files (default true)",sumoAutoConfig);
     cmd.AddValue("boundedRoadMobility",        "Keep vehicles inside a bounded multi-lane road corridor",boundedRoadMobility);
     cmd.AddValue("roadStartX",                 "Bounded road start x-coordinate",roadStartX);
     cmd.AddValue("roadLength",                 "Bounded road length in metres",roadLength);
@@ -9302,6 +9425,7 @@ main(int argc, char* argv[])
         N_RSUs     = 2;
         simTime    = std::min(simTime, 12.0);
     }
+    AutoConfigureSumoMode();
     if (N_RSUs == 0) N_RSUs = 1;
     if (N_Controllers == 0) N_Controllers = 1;
     controllerRegistrationThreshold =
@@ -9749,7 +9873,16 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
 
     AnimationInterface anim(animFile);
-    anim.SetMaxPktsPerTraceFile(50000);
+    // With 95 vehicles beaconing every ~0.1 s the default 50 000 packet cap
+    // is hit in ~11 s, after which AnimationInterface calls StopAnimation()
+    // and all position updates stop too.  Set a large cap so the full
+    // simulation is recorded.  For routing_test (3 vehicles) 50 000 is fine;
+    // for SUMO modes scale by node count and simTime.
+    {
+        uint64_t estPkts = static_cast<uint64_t>(
+            (N_Vehicles + N_RSUs) * simTime * 20);   // ~20 pkt/node/s
+        anim.SetMaxPktsPerTraceFile(std::max(uint64_t(50000), estPkts));
+    }
     ColorAndLabelNodes(anim, g_vehicleNodes, g_rsuNodes, g_controllerNode);
 
     // -----------------------------------------------------------------------

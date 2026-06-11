@@ -1,0 +1,14 @@
+<configuration>
+  <input>
+    <net-file value="klbb.net.xml"/>
+    <route-files value="klbb.rou.xml"/>
+  </input>
+  <time>
+    <begin value="0"/>
+    <end value="120"/>
+    <step-length value="1.0"/>
+  </time>
+  <gui_only>
+    <delay value="100"/>
+  </gui_only>
+</configuration>

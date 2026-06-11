@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- generated on 2026-06-11 23:25:25.570102 by randomTrips.py UNKNOWN
+  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_car.xml <doubleminus>begin 0 <doubleminus>end 120 <doubleminus>period 2.40 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass passenger <doubleminus>seed 42 <doubleminus>trip-attributes type="car"
+-->
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <trip id="0" depart="0.00" from="467160618#2" to="-1240654525#2" type="car"/>
+    <trip id="1" depart="2.40" from="1218166483#0" to="1164093566-AddedOffRampEdge" type="car"/>
+    <trip id="2" depart="4.80" from="740625861#1" to="543320067#0" type="car"/>
+    <trip id="3" depart="7.20" from="772231795#2" to="-28271271#2" type="car"/>
+    <trip id="4" depart="9.60" from="157333587#0" to="-1272976748#0" type="car"/>
+    <trip id="5" depart="12.00" from="1164093566" to="198263623#0" type="car"/>
+    <trip id="6" depart="14.40" from="-1240654523#0" to="1116067654-AddedOffRampEdge" type="car"/>
+    <trip id="7" depart="16.80" from="472093463#0" to="264565081#5" type="car"/>
+    <trip id="8" depart="19.20" from="1167928175" to="32876419#6" type="car"/>
+    <trip id="9" depart="21.60" from="771722632#0" to="-1157823048#4" type="car"/>
+    <trip id="10" depart="24.00" from="771711955" to="605458573#6" type="car"/>
+    <trip id="11" depart="26.40" from="1351749800" to="-772457001#0" type="car"/>
+    <trip id="12" depart="28.80" from="772518908#0" to="1333615673#1" type="car"/>
+    <trip id="13" depart="31.20" from="-198263658" to="-287515063#1" type="car"/>
+    <trip id="14" depart="33.60" from="771999787" to="403472569" type="car"/>
+    <trip id="15" depart="36.00" from="771714666#1" to="708742103#1" type="car"/>
+    <trip id="16" depart="38.40" from="28271271#2" to="780297566-AddedOffRampEdge" type="car"/>
+    <trip id="17" depart="40.80" from="141019908#3" to="278000395" type="car"/>
+    <trip id="18" depart="43.20" from="771743389#2" to="436312122#0" type="car"/>
+    <trip id="19" depart="45.60" from="772010857#1" to="318470207#2" type="car"/>
+    <trip id="20" depart="48.00" from="625563911#0" to="-149518995#0" type="car"/>
+    <trip id="21" depart="50.40" from="1175797444" to="1230751739#1" type="car"/>
+    <trip id="22" depart="52.80" from="-163080910#2" to="1179663405" type="car"/>
+    <trip id="23" depart="55.20" from="-264565081#8" to="1214822090" type="car"/>
+    <trip id="24" depart="57.60" from="4661703#0" to="138203175#1" type="car"/>
+    <trip id="25" depart="60.00" from="140803615#1" to="1157823048#2" type="car"/>
+    <trip id="26" depart="62.40" from="1204829669#0" to="772484665#1" type="car"/>
+    <trip id="27" depart="64.80" from="472069765#1" to="403476182#1" type="car"/>
+    <trip id="28" depart="67.20" from="-848894232#0" to="708742103#0" type="car"/>
+    <trip id="29" depart="69.60" from="-772457001#0" to="1389171807#2" type="car"/>
+    <trip id="30" depart="72.00" from="848894232#1" to="4661703#0" type="car"/>
+    <trip id="31" depart="74.40" from="318470207#0" to="604546189" type="car"/>
+    <trip id="32" depart="76.80" from="771997961#1" to="755074942" type="car"/>
+    <trip id="33" depart="79.20" from="1177546381#0" to="-1272976748#3" type="car"/>
+    <trip id="34" depart="81.60" from="1276041499#1" to="1204829669#2" type="car"/>
+    <trip id="35" depart="84.00" from="1157823048#11" to="772514937#0" type="car"/>
+    <trip id="36" depart="86.40" from="772217965" to="1266347716#1" type="car"/>
+    <trip id="37" depart="88.80" from="772270858#0" to="169210972" type="car"/>
+    <trip id="38" depart="91.20" from="32876392#0" to="1191674371" type="car"/>
+    <trip id="39" depart="93.60" from="403472566#0" to="772267424" type="car"/>
+    <trip id="40" depart="96.00" from="1494760253#1" to="1158640160" type="car"/>
+    <trip id="41" depart="98.40" from="863227700#0" to="198263643#0" type="car"/>
+    <trip id="42" depart="100.80" from="-182295918#1" to="-149518995#1" type="car"/>
+    <trip id="43" depart="103.20" from="-28271273#6" to="4579536#2" type="car"/>
+    <trip id="44" depart="105.60" from="771696236#1" to="149518995#7" type="car"/>
+    <trip id="45" depart="108.00" from="-149518995#3" to="1389171807#3" type="car"/>
+    <trip id="46" depart="110.40" from="848894232#9" to="252085334#1" type="car"/>
+    <trip id="47" depart="112.80" from="776071665#0" to="772193116#2" type="car"/>
+    <trip id="48" depart="115.20" from="-1204829669#0" to="625563911#5" type="car"/>
+    <trip id="49" depart="117.60" from="605458572" to="252085683#4" type="car"/>
+</routes>
