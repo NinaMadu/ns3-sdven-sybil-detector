@@ -9811,7 +9811,7 @@ main(int argc, char* argv[])
             Simulator::Schedule(Seconds(t + 0.05 * i + jitter),
                                 &SendV2VBeaconTagged,
                                 vehicleSocket,
-                                Ipv4Address("10.1.1.255"),
+                                Ipv4Address("255.255.255.255"),
                                 VEHICLE_PORT,
                                 v2v);
 
