@@ -704,6 +704,18 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
     {
         g_vehicleLastRssiByClaimedId[observerIndex][claimedId] = signalNoise.signal;
     }
+
+   
+    if (observerIndex >= N_Vehicles && observerIndex < N_Vehicles + N_RSUs)
+    {
+        uint32_t rsuIdx = observerIndex - N_Vehicles;
+        RssiSybilDetector::FeedObservation(
+            rsuIdx,
+            tag.GetClaimedNodeId(),
+            tag.GetRealNodeId(),
+            signalNoise.signal,
+            Simulator::Now().GetSeconds());
+    }
 }
 
 static void

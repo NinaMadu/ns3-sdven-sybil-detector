@@ -29,12 +29,12 @@ namespace RssiSybilDetector {
 // Tunable parameters
 // =============================================================================
 
-static double   kMeanShiftR       = 2.5;   // FIX 1: was 2.0 m
+static double   kMeanShiftR       = 15.0;  // widened: RSSI position error ~5-15 m under Rayleigh fading
 static double   kMeanShiftSth     = 0.05;
 static double   kWindowSec        = 15.0;   // FIX 2: was 0.1 s
 static uint32_t kMinRsuForMmse    = 3;
 static uint32_t kMinSamplesForMle = 3;     // FIX 3
-static double   kCoLocDistThresh  = 1.5;   // FIX 4: was 3.0 m
+static double   kCoLocDistThresh  = 15.0;  // widened: matches RSSI distance estimation uncertainty
 static double   kMmseCoarseStep   = 5.0;
 static double   kMmseFineStep     = 0.5;
 
@@ -673,7 +673,7 @@ struct ResultRow {
     std::cout << "\n========================================================\n";
     std::cout << "          SECURITY EVALUATION METRICS\n";
     std::cout << "========================================================\n\n";
-    std::cout << "Mode        : MF_rule_based\n";
+    std::cout << "Mode        : RSSI_paper_baseline\n";
     std::cout << std::fixed << std::setprecision(4);
 
     std::cout << "\n--- Security Detection Metrics ---\n";
