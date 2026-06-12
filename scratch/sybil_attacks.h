@@ -594,7 +594,7 @@ OutsiderBroadcastSybilBeacon(uint32_t vehicleIndex)
               << " ClaimedOffset=(+7.5,+5)"
               << " -> Broadcast" << std::endl;
 
-    SendTaggedPacket(sock, Ipv4Address("10.1.1.255"), VEHICLE_PORT, tx);
+    SendTaggedPacket(sock, Ipv4Address("255.255.255.255"), VEHICLE_PORT, tx);
 }
 
 // ---------------------------------------------------------------------------
@@ -856,7 +856,7 @@ BroadcastSimultaneousSybilBeacon(uint32_t vehicleIndex,
               << " ClaimedOffset=(" << offX << "," << offY << ")"
               << " -> Broadcast" << std::endl;
 
-    SendTaggedPacket(sock, Ipv4Address("10.1.1.255"), VEHICLE_PORT, tx);
+    SendTaggedPacket(sock, Ipv4Address("255.255.255.255"), VEHICLE_PORT, tx);
 }
 
 #if 0
@@ -979,7 +979,7 @@ BroadcastNonSimultaneousSybilBeacon(uint32_t vehicleIndex,
               << " ClaimedOffset=(" << offX << "," << offY << ")"
               << " -> Broadcast" << std::endl;
 
-    SendTaggedPacket(sock, Ipv4Address("10.1.1.255"), VEHICLE_PORT, tx);
+    SendTaggedPacket(sock, Ipv4Address("255.255.255.255"), VEHICLE_PORT, tx);
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,7 +1080,7 @@ RelayForwardSybilBeacon(uint32_t attackerIndex, uint32_t relayEpoch)
               << " ClaimedOffset=(" << offX << "," << offY << ")"
               << " -> Broadcast" << std::endl;
 
-    SendTaggedPacket(sock, Ipv4Address("10.1.1.255"), VEHICLE_PORT, tx);
+    SendTaggedPacket(sock, Ipv4Address("255.255.255.255"), VEHICLE_PORT, tx);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- generated on 2026-06-11 23:25:27.897397 by randomTrips.py UNKNOWN
-  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_truck.xml <doubleminus>begin 0 <doubleminus>end 120 <doubleminus>period 12.00 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass truck <doubleminus>seed 42 <doubleminus>trip-attributes type="truck"
+<!-- generated on 2026-06-12 15:13:27.655546 by randomTrips.py UNKNOWN
+  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_truck.xml <doubleminus>begin 0 <doubleminus>end 600 <doubleminus>period 60.00 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass truck <doubleminus>seed 42 <doubleminus>trip-attributes type="truck"
 -->
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
-    <trip id="0" depart="0.00" from="467160618#2" to="-1240654525#2" type="truck"/>
-    <trip id="1" depart="12.00" from="1218166483#0" to="1164093566-AddedOffRampEdge" type="truck"/>
-    <trip id="2" depart="24.00" from="740625861#1" to="543320067#0" type="truck"/>
-    <trip id="3" depart="36.00" from="772231795#2" to="-28271271#2" type="truck"/>
-    <trip id="4" depart="48.00" from="157333587#0" to="-1272976748#0" type="truck"/>
-    <trip id="5" depart="60.00" from="1164093566" to="198263623#0" type="truck"/>
-    <trip id="6" depart="72.00" from="-1240654523#0" to="1116067654-AddedOffRampEdge" type="truck"/>
-    <trip id="7" depart="84.00" from="472093463#0" to="264565081#5" type="truck"/>
-    <trip id="8" depart="96.00" from="1167928175" to="32876419#6" type="truck"/>
-    <trip id="9" depart="108.00" from="771722632#0" to="-1157823048#4" type="truck"/>
+    <trip id="0" depart="0.00" from="507104058#0" to="-1307631404#1" type="truck"/>
+    <trip id="1" depart="60.00" from="755081029" to="625563911#4" type="truck"/>
+    <trip id="2" depart="120.00" from="772267429#1" to="-754779354#0" type="truck"/>
+    <trip id="3" depart="180.00" from="163080912#0" to="-1307631404#1" type="truck"/>
+    <trip id="4" depart="240.00" from="1167928176" to="318470203-AddedOffRampEdge" type="truck"/>
+    <trip id="5" depart="300.00" from="604535881" to="403470389#0" type="truck"/>
+    <trip id="6" depart="360.00" from="1174598084" to="472093471" type="truck"/>
+    <trip id="7" depart="420.00" from="771989745" to="-1157823048#8" type="truck"/>
+    <trip id="8" depart="480.00" from="771743389#0" to="740625861#0" type="truck"/>
+    <trip id="9" depart="540.00" from="1346302472#2" to="1113253996#0" type="truck"/>
 </routes>

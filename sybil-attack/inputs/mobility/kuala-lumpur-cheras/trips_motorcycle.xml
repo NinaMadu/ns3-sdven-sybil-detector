@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- generated on 2026-06-12 16:08:18.449476 by randomTrips.py UNKNOWN
+  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-cheras/trips_motorcycle.xml <doubleminus>begin 0 <doubleminus>end 600 <doubleminus>period 15.00 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass motorcycle <doubleminus>seed 42 <doubleminus>trip-attributes type="motorcycle"
+-->
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <trip id="0" depart="0.00" from="39907063#3" to="-1177755172" type="motorcycle"/>
+    <trip id="1" depart="15.00" from="-544047547#6" to="-39919057#1" type="motorcycle"/>
+    <trip id="2" depart="30.00" from="39923136#1" to="39920408#0" type="motorcycle"/>
+    <trip id="3" depart="45.00" from="765326036#2" to="-194884058#6" type="motorcycle"/>
+    <trip id="4" depart="60.00" from="-931360951" to="-1188868146#0" type="motorcycle"/>
+    <trip id="5" depart="75.00" from="-39922331#0" to="165480812#0" type="motorcycle"/>
+    <trip id="6" depart="90.00" from="-125444201#1" to="-39912986" type="motorcycle"/>
+    <trip id="7" depart="105.00" from="39909725#0" to="360641375#3" type="motorcycle"/>
+    <trip id="8" depart="120.00" from="-39922435" to="39901897#3" type="motorcycle"/>
+    <trip id="9" depart="135.00" from="605156146" to="-110431586#2" type="motorcycle"/>
+    <trip id="10" depart="150.00" from="605137037" to="39922359" type="motorcycle"/>
+    <trip id="11" depart="165.00" from="-724658220#3" to="-39904619#5" type="motorcycle"/>
+    <trip id="12" depart="180.00" from="772465394" to="-66473321#1" type="motorcycle"/>
+    <trip id="13" depart="195.00" from="-39896815#6" to="-252891489" type="motorcycle"/>
+    <trip id="14" depart="210.00" from="66376570#5" to="39907546#1" type="motorcycle"/>
+    <trip id="15" depart="225.00" from="605145804" to="502518529#5" type="motorcycle"/>
+    <trip id="16" depart="240.00" from="180918996#0" to="774748338#1" type="motorcycle"/>
+    <trip id="17" depart="255.00" from="-765356863#4" to="39896417#2" type="motorcycle"/>
+    <trip id="18" depart="270.00" from="652723344#7" to="39910050#3" type="motorcycle"/>
+    <trip id="19" depart="285.00" from="722915942" to="39900500#2" type="motorcycle"/>
+    <trip id="20" depart="300.00" from="39919057#4" to="-1378243659#1" type="motorcycle"/>
+    <trip id="21" depart="315.00" from="-39922890" to="-536271571#2" type="motorcycle"/>
+    <trip id="22" depart="330.00" from="-252751235#0" to="-39920442#2" type="motorcycle"/>
+    <trip id="23" depart="345.00" from="-39899220#1" to="-39926127#3" type="motorcycle"/>
+    <trip id="24" depart="360.00" from="39906494" to="-765305412#1" type="motorcycle"/>
+    <trip id="25" depart="375.00" from="-765326036#4" to="-39914557#0" type="motorcycle"/>
+    <trip id="26" depart="390.00" from="-544046577#1" to="772180693" type="motorcycle"/>
+    <trip id="27" depart="405.00" from="39908006" to="39909324#0" type="motorcycle"/>
+    <trip id="28" depart="420.00" from="-39913166#2" to="502518529#2" type="motorcycle"/>
+    <trip id="29" depart="435.00" from="-39912044#1" to="-765356867#4" type="motorcycle"/>
+    <trip id="30" depart="450.00" from="833841348" to="39912802#1" type="motorcycle"/>
+    <trip id="31" depart="465.00" from="201391391#0" to="39921223#0" type="motorcycle"/>
+    <trip id="32" depart="480.00" from="66376563" to="604477501" type="motorcycle"/>
+    <trip id="33" depart="495.00" from="-39923136#0" to="-1229214360#0" type="motorcycle"/>
+    <trip id="34" depart="510.00" from="-652723344#4" to="-39924362#1" type="motorcycle"/>
+    <trip id="35" depart="525.00" from="-39921325#0" to="772222441#1" type="motorcycle"/>
+    <trip id="36" depart="540.00" from="764337186" to="-605137028#1" type="motorcycle"/>
+    <trip id="37" depart="555.00" from="39910039#6" to="-772465255#8" type="motorcycle"/>
+    <trip id="38" depart="570.00" from="771927574" to="1226399439" type="motorcycle"/>
+    <trip id="39" depart="585.00" from="-544046577#0" to="-39921891#1" type="motorcycle"/>
+</routes>
