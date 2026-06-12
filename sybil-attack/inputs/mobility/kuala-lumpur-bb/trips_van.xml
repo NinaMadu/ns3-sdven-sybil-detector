@@ -1,26 +1,36 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- generated on 2026-06-12 03:17:01.110049 by randomTrips.py UNKNOWN
-  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_van.xml <doubleminus>begin 0 <doubleminus>end 600 <doubleminus>period 30.00 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass delivery <doubleminus>seed 42 <doubleminus>trip-attributes type="van"
+<!-- generated on 2026-06-12 15:13:26.910725 by randomTrips.py UNKNOWN
+  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_van.xml <doubleminus>begin 0 <doubleminus>end 600 <doubleminus>period 20.00 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass delivery <doubleminus>seed 42 <doubleminus>trip-attributes type="van"
 -->
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
-    <trip id="0" depart="0.00" from="170306746#1" to="-1240654525#3" type="van"/>
-    <trip id="1" depart="30.00" from="-772193112" to="-772457002#0" type="van"/>
-    <trip id="2" depart="60.00" from="462455393" to="32876516#0" type="van"/>
-    <trip id="3" depart="90.00" from="771708751" to="-1493775795#1" type="van"/>
-    <trip id="4" depart="120.00" from="1306272855#0" to="-1246883885#0" type="van"/>
-    <trip id="5" depart="150.00" from="-1211154930#2" to="-606928400" type="van"/>
-    <trip id="6" depart="180.00" from="182293422#3" to="149518995#6" type="van"/>
-    <trip id="7" depart="210.00" from="-604802560#2" to="160196670#1" type="van"/>
-    <trip id="8" depart="240.00" from="605491545#1" to="-1139105657#2" type="van"/>
-    <trip id="9" depart="270.00" from="605485489#2" to="4579536#3" type="van"/>
-    <trip id="10" depart="300.00" from="1165306957" to="-471963814" type="van"/>
-    <trip id="11" depart="330.00" from="772514940#1" to="1229005337" type="van"/>
-    <trip id="12" depart="360.00" from="-1461273758#1" to="-1514689997" type="van"/>
-    <trip id="13" depart="390.00" from="698411996#2" to="170059718#2" type="van"/>
-    <trip id="14" depart="420.00" from="605491543" to="472212639#3" type="van"/>
-    <trip id="15" depart="450.00" from="1479952817#1" to="784396221" type="van"/>
-    <trip id="16" depart="480.00" from="1220066418#2" to="1496329796#1" type="van"/>
-    <trip id="17" depart="510.00" from="606970889#1" to="170306748#4" type="van"/>
-    <trip id="18" depart="540.00" from="744823498#1" to="1526780148#1" type="van"/>
-    <trip id="19" depart="570.00" from="39912925#1" to="-1336795825#1" type="van"/>
+    <trip id="0" depart="0.00" from="507104058#0" to="-1307631404#1" type="van"/>
+    <trip id="1" depart="20.00" from="755081029" to="625563911#4" type="van"/>
+    <trip id="2" depart="40.00" from="772267429#1" to="-754779354#0" type="van"/>
+    <trip id="3" depart="60.00" from="163080912#0" to="-1307631404#1" type="van"/>
+    <trip id="4" depart="80.00" from="1167928176" to="318470203-AddedOffRampEdge" type="van"/>
+    <trip id="5" depart="100.00" from="604535881" to="403470389#0" type="van"/>
+    <trip id="6" depart="120.00" from="1174598084" to="472093471" type="van"/>
+    <trip id="7" depart="140.00" from="771989745" to="-1157823048#8" type="van"/>
+    <trip id="8" depart="160.00" from="771743389#0" to="740625861#0" type="van"/>
+    <trip id="9" depart="180.00" from="1346302472#2" to="1113253996#0" type="van"/>
+    <trip id="10" depart="200.00" from="772525377" to="1389171807#0" type="van"/>
+    <trip id="11" depart="220.00" from="-170295228" to="-771722632#3" type="van"/>
+    <trip id="12" depart="240.00" from="772000719" to="503669863#0" type="van"/>
+    <trip id="13" depart="260.00" from="771989744#0" to="754779354#0" type="van"/>
+    <trip id="14" depart="280.00" from="318470205" to="848894230" type="van"/>
+    <trip id="15" depart="300.00" from="141171493#0" to="403472571#0" type="van"/>
+    <trip id="16" depart="320.00" from="771998198" to="503669873" type="van"/>
+    <trip id="17" depart="340.00" from="772202376" to="4585482#0" type="van"/>
+    <trip id="18" depart="360.00" from="740625860" to="-149518995#7" type="van"/>
+    <trip id="19" depart="380.00" from="1174598084" to="1302406288#0" type="van"/>
+    <trip id="20" depart="400.00" from="-163080910#3" to="1191674371" type="van"/>
+    <trip id="21" depart="420.00" from="-198263658" to="1248125819" type="van"/>
+    <trip id="22" depart="440.00" from="503669872" to="157333159#0" type="van"/>
+    <trip id="23" depart="460.00" from="1180372754" to="772537514#0" type="van"/>
+    <trip id="24" depart="480.00" from="604535876#0" to="503669863#2" type="van"/>
+    <trip id="25" depart="500.00" from="-772229362#1" to="753807682#1" type="van"/>
+    <trip id="26" depart="520.00" from="-772000718#1" to="160196670#1" type="van"/>
+    <trip id="27" depart="540.00" from="827378704#0" to="604535881" type="van"/>
+    <trip id="28" depart="560.00" from="39914067" to="698411996#2" type="van"/>
+    <trip id="29" depart="580.00" from="772000717" to="771728989" type="van"/>
 </routes>

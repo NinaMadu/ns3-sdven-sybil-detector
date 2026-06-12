@@ -1,7 +1,7 @@
 <configuration>
   <input>
-    <net-file value="klbb.net.xml"/>
-    <route-files value="klbb.rou.xml"/>
+    <net-file value="klcp.net.xml"/>
+    <route-files value="klcp.rou.xml"/>
   </input>
   <time>
     <begin value="0"/>

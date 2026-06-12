@@ -1,26 +1,46 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- generated on 2026-06-12 03:17:02.139314 by randomTrips.py UNKNOWN
-  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_motorcycle.xml <doubleminus>begin 0 <doubleminus>end 600 <doubleminus>period 30.00 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass motorcycle <doubleminus>seed 42 <doubleminus>trip-attributes type="motorcycle"
+<!-- generated on 2026-06-12 15:13:28.290897 by randomTrips.py UNKNOWN
+  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_motorcycle.xml <doubleminus>begin 0 <doubleminus>end 600 <doubleminus>period 15.00 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass motorcycle <doubleminus>seed 42 <doubleminus>trip-attributes type="motorcycle"
 -->
 <routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
-    <trip id="0" depart="0.00" from="467160618#2" to="-1240654525#2" type="motorcycle"/>
-    <trip id="1" depart="30.00" from="1218166483#0" to="1164093566-AddedOffRampEdge" type="motorcycle"/>
-    <trip id="2" depart="60.00" from="740625861#1" to="543320067#0" type="motorcycle"/>
-    <trip id="3" depart="90.00" from="772231795#2" to="-28271271#2" type="motorcycle"/>
-    <trip id="4" depart="120.00" from="157333587#0" to="-1272976748#0" type="motorcycle"/>
-    <trip id="5" depart="150.00" from="1164093566" to="198263623#0" type="motorcycle"/>
-    <trip id="6" depart="180.00" from="-1240654523#0" to="1116067654-AddedOffRampEdge" type="motorcycle"/>
-    <trip id="7" depart="210.00" from="472093463#0" to="264565081#5" type="motorcycle"/>
-    <trip id="8" depart="240.00" from="1167928175" to="32876419#6" type="motorcycle"/>
-    <trip id="9" depart="270.00" from="771722632#0" to="-1157823048#4" type="motorcycle"/>
-    <trip id="10" depart="300.00" from="771711955" to="605458573#6" type="motorcycle"/>
-    <trip id="11" depart="330.00" from="1351749800" to="-772457001#0" type="motorcycle"/>
-    <trip id="12" depart="360.00" from="772518908#0" to="1333615673#1" type="motorcycle"/>
-    <trip id="13" depart="390.00" from="-198263658" to="-287515063#1" type="motorcycle"/>
-    <trip id="14" depart="420.00" from="771999787" to="403472569" type="motorcycle"/>
-    <trip id="15" depart="450.00" from="771714666#1" to="708742103#1" type="motorcycle"/>
-    <trip id="16" depart="480.00" from="28271271#2" to="780297566-AddedOffRampEdge" type="motorcycle"/>
-    <trip id="17" depart="510.00" from="141019908#3" to="278000395" type="motorcycle"/>
-    <trip id="18" depart="540.00" from="771743389#2" to="436312122#0" type="motorcycle"/>
-    <trip id="19" depart="570.00" from="772010857#1" to="318470207#2" type="motorcycle"/>
+    <trip id="0" depart="0.00" from="507104058#0" to="-1307631404#1" type="motorcycle"/>
+    <trip id="1" depart="15.00" from="755081029" to="625563911#4" type="motorcycle"/>
+    <trip id="2" depart="30.00" from="772267429#1" to="-754779354#0" type="motorcycle"/>
+    <trip id="3" depart="45.00" from="163080912#0" to="-1307631404#1" type="motorcycle"/>
+    <trip id="4" depart="60.00" from="1167928176" to="318470203-AddedOffRampEdge" type="motorcycle"/>
+    <trip id="5" depart="75.00" from="604535881" to="403470389#0" type="motorcycle"/>
+    <trip id="6" depart="90.00" from="1174598084" to="472093471" type="motorcycle"/>
+    <trip id="7" depart="105.00" from="771989745" to="-1157823048#8" type="motorcycle"/>
+    <trip id="8" depart="120.00" from="771743389#0" to="740625861#0" type="motorcycle"/>
+    <trip id="9" depart="135.00" from="1346302472#2" to="1113253996#0" type="motorcycle"/>
+    <trip id="10" depart="150.00" from="772525377" to="1389171807#0" type="motorcycle"/>
+    <trip id="11" depart="165.00" from="-170295228" to="-771722632#3" type="motorcycle"/>
+    <trip id="12" depart="180.00" from="772000719" to="503669863#0" type="motorcycle"/>
+    <trip id="13" depart="195.00" from="771989744#0" to="754779354#0" type="motorcycle"/>
+    <trip id="14" depart="210.00" from="318470205" to="848894230" type="motorcycle"/>
+    <trip id="15" depart="225.00" from="141171493#0" to="403472571#0" type="motorcycle"/>
+    <trip id="16" depart="240.00" from="771998198" to="503669873" type="motorcycle"/>
+    <trip id="17" depart="255.00" from="772202376" to="4585482#0" type="motorcycle"/>
+    <trip id="18" depart="270.00" from="740625860" to="-149518995#7" type="motorcycle"/>
+    <trip id="19" depart="285.00" from="1174598084" to="1302406288#0" type="motorcycle"/>
+    <trip id="20" depart="300.00" from="-163080910#3" to="1191674371" type="motorcycle"/>
+    <trip id="21" depart="315.00" from="-198263658" to="1248125819" type="motorcycle"/>
+    <trip id="22" depart="330.00" from="503669872" to="157333159#0" type="motorcycle"/>
+    <trip id="23" depart="345.00" from="1180372754" to="772537514#0" type="motorcycle"/>
+    <trip id="24" depart="360.00" from="604535876#0" to="503669863#2" type="motorcycle"/>
+    <trip id="25" depart="375.00" from="-772229362#1" to="753807682#1" type="motorcycle"/>
+    <trip id="26" depart="390.00" from="-772000718#1" to="160196670#1" type="motorcycle"/>
+    <trip id="27" depart="405.00" from="827378704#0" to="604535881" type="motorcycle"/>
+    <trip id="28" depart="420.00" from="39914067" to="698411996#2" type="motorcycle"/>
+    <trip id="29" depart="435.00" from="772000717" to="771728989" type="motorcycle"/>
+    <trip id="30" depart="450.00" from="1175797444" to="-1346302472#1" type="motorcycle"/>
+    <trip id="31" depart="465.00" from="1300412145" to="1232130283#0" type="motorcycle"/>
+    <trip id="32" depart="480.00" from="1157823048#9" to="773809451" type="motorcycle"/>
+    <trip id="33" depart="495.00" from="772231795#0" to="135722396" type="motorcycle"/>
+    <trip id="34" depart="510.00" from="604546193" to="163080910#4" type="motorcycle"/>
+    <trip id="35" depart="525.00" from="772463864" to="198263655#0" type="motorcycle"/>
+    <trip id="36" depart="540.00" from="1180372754" to="1211154930#0" type="motorcycle"/>
+    <trip id="37" depart="555.00" from="39914067" to="1232130280" type="motorcycle"/>
+    <trip id="38" depart="570.00" from="149518995#0" to="1179816735" type="motorcycle"/>
+    <trip id="39" depart="585.00" from="863227700#0" to="318470206#0" type="motorcycle"/>
 </routes>

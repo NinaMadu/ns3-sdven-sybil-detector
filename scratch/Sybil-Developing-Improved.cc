@@ -109,9 +109,9 @@ std::string mobilityRsuPositionFile = "";    ///< Optional one-run override for 
 std::string mobilityMode3Name = "sumo_synthetic_urban";
 std::string mobilityMode3TraceFile = "sybil-attack/inputs/mobility/synthetic-urban/sumo_mobility.tcl";
 std::string mobilityMode3RsuPositionFile = "sybil-attack/inputs/mobility/synthetic-urban/synthetic_urban_rsus.csv";
-std::string mobilityMode4Name = "sumo_colombo_small";
-std::string mobilityMode4TraceFile = "sybil-attack/inputs/mobility/colombo-small/colombo_small_mobility.tcl";
-std::string mobilityMode4RsuPositionFile = "sybil-attack/inputs/mobility/colombo-small/colombo_small_rsus_300m.csv";
+std::string mobilityMode4Name = "sumo_kl_cheras";
+std::string mobilityMode4TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_mobility.tcl";
+std::string mobilityMode4RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_rsus_200m.csv";
 std::string mobilityMode5Name = "sumo_kuala_lumpur_bb";
 std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_mobility.tcl";
 std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_rsus_200m.csv";
@@ -3369,12 +3369,21 @@ AutoConfigureSumoMode()
     }
 
     double traceMaxTime = MaxSumoTraceTime(scenario.traceFile);
-    if (traceMaxTime > 0.0 && simTime < traceMaxTime)
+    // Only auto-set simTime when the user left it at the 12 s default.
+    // If the user passed an explicit --simTime value, honour it so that
+    // short test runs (e.g. --simTime=60) work with the full-length traces.
+    const double kDefaultSimTime = 12.0;
+    if (traceMaxTime > 0.0 && simTime <= kDefaultSimTime)
     {
         std::cout << "[Mobility] sumoAutoConfig: simTime " << simTime
                   << " -> " << traceMaxTime
                   << " (from trace " << scenario.traceFile << ")\n";
         simTime = traceMaxTime;
+    }
+    else if (traceMaxTime > 0.0)
+    {
+        std::cout << "[Mobility] sumoAutoConfig: simTime kept at user value "
+                  << simTime << " s (trace has " << traceMaxTime << " s)\n";
     }
 }
 
@@ -9706,25 +9715,29 @@ main(int argc, char* argv[])
     internet.Install(g_controllerNode);
 
     Ipv4AddressHelper ipv4;
+    // /22 subnets (1022 usable addresses each) so large scenarios with
+    // hundreds of vehicles + RSUs never overflow a /24 (254 addresses).
+    // Each block is spaced 4 apart in the third octet to avoid overlap.
     // ch178 CCH — primary; used for all V2V/V2RSU/RSU2SDN addressing
-    ipv4.SetBase("10.1.1.0", "255.255.255.0");
+    ipv4.SetBase("10.1.0.0", "255.255.252.0");
     g_wirelessInterfaces = ipv4.Assign(wirelessDevices);
 
-    // ch172–184 SCH — secondary channels; assigned separate subnets
-    ipv4.SetBase("10.1.3.0", "255.255.255.0");
+    // ch172–184 SCH — secondary channels; assigned separate /22 subnets
+    ipv4.SetBase("10.1.4.0", "255.255.252.0");
     ipv4.Assign(wirelessDevices_172);
-    ipv4.SetBase("10.1.4.0", "255.255.255.0");
+    ipv4.SetBase("10.1.8.0", "255.255.252.0");
     ipv4.Assign(wirelessDevices_174);
-    ipv4.SetBase("10.1.5.0", "255.255.255.0");
+    ipv4.SetBase("10.1.12.0", "255.255.252.0");
     ipv4.Assign(wirelessDevices_176);
-    ipv4.SetBase("10.1.6.0", "255.255.255.0");
+    ipv4.SetBase("10.1.16.0", "255.255.252.0");
     ipv4.Assign(wirelessDevices_180);
-    ipv4.SetBase("10.1.7.0", "255.255.255.0");
+    ipv4.SetBase("10.1.20.0", "255.255.252.0");
     ipv4.Assign(wirelessDevices_182);
-    ipv4.SetBase("10.1.8.0", "255.255.255.0");
+    ipv4.SetBase("10.1.24.0", "255.255.252.0");
     ipv4.Assign(wirelessDevices_184);
 
-    ipv4.SetBase("10.1.2.0", "255.255.255.0");
+    // Wired RSU↔controller CSMA — 122 RSUs + controller fits in /24
+    ipv4.SetBase("10.1.28.0", "255.255.255.0");
     g_wiredInterfaces = ipv4.Assign(wiredDevices);
 
     // -----------------------------------------------------------------------
