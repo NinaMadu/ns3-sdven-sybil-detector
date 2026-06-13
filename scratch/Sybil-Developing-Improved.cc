@@ -8870,7 +8870,7 @@ static void
 SendControllerRsuCommand(uint32_t rsuIndex)
 {
     if (RssiSolutionModeActive() && rsuIndex == 0)
-        RssiSybilDetector::RunDetection(0.0, 200.0, 20.0, 110.0, 65.0);
+        RssiSybilDetector::RunDetection();
 
     // Type 6: malicious controller injects Sybil records into its global table.
     // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections

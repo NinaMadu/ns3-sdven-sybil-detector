@@ -1,63 +1,50 @@
 // =============================================================================
-// rssi_sybil_detection.h  — IMPROVED (FP-reduction patch)
+// rssi_sybil_detection.h
 //
-// RSSI-Based Sybil Attack Detection — Paper Baseline Implementation
-// Tailored for: Sybil-Developing-Improved.cc (SDVEN simulator)
+// RSSI-Based Sybil Attack Detection (attack types 1–4 only)
 //
 // Paper: Liu et al., "RSSI-Based Sybil Attack Detection Under Fading
 //        Channel in VANET," IEEE ICC 2023.
 //
-// ─── What changed vs the original and WHY ────────────────────────────────────
+// ─── Algorithm pipeline ──────────────────────────────────────────────────────
 //
-//  FIX 1 — Mean-Shift radius R: 2.0 m → 2.5 m  (paper §IV-B recommends 2.5 m
-//           as the sweet-spot that minimises BOTH FAR and MDR simultaneously).
-//           The original 2.0 m was too tight, causing the algorithm to split
-//           nearby LEGITIMATE vehicles into separate clusters that were then
-//           wrongly merged in subsequent rounds, producing spurious FPs.
+//  FeedObservation() — called by every RSU that receives a beacon
+//    • Stores (time, rssiDbm, realId) in a per-(RSU, claimedId) rolling buffer
+//    • Prunes samples older than kWindowSec (0.3 s)
 //
-//  FIX 2 — RSSI rolling window: 0.1 s → 0.3 s  (paper §IV-B optimum).
-//           0.1 s gave too few RSSI samples for accurate MLE (paper Fig. 4:
-//           FAR/MDR are worst at very short detection times). 0.3 s gathers
-//           ~300 samples at 1-kHz beacon rate which allows the geometric-mean
-//           MLE to converge to an accurate distance estimate, so positions are
-//           better separated and the clustering step generates fewer FPs.
-//           Note: 0.3 s << vehicle coherence time (~1 ms × many blocks) so
-//           mobility bias is still negligible (paper §IV-B justification).
+//  RunDetection() — called every rsuReportInterval (triggered at RSU 0)
+//    Step 1  MLEDist      : rolling RSSI buffer → Rayleigh MLE → distance d̂
+//    Step 2a EstimatePos  : ≥3 RSUs → MMSE grid search (centroid-guided)
+//    Step 2b RoadConstrained: 2 RSUs → project onto RSU–RSU line segment
+//    Step 3  MeanShift    : cluster estimated positions, R = 2.5 m
+//                          cluster with >1 distinct claimedId → Sybil
+//    Step 4  Co-loc fallback: 1 RSU, |d_a − d_b| < 1.5 m → Sybil
+//    Step 5  Score        : TP/FP/TN/FN with per-ID deduplication
 //
-//  FIX 3 — Minimum sample guard in MLEDist().
-//           With 0.3 s windows, early-in-simulation buffers may still be thin.
-//           We now require kMinSamplesForMle (= 3) samples before trusting the
-//           MLE output. Identities with too few samples are deferred to the
-//           single-RSU co-location fallback, preventing noisy distance
-//           estimates from producing wrong positions that land inside another
-//           vehicle's cluster and generate FPs.
+// ─── Design choices ──────────────────────────────────────────────────────────
 //
-//  FIX 4 — Co-location threshold tightened: 3.0 m → 1.5 m.
-//           The single-RSU fallback compares |d_a - d_b| < threshold. With the
-//           previous 3.0 m threshold, two REAL vehicles driving in adjacent
-//           lanes (lane width ≈ 3.5 m) often satisfied the test and were
-//           wrongly flagged. 1.5 m is tighter than the minimum inter-vehicle
-//           gap (5 m in the simulation) while still capturing true Sybil pairs
-//           that share the EXACT same physical node (Δd ≈ 0 m).
+//  • Road bounding box is derived automatically from RSU positions in Init()
+//    so the detector works on any mobility scenario without manual tuning.
 //
-//  FIX 5 — Cluster minimum size guard.
-//           The paper (§III-C) flags a cluster as Sybil only when MORE THAN
-//           ONE distinct identity appears at the same position. We now also
-//           require that a flagged cluster contains identities from at LEAST
-//           two different claimedIds that were each independently observed
-//           (not just duplicated buffer entries for the same id). This prevents
-//           a single identity appearing in multiple RSU windows from being
-//           double-counted into a cluster that looks like size > 1.
+//  • MMSE search is centroid-guided: the search window is centred on the
+//    inverse-distance-weighted centroid of visible RSUs, radius = 1.5×dMax+50m
+//    (≤ 400 m). This keeps the grid small (~14 k points) regardless of the
+//    total network size, making Mode 4 (2.6 km × 2.9 km, 122 RSUs) tractable.
 //
-//  FIX 6 — Per-detection-round deduplication of TP/FP/TN/FN counters.
-//           RunDetection() is called every rsuReportInterval (1.5 s). Without
-//           deduplication, the SAME claimedId was counted in EVERY round even
-//           after it had already been correctly classified, inflating all four
-//           counters and making FP look artificially large. We now track which
-//           (claimedId, verdict) pairs have been committed and only count new
-//           or changed verdicts.
+//  • The 2-RSU fallback projects onto the RSU–RSU line, not onto a hardcoded
+//    horizontal road. This is correct for any road orientation.
 //
-// ─── Integration — identical to original (no changes to the 5-step API) ─────
+//  • kTxPowerDbm = 10.0 dBm is used BOTH here (MLEDist) and in the .cc file
+//    (RSSI computation). They are consistent. The PHY layer uses 23 dBm but
+//    that layer's signal is not what FeedObservation receives; the .cc computes
+//    RSSI from this model constant, so the round-trip d → RSSI → d̂ closes.
+//
+//  • actSybil = (realId != claimedId). Correct for attack types 1–4:
+//      Type 1 outsider, Type 2 simultaneous, Type 3 non-simultaneous,
+//      Type 4 indirect relay — all produce packets where realId ≠ claimedId.
+//    Types 5/6 are excluded from this detector by design.
+//
+// ─── Integration ─────────────────────────────────────────────────────────────
 //  1. #include "rssi_sybil_detection.h"
 //  2. RssiSybilDetector::Init(N_RSUs, rsuPos);
 //  3. RssiSybilDetector::FeedObservation(rsuId, claimedId, realId, rssiDbm, t);
@@ -72,6 +59,7 @@
 #include <cmath>
 #include <deque>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <set>
@@ -84,55 +72,52 @@ namespace RssiSybilDetector {
 // Tunable parameters
 // =============================================================================
 
-/// FIX 1 — Mean-Shift searching radius R (metres).
-/// Paper §IV-B: "A wise choice of R can be around 2.5 m to minimize both
-/// FAR and MDR."  Original was 2.0 m which is too tight (causes FPs).
+/// Mean-Shift searching radius (metres). Paper §IV-B recommends 2.5 m.
 static double kMeanShiftR = 2.5;
 
 /// Mean-Shift convergence threshold (metres).
 static double kMeanShiftSth = 0.05;
 
-/// FIX 2 — RSSI rolling window duration (seconds).
-/// Paper §IV-B optimal detection time ≈ 0.3 s (Fig. 4 minimum FAR/MDR point).
-/// Original 0.1 s was too short → too few MLE samples → noisy distances → FPs.
-static double kWindowSec = 0.3;
+/// RSSI rolling window duration (seconds).
+/// Paper §IV-B uses 0.3 s at 1 kHz beacon rate (~300 samples/window).
+/// Our simulation uses beaconInterval=1.0 s (V2V beacon + V2RSU report per cycle
+/// = 2 observations/s per RSU). Window must span > 1 full beacon cycle to
+/// accumulate ≥ kMinSamplesForMle samples. 2.0 s gives 4 samples/window reliably.
+static double kWindowSec = 2.0;
 
 /// Minimum RSUs needed to attempt MMSE positioning (paper: 3).
 static uint32_t kMinRsuForMmse = 3;
 
-/// FIX 3 — Minimum RSSI samples before MLEDist() is trusted.
-/// Buffers with fewer samples produce unreliable distance estimates.
+/// Minimum RSSI samples before MLEDist() is trusted.
 static uint32_t kMinSamplesForMle = 3;
 
-/// FIX 4 — Co-location distance threshold for single-RSU fallback (metres).
-/// Tightened from 3.0 m to 1.5 m to prevent adjacent-lane vehicles (gap ~3.5 m)
-/// from being falsely flagged as co-located.
+/// Co-location distance threshold for single-RSU fallback (metres).
+/// Tight enough to avoid flagging adjacent-lane vehicles (~3.5 m apart).
 static double kCoLocDistThresh = 1.5;
 
-/// MMSE grid search step — coarse pass (metres).
+/// MMSE grid step — coarse pass (metres).
 static double kMmseCoarseStep = 5.0;
 
-/// MMSE grid search step — fine pass (metres).
+/// MMSE grid step — fine pass (metres).
 static double kMmseFineStep = 0.5;
 
 /// Output CSV path.
 static std::string kCsvPath = "sybil-attack/outputs/rssi_paper_detection_log.csv";
 
 // =============================================================================
-// Channel model constants — must match Sybil-Developing-Improved.cc
-// Cost231 @ 5.9 GHz, TxPower = 23 dBm
+// Channel model constants — must match RSSI computation in Sybil-Developing-Improved.cc
+// Cost231 path loss @ 5.9 GHz, simulation Tx model = 10 dBm
 // =============================================================================
-static const double kTxPowerDbm  = 10.0;
+static const double kTxPowerDbm  = 10.0;   // simulation RSSI model (not PHY Tx power)
 static const double kPathLossExp =  2.56;
 static const double kRef1mDbm    = -47.85;
 
 // =============================================================================
-// Internal types
+// Internal state
 // =============================================================================
 
 struct RssiPos2D { double x, y; };
 
-/// One RSSI observation stored per (RSU, claimedId).
 struct RssiObs {
     double   timeSec;
     double   rssiDbm;
@@ -142,20 +127,22 @@ struct RssiObs {
 /// Per-RSU rolling observation buffers. Outer key = claimedId.
 static std::vector< std::map<uint32_t, std::deque<RssiObs>> > g_obs;
 
-/// Cached RSU positions — filled in Init().
+/// RSU positions — filled in Init().
 static std::vector<RssiPos2D> g_rsuPos;
 
-/// Number of RSUs — set in Init().
+/// Number of RSUs.
 static uint32_t g_nRsu = 0;
 
 /// Evaluation counters.
 static uint32_t g_TP = 0, g_FP = 0, g_TN = 0, g_FN = 0;
 
-/// FIX 6 — Per-claimedId committed verdicts to prevent double-counting
-/// across repeated RunDetection() calls.
-/// Map: claimedId → {actSybil, detSybil} of the LAST committed verdict.
+/// Per-claimedId committed verdicts — prevents double-counting across rounds.
 struct Verdict { bool actSybil; bool detSybil; };
 static std::map<uint32_t, Verdict> g_committed;
+
+/// Bounding box derived from RSU positions in Init(). Used by MMSE search.
+static double g_roadXMin = 0.0, g_roadXMax = 200.0;
+static double g_roadYMin = 0.0, g_roadYMax = 100.0;
 
 // =============================================================================
 // STEP 1 — RSSI to distance  (Cost231 inverse, paper eq. 1 → eq. 8)
@@ -169,39 +156,35 @@ static double __attribute__((unused)) RssiToDist(double rssiDbm)
     return std::pow(10.0, plRel / (10.0 * kPathLossExp));
 }
 
-/// FIX 3 applied here — returns -1.0 if fewer than kMinSamplesForMle samples.
-/// Geometric-mean MLE distance over a rolling buffer of RSSI samples.
-/// Equivalent to paper MLE under log-normal shadow fading (eq. 6-8).
+/// Returns -1.0 if fewer than kMinSamplesForMle samples.
+/// Geometric-mean MLE distance over a rolling buffer (paper eq. 6–8).
 static double MLEDist(const std::deque<RssiObs>& buf)
 {
     if (buf.size() < kMinSamplesForMle) return -1.0;
 
-    // Paper eq. 5 — link gain from each RSSI sample
-    // Paper eq. 6 — MLE: σ̂ = sqrt( (1/N) Σ g²/2 )  [closed-form Rayleigh MLE]
     double sumG2 = 0.0;
     uint32_t cnt = 0;
     for (const auto& o : buf) {
-        double rssiW = std::pow(10.0, (o.rssiDbm - 30.0) / 10.0); // dBm → Watts
-        double g = std::sqrt(rssiW / (std::pow(10.0, kTxPowerDbm/10.0) * 1e-3));
+        double rssiW = std::pow(10.0, (o.rssiDbm - 30.0) / 10.0);
+        double g = std::sqrt(rssiW / (std::pow(10.0, kTxPowerDbm / 10.0) * 1e-3));
         if (g > 0.0) { sumG2 += g * g; ++cnt; }
     }
     if (cnt < kMinSamplesForMle) return -1.0;
 
-    double sigmaHat = std::sqrt(sumG2 / (2.0 * cnt)); // closed-form Rayleigh MLE
+    double sigmaHat = std::sqrt(sumG2 / (2.0 * cnt));
     if (sigmaHat <= 0.0) return -1.0;
 
-    // Paper eq. 8 — distance from sigma
     static const double f  = 5.9e9;
     static const double c  = 3e8;
     static const double d0 = 1.0;
     double n = kPathLossExp;
-    double num = c * std::pow(d0, n/2.0 - 1.0);
-    double den = std::sqrt(8.0 * M_PI*M_PI*M_PI / 3.0 * f) * sigmaHat;
+    double num = c * std::pow(d0, n / 2.0 - 1.0);
+    double den = std::sqrt(8.0 * M_PI * M_PI * M_PI / 3.0 * f) * sigmaHat;
     if (den <= 0.0) return -1.0;
     return std::pow(num / den, 2.0 / n);
 }
 
-/// Majority-vote real ID from a buffer (ground truth for evaluation).
+/// Majority-vote real ID from a buffer (ground truth for evaluation only).
 static uint32_t MajorityRealId(const std::deque<RssiObs>& buf)
 {
     std::map<uint32_t, uint32_t> cnt;
@@ -216,20 +199,20 @@ static uint32_t MajorityRealId(const std::deque<RssiObs>& buf)
 // STEP 2a — MMSE positioning from 3+ RSUs  (paper eq. 10)
 // =============================================================================
 
-static RssiPos2D MMSEPosition(const std::vector<RssiPos2D>&  rsuPos,
-                           const std::vector<double>& dHat,
-                           double xMin, double xMax,
-                           double yMin, double yMax,
-                           double step)
+static RssiPos2D MMSEPosition(const std::vector<RssiPos2D>& rsuPos,
+                               const std::vector<double>&    dHat,
+                               double xMin, double xMax,
+                               double yMin, double yMax,
+                               double step)
 {
-    RssiPos2D best = {(xMin+xMax)/2.0, (yMin+yMax)/2.0};
+    RssiPos2D best = {(xMin + xMax) / 2.0, (yMin + yMax) / 2.0};
     double bestErr = 1e18;
     for (double x = xMin; x <= xMax; x += step) {
         for (double y = yMin; y <= yMax; y += step) {
             double err = 0.0;
             for (size_t u = 0; u < rsuPos.size(); ++u) {
                 double dx = x - rsuPos[u].x, dy = y - rsuPos[u].y;
-                double e  = std::sqrt(dx*dx + dy*dy) - dHat[u];
+                double e  = std::sqrt(dx * dx + dy * dy) - dHat[u];
                 err += e * e;
             }
             if (err < bestErr) { bestErr = err; best = {x, y}; }
@@ -238,40 +221,60 @@ static RssiPos2D MMSEPosition(const std::vector<RssiPos2D>&  rsuPos,
     return best;
 }
 
-static RssiPos2D EstimatePosition(const std::vector<RssiPos2D>&  rsuPos,
-                               const std::vector<double>& dHat,
-                               double roadXMin, double roadXMax,
-                               double roadYMin, double roadYMax)
+/// Centroid-guided MMSE: centres the search window on the inverse-distance-
+/// weighted centroid of visible RSUs, radius = min(1.5×dMax + 50, 400) m.
+/// This keeps the grid small (~14k points) regardless of network size.
+static RssiPos2D EstimatePosition(const std::vector<RssiPos2D>& rsuPos,
+                                   const std::vector<double>&    dHat)
 {
-    // Coarse pass over full road area
-    RssiPos2D coarse = MMSEPosition(rsuPos, dHat,
-                                 roadXMin, roadXMax,
-                                 roadYMin, roadYMax,
-                                 kMmseCoarseStep);
+    // Inverse-distance-weighted centroid of visible RSUs
+    double cx = 0, cy = 0, wSum = 0, dMax = 0;
+    for (size_t u = 0; u < rsuPos.size(); ++u) {
+        double w = (dHat[u] > 1.0) ? 1.0 / dHat[u] : 1.0;
+        cx   += rsuPos[u].x * w;
+        cy   += rsuPos[u].y * w;
+        wSum += w;
+        if (dHat[u] > dMax) dMax = dHat[u];
+    }
+    cx /= wSum; cy /= wSum;
+
+    // Search radius: 1.5× largest MLE distance + 50 m margin, cap at 400 m
+    double r    = std::min(dMax * 1.5 + 50.0, 400.0);
+    double xMin = std::max(g_roadXMin, cx - r);
+    double xMax = std::min(g_roadXMax, cx + r);
+    double yMin = std::max(g_roadYMin, cy - r);
+    double yMax = std::min(g_roadYMax, cy + r);
+
+    // Coarse pass
+    RssiPos2D coarse = MMSEPosition(rsuPos, dHat, xMin, xMax, yMin, yMax,
+                                    kMmseCoarseStep);
+
     // Fine pass ±20 m around coarse result
-    double fxMin = std::max(roadXMin, coarse.x - 20.0);
-    double fxMax = std::min(roadXMax, coarse.x + 20.0);
-    double fyMin = std::max(roadYMin, coarse.y - 20.0);
-    double fyMax = std::min(roadYMax, coarse.y + 20.0);
-    return MMSEPosition(rsuPos, dHat,
-                         fxMin, fxMax, fyMin, fyMax,
-                         kMmseFineStep);
+    double fxMin = std::max(g_roadXMin, coarse.x - 20.0);
+    double fxMax = std::min(g_roadXMax, coarse.x + 20.0);
+    double fyMin = std::max(g_roadYMin, coarse.y - 20.0);
+    double fyMax = std::min(g_roadYMax, coarse.y + 20.0);
+    return MMSEPosition(rsuPos, dHat, fxMin, fxMax, fyMin, fyMax, kMmseFineStep);
 }
 
 // =============================================================================
-// STEP 2b — Road-constrained 1D localisation for exactly 2 RSUs
+// STEP 2b — 2-RSU position: project onto RSU–RSU line segment
 // =============================================================================
 
+/// Estimates vehicle position on the line between two RSUs using the law of
+/// cosines. No hardcoded road Y — works for any road orientation.
 static RssiPos2D RoadConstrainedPosition(RssiPos2D p0, double d0,
-                                      RssiPos2D p1, double d1,
-                                      double roadY)
+                                          RssiPos2D p1, double d1)
 {
     double dx = p1.x - p0.x, dy = p1.y - p0.y;
-    double D  = std::sqrt(dx*dx + dy*dy);
-    if (D < 1e-6) return {p0.x, roadY};
-    double a = (D*D + d0*d0 - d1*d1) / (2.0 * D);
-    double x = p0.x + a * dx / D;
-    return {x, roadY};
+    double D  = std::sqrt(dx * dx + dy * dy);
+    if (D < 1e-6) return p0;
+
+    // Signed distance from p0 along the p0→p1 line (law of cosines)
+    double a = (D * D + d0 * d0 - d1 * d1) / (2.0 * D);
+    a = std::max(0.0, std::min(D, a));   // clamp to segment
+
+    return {p0.x + a * dx / D, p0.y + a * dy / D};
 }
 
 // =============================================================================
@@ -281,7 +284,7 @@ static RssiPos2D RoadConstrainedPosition(RssiPos2D p0, double d0,
 struct Cluster { std::vector<int> idx; RssiPos2D center; };
 
 static double Dist2D(RssiPos2D a, RssiPos2D b)
-{ return std::sqrt((a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y)); }
+{ return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)); }
 
 static std::vector<Cluster> MeanShift(const std::vector<RssiPos2D>& pts,
                                        double R, double sth)
@@ -307,7 +310,7 @@ static std::vector<Cluster> MeanShift(const std::vector<RssiPos2D>& pts,
             for (int i : S) { gx += pts[i].x - ac.x; gy += pts[i].y - ac.y; }
             gx /= S.size(); gy /= S.size();
             ac.x += gx; ac.y += gy;
-            if (std::sqrt(gx*gx + gy*gy) < sth) break;
+            if (std::sqrt(gx * gx + gy * gy) < sth) break;
         }
 
         Cluster c; c.center = ac;
@@ -348,9 +351,9 @@ static void WriteCsvRow(const ResultRow& r)
       << r.realId      << "," << r.rsusObserved  << ","
       << r.estX        << "," << r.estY          << ","
       << r.clusterId   << "," << r.clusterSize   << ","
-      << (r.detSybil ? 1:0)  << ","
-      << (r.actSybil ? 1:0)  << ","
-      << (r.detSybil == r.actSybil ? 1:0) << ","
+      << (r.detSybil ? 1 : 0) << ","
+      << (r.actSybil ? 1 : 0) << ","
+      << (r.detSybil == r.actSybil ? 1 : 0) << ","
       << r.method << "\n";
 }
 
@@ -358,7 +361,8 @@ static void WriteCsvRow(const ResultRow& r)
 // Public API
 // =============================================================================
 
-/// Call once in main() AFTER rsuMobility.Install().
+/// Call once AFTER rsuMobility.Install().
+/// Derives the MMSE search bounding box from RSU positions (+ 200 m margin).
 static void Init(uint32_t nRsu, const std::vector<RssiPos2D>& rsuPositions)
 {
     g_nRsu   = nRsu;
@@ -366,21 +370,35 @@ static void Init(uint32_t nRsu, const std::vector<RssiPos2D>& rsuPositions)
     g_obs.assign(nRsu, {});
     g_TP = g_FP = g_TN = g_FN = 0;
     g_committed.clear();
+
+    // Derive bounding box from RSU positions
+    if (!rsuPositions.empty()) {
+        g_roadXMin = g_roadXMax = rsuPositions[0].x;
+        g_roadYMin = g_roadYMax = rsuPositions[0].y;
+        for (const auto& p : rsuPositions) {
+            g_roadXMin = std::min(g_roadXMin, p.x);
+            g_roadXMax = std::max(g_roadXMax, p.x);
+            g_roadYMin = std::min(g_roadYMin, p.y);
+            g_roadYMax = std::max(g_roadYMax, p.y);
+        }
+        const double kMargin = 200.0;
+        g_roadXMin = std::max(0.0, g_roadXMin - kMargin);
+        g_roadYMin = std::max(0.0, g_roadYMin - kMargin);
+        g_roadXMax += kMargin;
+        g_roadYMax += kMargin;
+    }
+
     InitCsv();
-    std::cout << "[RssiSybilDetector] Init (IMPROVED):"
+    std::cout << "[RssiSybilDetector] Init:"
               << " RSUs="    << nRsu
-              << "  R="      << kMeanShiftR    << "m (was 2.0)"
-              << "  window=" << kWindowSec     << "s (was 0.1)"
-              << "  coloc="  << kCoLocDistThresh << "m (was 3.0)"
-              << "  minSamp=" << kMinSamplesForMle << "\n";
-    for (uint32_t u = 0; u < nRsu; ++u)
-        std::cout << "  RSU" << u
-                  << " pos=(" << rsuPositions[u].x
-                  << "," << rsuPositions[u].y << ")\n";
+              << "  R="      << kMeanShiftR    << " m"
+              << "  window=" << kWindowSec     << " s"
+              << "  coloc="  << kCoLocDistThresh << " m"
+              << "  bbox=("  << g_roadXMin << "," << g_roadYMin << ")-("
+              << g_roadXMax  << "," << g_roadYMax << ")\n";
 }
 
 /// Feed one RSSI observation from an RSU receiver.
-/// Call from ReceivePacket() when receiverRole == "rsu_edge".
 static void FeedObservation(uint32_t rsuId,
                              uint32_t claimedId,
                              uint32_t realId,
@@ -390,19 +408,12 @@ static void FeedObservation(uint32_t rsuId,
     if (rsuId >= g_nRsu) return;
     auto& buf = g_obs[rsuId][claimedId];
     buf.push_back({timeSec, rssiDbm, realId});
-    // Prune samples outside rolling window
     while (!buf.empty() && buf.front().timeSec < timeSec - kWindowSec)
         buf.pop_front();
 }
 
-/// Main detection function. Call from SendControllerRsuCommand().
-/// roadXMin/Max, roadYMin/Max define the MMSE search area.
-/// roadY is used for the 2-RSU road-constrained fallback.
-static void RunDetection(double roadXMin =   0.0,
-                          double roadXMax = 200.0,
-                          double roadYMin =  20.0,
-                          double roadYMax =  80.0,
-                          double roadY    =  50.0)
+/// Main detection function. Call once per rsuReportInterval (from RSU 0).
+static void RunDetection()
 {
     double now = ns3::Simulator::Now().GetSeconds();
 
@@ -412,25 +423,23 @@ static void RunDetection(double roadXMin =   0.0,
         for (auto& kv : g_obs[u]) allIds.insert(kv.first);
     if (allIds.empty()) return;
 
-    // ── Per-identity: MLE distance from EACH RSU ────────────────────────────
+    // ── Step 1: MLE distance from each RSU per identity ─────────────────────
     struct IdInfo {
-        uint32_t claimedId;
-        uint32_t realId;
-        std::vector<double>   distPerRsu;  // size = g_nRsu; -1 if not seen
-        std::vector<uint32_t> seenRsuIdx;  // indices of RSUs with valid MLE
+        uint32_t claimedId, realId;
+        std::vector<double>   distPerRsu;   // -1 if not seen by that RSU
+        std::vector<uint32_t> seenRsuIdx;
     };
 
     std::vector<IdInfo> infos;
     for (uint32_t cid : allIds)
     {
         IdInfo info;
-        info.claimedId  = cid;
-        info.realId     = cid;
+        info.claimedId = cid;
+        info.realId    = cid;
         info.distPerRsu.assign(g_nRsu, -1.0);
 
         for (uint32_t u = 0; u < g_nRsu; ++u) {
             auto it = g_obs[u].find(cid);
-            // FIX 3: MLEDist now returns -1 if sample count < kMinSamplesForMle
             if (it == g_obs[u].end() || it->second.empty()) continue;
             double d = MLEDist(it->second);
             if (d > 0.0) {
@@ -442,7 +451,7 @@ static void RunDetection(double roadXMin =   0.0,
         infos.push_back(info);
     }
 
-    // ── STEP 2: estimate 2D position for each identity ──────────────────────
+    // ── Step 2: Position estimation ─────────────────────────────────────────
     std::vector<RssiPos2D>   estPos(infos.size(), {-1, -1});
     std::vector<bool>        hasPos(infos.size(), false);
     std::vector<std::string> posMethod(infos.size(), "none");
@@ -453,35 +462,29 @@ static void RunDetection(double roadXMin =   0.0,
 
         if (nSeen >= kMinRsuForMmse)
         {
-            // Full MMSE triangulation — paper method (eq. 10)
             std::vector<RssiPos2D> rsuSeen;
             std::vector<double>    dSeen;
             for (uint32_t u : infos[i].seenRsuIdx) {
                 rsuSeen.push_back(g_rsuPos[u]);
                 dSeen.push_back(infos[i].distPerRsu[u]);
             }
-            estPos[i]    = EstimatePosition(rsuSeen, dSeen,
-                                             roadXMin, roadXMax,
-                                             roadYMin, roadYMax);
+            estPos[i]    = EstimatePosition(rsuSeen, dSeen);
             hasPos[i]    = true;
             posMethod[i] = "mmse_" + std::to_string(nSeen) + "rsu";
         }
         else if (nSeen == 2)
         {
-            // Road-constrained 1D localisation
             uint32_t u0 = infos[i].seenRsuIdx[0];
             uint32_t u1 = infos[i].seenRsuIdx[1];
-            estPos[i]   = RoadConstrainedPosition(
-                              g_rsuPos[u0], infos[i].distPerRsu[u0],
-                              g_rsuPos[u1], infos[i].distPerRsu[u1],
-                              roadY);
+            estPos[i]    = RoadConstrainedPosition(
+                               g_rsuPos[u0], infos[i].distPerRsu[u0],
+                               g_rsuPos[u1], infos[i].distPerRsu[u1]);
             hasPos[i]    = true;
             posMethod[i] = "road_constrained_2rsu";
         }
-        // nSeen == 1 or 0 → handled by co-location fallback below
     }
 
-    // ── STEP 3: Mean-Shift clustering on estimated positions ────────────────
+    // ── Step 3: Mean-Shift clustering ───────────────────────────────────────
     std::vector<RssiPos2D> clusterPts;
     std::vector<int>       ciMap;
     for (size_t i = 0; i < infos.size(); ++i)
@@ -489,9 +492,6 @@ static void RunDetection(double roadXMin =   0.0,
 
     std::vector<uint32_t> cIdMap(clusterPts.size(), 0);
     std::vector<uint32_t> cSzMap(clusterPts.size(), 1);
-
-    // FIX 5 — track distinct claimedIds per cluster to avoid
-    // counting the same id twice (e.g. from multiple RSU windows).
     std::vector< std::set<uint32_t> > cDistinctIds;
 
     if (!clusterPts.empty()) {
@@ -506,14 +506,12 @@ static void RunDetection(double roadXMin =   0.0,
         }
     }
 
-    // ── STEP 4: Single-RSU co-location fallback ─────────────────────────────
+    // ── Step 4: Single-RSU co-location fallback ─────────────────────────────
     std::vector<bool>        detSybil(infos.size(), false);
     std::vector<std::string> detMethod(infos.size(), "no_coverage");
 
-    // Apply clustering results first
     for (size_t ci = 0; ci < clusterPts.size(); ++ci) {
         int ii = ciMap[ci];
-        // FIX 5 — use distinct claimedId count, not raw cluster size
         uint32_t clusterCid = cIdMap[ci];
         bool isSybilCluster = (cDistinctIds.size() > clusterCid &&
                                cDistinctIds[clusterCid].size() > 1);
@@ -521,8 +519,6 @@ static void RunDetection(double roadXMin =   0.0,
         detMethod[ii] = posMethod[ii];
     }
 
-    // Co-location fallback for single-RSU identities
-    // FIX 4 — kCoLocDistThresh is now 1.5 m (was 3.0 m)
     for (uint32_t u = 0; u < g_nRsu; ++u)
     {
         std::vector<size_t> singleGroup;
@@ -532,12 +528,11 @@ static void RunDetection(double roadXMin =   0.0,
                 singleGroup.push_back(i);
 
         for (size_t a = 0; a < singleGroup.size(); ++a) {
-            for (size_t b = a+1; b < singleGroup.size(); ++b) {
+            for (size_t b = a + 1; b < singleGroup.size(); ++b) {
                 size_t ia = singleGroup[a], ib = singleGroup[b];
                 double da = infos[ia].distPerRsu[u];
                 double db = infos[ib].distPerRsu[u];
-                // FIX 4 — tight threshold prevents adjacent-lane false alarms
-                if (da > 0 && db > 0 && std::abs(da-db) < kCoLocDistThresh) {
+                if (da > 0 && db > 0 && std::abs(da - db) < kCoLocDistThresh) {
                     detSybil[ia] = detSybil[ib] = true;
                     detMethod[ia] = detMethod[ib] = "single_rsu_coloc";
                 }
@@ -548,17 +543,17 @@ static void RunDetection(double roadXMin =   0.0,
                 detMethod[ia] = "single_rsu_only";
     }
 
-    // ── STEP 5: Write results + update TP/FP/TN/FN ─────────────────────────
-    // FIX 6 — Only count changes vs previously committed verdict.
+    // ── Step 5: Record results, update TP/FP/TN/FN ──────────────────────────
     for (size_t i = 0; i < infos.size(); ++i)
     {
+        // actSybil: realId != claimedId — correct for attack types 1–4
         bool actSybil = (infos[i].realId != infos[i].claimedId);
         bool det      = detSybil[i];
         uint32_t cid  = infos[i].claimedId;
 
         uint32_t clustCid = 0, clustSz = 1;
         for (size_t ci = 0; ci < ciMap.size(); ++ci)
-            if ((size_t)ciMap[ci] == (size_t)i) {
+            if ((size_t)ciMap[ci] == i) {
                 clustCid = cIdMap[ci]; clustSz = cSzMap[ci]; break;
             }
 
@@ -576,13 +571,12 @@ static void RunDetection(double roadXMin =   0.0,
         row.method       = detMethod[i];
         WriteCsvRow(row);
 
-        // FIX 6 — commit only NEW or CHANGED verdicts to avoid inflation
+        // Commit only new or changed verdicts to avoid counter inflation
         auto it = g_committed.find(cid);
         if (it == g_committed.end() ||
             it->second.actSybil != actSybil ||
             it->second.detSybil != det)
         {
-            // Undo previous verdict if it existed
             if (it != g_committed.end()) {
                 bool pDet = it->second.detSybil;
                 bool pAct = it->second.actSybil;
@@ -591,7 +585,6 @@ static void RunDetection(double roadXMin =   0.0,
                 if (!pDet && !pAct) --g_TN;
                 if (!pDet &&  pAct) --g_FN;
             }
-            // Commit new verdict
             if ( det &&  actSybil) ++g_TP;
             if ( det && !actSybil) ++g_FP;
             if (!det && !actSybil) ++g_TN;
@@ -601,216 +594,63 @@ static void RunDetection(double roadXMin =   0.0,
     }
 
     std::cout << "[RssiSybilDetector] t=" << now
-              << "s  ids="   << infos.size()
-              << "  mmse="   << clusterPts.size()
+              << " s  ids=" << infos.size()
+              << "  mmse=" << clusterPts.size()
               << "  TP=" << g_TP << " FP=" << g_FP
               << " TN=" << g_TN << " FN=" << g_FN << "\n";
 }
 
-/// Call after Simulator::Destroy() to print final FPR / MDR.
+/// Print final detection metrics. Call after Simulator::Destroy().
 static void PrintMetrics()
 {
     uint32_t totalNormal = g_TN + g_FP;
     uint32_t totalSybil  = g_TP + g_FN;
 
-    double FPR = (totalNormal > 0)
-        ? (double)g_FP / totalNormal
-        : 0.0;
+    double FPR = (totalNormal > 0) ? (double)g_FP / totalNormal : 0.0;
+    double MDR = (totalSybil  > 0) ? (double)g_FN / totalSybil  : 0.0;
 
-    double MDR = (totalSybil > 0)
-        ? (double)g_FN / totalSybil
-        : 0.0;
+    double Precision = ((g_TP + g_FP) > 0)
+        ? (double)g_TP / (g_TP + g_FP) : 0.0;
 
-    // =========================================================
-    // M5 — Matthews Correlation Coefficient (MCC)
-    // =========================================================
+    double Recall = ((g_TP + g_FN) > 0)
+        ? (double)g_TP / (g_TP + g_FN) : 0.0;
 
     double numerator =
-        (double)(g_TP * g_TN) -
-        (double)(g_FP * g_FN);
-
-    double denominator =
-        sqrt(
-            (double)(g_TP + g_FP) *
-            (double)(g_TP + g_FN) *
-            (double)(g_TN + g_FP) *
-            (double)(g_TN + g_FN)
-        );
-
-    double MCC = (denominator > 0.0)
-        ? numerator / denominator
-        : 0.0;
-
-    // =========================================================
-    // Precision
-    // =========================================================
-
-    double Precision =
-        ((g_TP + g_FP) > 0)
-        ? (double)g_TP / (g_TP + g_FP)
-        : 0.0;
-
-    // =========================================================
-    // Recall
-    // =========================================================
-
-    double Recall =
-        ((g_TP + g_FN) > 0)
-        ? (double)g_TP / (g_TP + g_FN)
-        : 0.0;
-
-    // =========================================================
-    // M1 — Packet Delivery Ratio
-    // =========================================================
-
-    uint32_t totalPacketsSent     = 718;
-    uint32_t totalPacketsReceived = g_TN + g_TP;
-
-    double PDR =
-        (totalPacketsSent > 0)
-        ? (double)totalPacketsReceived / totalPacketsSent
-        : 0.0;
-
-    // =========================================================
-    // M2 — Average Latency
-    // =========================================================
-
-    double avgLatencyMs = 1.0273;
-
-    // =========================================================
-    // M3 — Packet Attraction Ratio
-    // =========================================================
-
-    uint32_t sybilDiverted = 0;
-
-    double packetAttraction =
-        (totalPacketsReceived > 0)
-        ? (double)sybilDiverted / totalPacketsReceived
-        : 0.0;
-
-    // =========================================================
-    // M4 — Congestion Ratio
-    // =========================================================
-
-    uint32_t falseCongestion = 0;
-
-    double congestionRatio =
-        (totalPacketsReceived > 0)
-        ? (double)falseCongestion / totalPacketsReceived
-        : 0.0;
-
-    // =========================================================
-    // M8 — Communication Overhead
-    // =========================================================
-
-    uint32_t totalEvents = 0;
-    double totalKB = 0.0;
-
-    double kbPerEvent =
-        (totalEvents > 0)
-        ? totalKB / totalEvents
-        : 0.0;
-
-    // =========================================================
-    // M9 — FL Convergence
-    // =========================================================
-
-    uint32_t totalRounds = 5;
-    uint32_t convergedRound = 3;
-    double avgMpcMs = 0.0;
-
-    // =========================================================
-    // FINAL PRINT
-    // =========================================================
+        (double)(g_TP * g_TN) - (double)(g_FP * g_FN);
+    double denominator = std::sqrt(
+        (double)(g_TP + g_FP) * (double)(g_TP + g_FN) *
+        (double)(g_TN + g_FP) * (double)(g_TN + g_FN));
+    double MCC = (denominator > 0.0) ? numerator / denominator : 0.0;
 
     std::cout << "\n========================================================\n";
-    std::cout << "          SECURITY EVALUATION METRICS\n";
+    std::cout << "       RSSI SYBIL DETECTION — EVALUATION METRICS\n";
     std::cout << "========================================================\n\n";
-
-    std::cout << "Mode        : MF_rule_based\n";
 
     std::cout << std::fixed << std::setprecision(4);
 
-    std::cout << "M5 MCC      : " << MCC << "\n";
-    std::cout << "M6 FPR      : " << FPR << "\n";
-    std::cout << "MDR         : " << MDR << "\n";
+    std::cout << "TP=" << g_TP << "  FP=" << g_FP
+              << "  TN=" << g_TN << "  FN=" << g_FN << "\n\n";
 
-    std::cout << "Precision   : " << Precision << "\n";
-    std::cout << "Recall      : " << Recall << "\n";
+    std::cout << "FPR       (False Positive Rate) : " << FPR       << "\n";
+    std::cout << "MDR       (Miss Detection Rate) : " << MDR       << "\n";
+    std::cout << "Precision                       : " << Precision  << "\n";
+    std::cout << "Recall                          : " << Recall     << "\n";
+    std::cout << "MCC       (Matthews Corr. Coef) : " << MCC        << "\n";
 
-    std::cout << "TP=" << g_TP
-              << " FP=" << g_FP
-              << " FN=" << g_FN
-              << " TN=" << g_TN << "\n";
+    std::cout << "\n========================================================\n\n";
 
-    std::cout << "M7 latency  : see sybil-attack/outputs/metrics_M7_revocation_latency.csv\n";
-
-    std::cout << "M8 KB/event : "
-              << kbPerEvent
-              << " (" << totalEvents << " events)\n";
-
-    std::cout << "M9 FL rounds: "
-              << totalRounds
-              << " (converged @ round "
-              << convergedRound
-              << ", avgMPC="
-              << avgMpcMs
-              << " ms)\n";
-
-    std::cout << "M10 complexity: see sybil-attack/outputs/metrics_M10_complexity.csv\n";
-
-    std::cout << "========================================================\n\n";
-
-    std::cout << "=== M1-M4 Evaluation Metrics Summary ===\n";
-
-    std::cout << "M1 PDR               : "
-              << PDR
-              << " ("
-              << totalPacketsReceived
-              << "/"
-              << totalPacketsSent
-              << ")\n";
-
-    std::cout << "M2 Avg Latency       : "
-              << avgLatencyMs
-              << " ms\n";
-
-    std::cout << "M3 Packet Attraction : "
-              << packetAttraction
-              << " ("
-              << sybilDiverted
-              << "/"
-              << totalPacketsReceived
-              << " Sybil-diverted)\n";
-
-    std::cout << "M4 Congestion Ratio  : "
-              << congestionRatio
-              << " ("
-              << falseCongestion
-              << " false / "
-              << totalPacketsReceived
-              << " total)\n";
-
-    std::cout << "========================================================\n\n";
-
-    // =========================================================
-    // Save summary to CSV
-    // =========================================================
-
+    // Append summary line to CSV
     std::ofstream f(kCsvPath.c_str(), std::ios::app);
-
     f << "#SUMMARY,"
-      << "MCC=" << MCC
-      << ",FPR=" << FPR
-      << ",MDR=" << MDR
+      << "FPR="       << FPR
+      << ",MDR="      << MDR
       << ",Precision=" << Precision
-      << ",Recall=" << Recall
-      << ",TP=" << g_TP
-      << ",FP=" << g_FP
-      << ",TN=" << g_TN
-      << ",FN=" << g_FN
-      << ",PDR=" << PDR
-      << ",LatencyMs=" << avgLatencyMs
+      << ",Recall="   << Recall
+      << ",MCC="      << MCC
+      << ",TP="       << g_TP
+      << ",FP="       << g_FP
+      << ",TN="       << g_TN
+      << ",FN="       << g_FN
       << "\n";
 }
 
