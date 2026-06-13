@@ -113,8 +113,8 @@ std::string mobilityMode4Name = "sumo_kl_cheras";
 std::string mobilityMode4TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_mobility.tcl";
 std::string mobilityMode4RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_rsus_200m.csv";
 std::string mobilityMode5Name = "sumo_kuala_lumpur_bb";
-std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_mobility.tcl";
-std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_rsus_200m.csv";
+std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_snapshot_480.tcl";
+std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_rsus_100m.csv";
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
 std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_table_log.csv";
@@ -9617,8 +9617,8 @@ main(int argc, char* argv[])
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211p);
     wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                 "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                 "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                 "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                 "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                  "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac;
     wifiMac.SetType("ns3::AdhocWifiMac");
@@ -9626,8 +9626,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_172;
     wifi_172.SetStandard(WIFI_STANDARD_80211p);
     wifi_172.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_172;
     wifiMac_172.SetType("ns3::AdhocWifiMac");
@@ -9635,8 +9635,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_174;
     wifi_174.SetStandard(WIFI_STANDARD_80211p);
     wifi_174.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_174;
     wifiMac_174.SetType("ns3::AdhocWifiMac");
@@ -9644,8 +9644,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_176;
     wifi_176.SetStandard(WIFI_STANDARD_80211p);
     wifi_176.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_176;
     wifiMac_176.SetType("ns3::AdhocWifiMac");
@@ -9653,8 +9653,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_180;
     wifi_180.SetStandard(WIFI_STANDARD_80211p);
     wifi_180.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_180;
     wifiMac_180.SetType("ns3::AdhocWifiMac");
@@ -9662,8 +9662,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_182;
     wifi_182.SetStandard(WIFI_STANDARD_80211p);
     wifi_182.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_182;
     wifiMac_182.SetType("ns3::AdhocWifiMac");
@@ -9671,8 +9671,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_184;
     wifi_184.SetStandard(WIFI_STANDARD_80211p);
     wifi_184.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_184;
     wifiMac_184.SetType("ns3::AdhocWifiMac");
