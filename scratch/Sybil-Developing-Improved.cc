@@ -27,6 +27,7 @@
 #include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
 #include "rssi_sybil_detection.h"
 #include "fl_sybil_detection.h"
+#include "ml_realtime_detection.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1543,6 +1544,12 @@ FLSolutionModeActive()
     return solution_mode == MODE_BASELINE_FL;
 }
 
+static bool
+MlSolutionModeActive()
+{
+    return solution_mode == MODE_BASELINE_ML;
+}
+
 static uint32_t
 MapLegacyProposedMethod(uint32_t legacyMode)
 {
@@ -1595,6 +1602,10 @@ ConfigureSolutionMode()
     else if (solution_mode == MODE_LIGHTWEIGHT)
     {
         std::cout << " active";
+    }
+    else if (MlSolutionModeActive())
+    {
+        std::cout << " active — in-sim real-time AdaBoost DPM detection";
     }
     else if (IsPlaceholderDetectionMode(solution_mode))
     {
@@ -9940,6 +9951,17 @@ main(int argc, char* argv[])
     // Run
     // -----------------------------------------------------------------------
 
+    // In-sim real-time ML detection: schedule the periodic scorer before Run().
+    // Predictions are saved per-run under sybil-attack/ml-baseline/results/.
+    if (MlSolutionModeActive())
+    {
+        std::ostringstream mlOut;
+        mlOut << "sybil-attack/ml-baseline/results/type" << sybil_attack_type
+              << "_pct" << sybil_attack_percentage << "_insim_predictions.csv";
+        MLRealtimeDetector::SetOutput(mlOut.str());
+        MLRealtimeDetector::Init(10.0);   // score every 10 simulated seconds
+    }
+
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
     Simulator::Destroy();
@@ -9948,6 +9970,8 @@ main(int argc, char* argv[])
     WriteFinalSummary();
     if (RssiSolutionModeActive())
         RssiSybilDetector::PrintMetrics();
+    if (MlSolutionModeActive())
+        MLRealtimeDetector::FinalizeAndReport();
 
     return 0;
 }
