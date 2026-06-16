@@ -92,6 +92,16 @@ double cloudPresenceTimeout = 8.0;           ///< Seconds before global vehicle 
 bool boundedRoadMobility = true;             ///< Keep vehicles inside a bounded road corridor.
 uint32_t mobility_mode = 2;                  ///< 1=test, 2=programmed road, 3-5=SUMO/ns-2 traces.
 bool sumoAutoConfig = true;                  ///< Auto-set N_Vehicles/N_RSUs from SUMO trace files.
+
+// RSSI detector tuning — exposed as CLI args, applied before RssiSybilDetector::Init()
+double   rssiClusterRadius  = 25.0;   ///< Co-location cluster radius (m)
+double   rssiDist1Thresh    = 15.0;   ///< 1-RSU fallback distance threshold (m)
+double   rssiWindowSec      =  2.0;   ///< Rolling observation window (s)
+uint32_t rssiMinSamples     =  8;     ///< Min samples per (RSU,claimedId) before detection
+uint32_t rssiStreakRequired  =  2;     ///< Consecutive windows needed to confirm Sybil
+
+// Sweep mode — suppresses all per-packet logging so threshold sweeps run fast
+bool sweepMode = false;
 double roadStartX = 20.0;                    ///< Road corridor start x-coordinate.
 double roadLength = 800.0;                   ///< Road corridor length in metres.
 double roadBaseY = 40.0;                     ///< Centre y-coordinate of the road corridor.
@@ -2963,6 +2973,7 @@ LogRsuPassiveBeaconEvidenceEvent(const std::string& event,
                                  const std::string& status,
                                  uint32_t triggerSeq = 0)
 {
+    if (sweepMode) return;
     std::ofstream out(rsuPassiveBeaconEvidenceCsv.c_str(), std::ios::app);
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
@@ -3626,6 +3637,14 @@ InitializeRssiSolution()
         Vector p = g_rsuNodes.Get(u)->GetObject<MobilityModel>()->GetPosition();
         rsuPos.push_back({p.x, p.y});
     }
+
+    // Apply CLI-tuned thresholds before Init() so Init() prints the correct values
+    RssiSybilDetector::kClusterRadiusM   = rssiClusterRadius;
+    RssiSybilDetector::kDist1RsuThreshM  = rssiDist1Thresh;
+    RssiSybilDetector::kWindowSec        = rssiWindowSec;
+    RssiSybilDetector::kMinSamplesForMle = rssiMinSamples;
+    RssiSybilDetector::kStreakRequired   = rssiStreakRequired;
+
     RssiSybilDetector::Init(N_RSUs, rsuPos);
 }
 
@@ -3637,6 +3656,7 @@ LogRsuVehicleTableEvent(const std::string& event,
                         const std::string& status,
                         uint32_t triggerSeq = 0)
 {
+    if (sweepMode) return;
     uint32_t tableSize = (rsuIndex < g_rsuVehicleTables.size())
                          ? g_rsuVehicleTables[rsuIndex].size()
                          : 0;
@@ -3700,6 +3720,7 @@ LogRsuVehicleObservationRowEvent(const std::string& event,
                                  const std::string& status,
                                  uint32_t triggerSeq = 0)
 {
+    if (sweepMode) return;
     uint32_t rowsForClaimedId = 0;
     if (rsuIndex < g_rsuVehicleObservationTables.size())
     {
@@ -4088,6 +4109,7 @@ LogRsuRegionalAwarenessEvent(const std::string& event,
                              const std::string& status,
                              uint32_t triggerSeq)
 {
+    if (sweepMode) return;
     uint32_t tableSize = (rsuIndex < g_rsuRegionalAwarenessTables.size())
                          ? g_rsuRegionalAwarenessTables[rsuIndex].size()
                          : 0;
@@ -7279,6 +7301,7 @@ LogReceivedPacket(const std::string& receiverRole,
                   const SybilPacketTag& tag,
                   bool hasTag)
 {
+    if (sweepMode) return;
     uint32_t triggerSeq  = hasTag ? tag.GetSequenceNumber() : 0;
     double   delay       = hasTag ? Simulator::Now().GetSeconds() - tag.GetCreatedTime() : 0.0;
     uint32_t messageType = hasTag ? tag.GetMessageType() : 0;
@@ -9445,6 +9468,13 @@ main(int argc, char* argv[])
     cmd.AddValue("mobilityMode5Name",          "Display name for mobility_mode=5 placeholder",mobilityMode5Name);
     cmd.AddValue("mobilityMode5TraceFile",     "SUMO/ns-2 mobility trace for mobility_mode=5",mobilityMode5TraceFile);
     cmd.AddValue("mobilityMode5RsuPositionFile","Optional RSU CSV for mobility_mode=5",mobilityMode5RsuPositionFile);
+    // RSSI detector tuning
+    cmd.AddValue("rssiClusterRadius",  "Co-location cluster radius (m) [default 25]",      rssiClusterRadius);
+    cmd.AddValue("rssiDist1Thresh",    "1-RSU fallback distance threshold (m) [default 15]",rssiDist1Thresh);
+    cmd.AddValue("rssiWindowSec",      "Rolling observation window (s) [default 2.0]",      rssiWindowSec);
+    cmd.AddValue("rssiMinSamples",     "Min samples per RSU before including in detection [default 8]", rssiMinSamples);
+    cmd.AddValue("rssiStreak",         "Consecutive windows to confirm Sybil [default 2]",  rssiStreakRequired);
+    cmd.AddValue("sweepMode",          "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
     cmd.Parse(argc, argv);
     if (proposed_method != kNoLegacyProposedMethod)
         solution_mode = MapLegacyProposedMethod(proposed_method);

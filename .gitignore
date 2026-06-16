@@ -27,6 +27,8 @@
 !sybil-attack/security/**
 !sybil-attack/scripts/
 !sybil-attack/scripts/**
+!sybil-attack/commands/
+!sybil-attack/commands/**
 !sybil-attack/mobility_routing_test_report.md
 
 # Keep runtime CSVs loaded directly by the simulation.
