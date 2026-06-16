@@ -1871,6 +1871,18 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
         uint32_t rsuIndex = observerIndex - N_Vehicles;
         if (rsuIndex < N_RSUs)
         {
+            // Feed actual PHY-layer RSSI into the Φcoloc detector — this replaces
+            // the position-derived software model previously computed in ReceivePacket().
+            if (RssiSolutionModeActive())
+            {
+                RssiSybilDetector::FeedObservation(
+                    rsuIndex,
+                    tag.GetClaimedNodeId(),
+                    tag.GetRealNodeId(),
+                    signalNoise.signal,
+                    Simulator::Now().GetSeconds());
+            }
+
             BsmCoreDataTag bsmTag;
             if (packet->PeekPacketTag(bsmTag))
             {
@@ -8254,37 +8266,8 @@ ReceivePacket(std::string receiverRole, uint32_t receiverId,
         bool hasTag = packet->PeekPacketTag(tag);
         LogReceivedPacket(receiverRole, receiverId, channel, packet, tag, hasTag);
 
-        if (RssiSolutionModeActive() && receiverRole == "rsu_edge" && hasTag)
-        {
-            double rssiDbm = -80.0;
-            uint32_t realId = tag.GetRealNodeId();
-            if (realId < g_vehicleNodes.GetN() &&
-                receiverId < g_rsuNodes.GetN())
-            {
-                Ptr<MobilityModel> vehicleMob =
-                    g_vehicleNodes.Get(realId)->GetObject<MobilityModel>();
-                Ptr<MobilityModel> rsuMob =
-                    g_rsuNodes.Get(receiverId)->GetObject<MobilityModel>();
-                double dist = std::max(0.5, vehicleMob->GetDistanceFrom(rsuMob));
-                double pl = std::abs(RssiSybilDetector::kRef1mDbm)
-                          + 10.0 * RssiSybilDetector::kPathLossExp
-                          * std::log10(dist);
-                rssiDbm = RssiSybilDetector::kTxPowerDbm - pl;
-                static std::mt19937 rng_r(std::random_device{}());
-                static std::uniform_real_distribution<double> uni(0.0, 1.0);
-                double sigma_ch = 0.7071;
-                double rayleighGain =
-                    sigma_ch * std::sqrt(-2.0 * std::log(std::max(uni(rng_r), 1e-9)));
-                rssiDbm += 20.0 * std::log10(rayleighGain);
-            }
-
-            RssiSybilDetector::FeedObservation(
-                receiverId,
-                tag.GetClaimedNodeId(),
-                tag.GetRealNodeId(),
-                rssiDbm,
-                Simulator::Now().GetSeconds());
-        }
+        // RSSI observations are now fed by WifiMonitorSnifferRx using actual
+        // PHY-layer signal strength (signalNoise.signal) — no software model here.
     }
 }
 
@@ -9572,19 +9555,26 @@ main(int argc, char* argv[])
     YansWifiChannelHelper wifiChannel_184;
 
     wifiChannel.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                   "Frequency", DoubleValue(5.9e9));
     wifiChannel_172.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_172.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_172.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_174.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_174.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_174.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_176.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_176.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_176.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_180.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_180.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_180.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_182.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_182.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_182.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_184.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_184.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_184.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
 
     // --- Physical layer helpers (one per channel) ---
     YansWifiPhyHelper wifiPhy;
@@ -9965,7 +9955,7 @@ main(int argc, char* argv[])
             std::cout << "SDN Controller:    MALICIOUS" << std::endl;
     }
 
-    std::cout << "WiFi: 802.11p DSRC @ 5.9 GHz, 10 MHz, 23 dBm, Cost231" << std::endl;
+    std::cout << "WiFi: 802.11p DSRC @ 5.9 GHz, 10 MHz, " << txPowerDbm << " dBm, Cost231@5.9GHz" << std::endl;
     std::cout << "Backhaul: CSMA 1000 Mbps / 10 us" << std::endl;
     std::cout << "CSV: " << communicationCsv << std::endl;
     std::cout << "Vehicle neighbor CSV: " << vehicleNeighborTableCsv << std::endl;
