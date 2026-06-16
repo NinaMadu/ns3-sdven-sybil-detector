@@ -1687,5 +1687,6 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
             }
         }
     }
-    MetricsOnTransmitForMessage(tx->messageType, expectedDeliveries);
+    bool isBroadcastTx = (tx->destinationId == 0xFFFFFFFF);
+    MetricsOnTransmitForMessage(tx->messageType, expectedDeliveries, isBroadcastTx);
 }

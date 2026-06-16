@@ -61,6 +61,7 @@ uint32_t N_Vehicles = 8;              ///< Number of vehicle nodes.
 uint32_t N_RSUs = 2;                  ///< Number of RSU edge nodes.
 uint32_t N_Controllers = 1;           ///< Number of SDN controller nodes.
 double simTime = 12.0;                ///< Total simulation time (seconds).
+double txPowerDbm = 40.0;             ///< PHY Tx power (dBm) for all 802.11p radios. DSRC RSU EIRP limit ~40 dBm.
 double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
 double beaconJitterMax = 0.02;        ///< Maximum random V2V beacon timing jitter (seconds).
 double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
@@ -113,8 +114,8 @@ std::string mobilityMode4Name = "sumo_kl_cheras";
 std::string mobilityMode4TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_mobility.tcl";
 std::string mobilityMode4RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_rsus_200m.csv";
 std::string mobilityMode5Name = "sumo_kuala_lumpur_bb";
-std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_snapshot_480.tcl";
-std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_rsus_100m.csv";
+std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_mobility.tcl";
+std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_rsus_8x8.csv";
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
 std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_table_log.csv";
@@ -8173,12 +8174,48 @@ LogReceivedPacket(const std::string& receiverRole,
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.suspicionFlags   : 0u) << ","
         << (hasTag ? "received_tagged" : "received_untagged") << "\n";
 
-    // M1 PDR: only credit V2V beacon delivery when the receiver is another vehicle.
+    // M1 PDR accounting.
+    //   Unicast (non-beacon): one intended receiver -> always credited (M1.1).
+    //   V2V broadcast beacon: credit only vehicle receivers WITHIN v2vReliableRange
+    //   of the sender, matching the intended-receiver denominator counted at
+    //   transmit (SendTaggedPacket). This keeps broadcast PDR (M1.2) in [0,1];
+    //   receptions beyond v2vReliableRange are bonus coverage, not "intended".
     bool isV2VBroadcast = hasTag && tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
-    bool countForPDR    = !isV2VBroadcast || receiverRole == "vehicle";
+    bool countForPDR;
+    if (isV2VBroadcast)
+    {
+        countForPDR = false;
+        uint32_t senderIdx = hasTag ? tag.GetRealNodeId() : 0xFFFFFFFF;
+        if (receiverRole == "vehicle" &&
+            senderIdx < g_vehicleNodes.GetN() && receiverId < g_vehicleNodes.GetN())
+        {
+            Ptr<MobilityModel> sMob = g_vehicleNodes.Get(senderIdx)->GetObject<MobilityModel>();
+            Ptr<MobilityModel> rMob = g_vehicleNodes.Get(receiverId)->GetObject<MobilityModel>();
+            if (sMob && rMob && sMob->GetDistanceFrom(rMob) <= v2vReliableRange)
+            {
+                // De-duplicate the multi-channel copies of one beacon: a limited
+                // broadcast egresses all 7 WAVE channel devices, so the same beacon
+                // (identical sequence) is received several times. Count it once per
+                // (receiver, sender) so M1.2 matches the single-count denominator.
+                static std::map<uint64_t, uint32_t> s_lastBeaconSeq;
+                uint64_t key = (static_cast<uint64_t>(receiverId) << 32) | senderIdx;
+                uint32_t seq = hasTag ? tag.GetSequenceNumber() : 0;
+                auto it = s_lastBeaconSeq.find(key);
+                if (it == s_lastBeaconSeq.end() || it->second != seq)
+                {
+                    s_lastBeaconSeq[key] = seq;
+                    countForPDR = true;
+                }
+            }
+        }
+    }
+    else
+    {
+        countForPDR = true;
+    }
 
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
-    MetricsOnReceive(isSybil, delay, countForPDR);
+    MetricsOnReceive(isSybil, delay, countForPDR, isV2VBroadcast);
     if (hasTag)
     {
         MetricsOnReceiveForMessage(messageType, delay, countForPDR);
@@ -9277,6 +9314,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getUint  ("N_Controllers",                   N_Controllers);
     getUint  ("controllerRegistrationThreshold", controllerRegistrationThreshold);
     getDouble("simTime",                         simTime);
+    getDouble("txPowerDbm",                      txPowerDbm);
     getBool  ("routing_test",                    routing_test);
     getDouble("beaconInterval",                  beaconInterval);
     getDouble("beaconJitterMax",                 beaconJitterMax);
@@ -9374,6 +9412,7 @@ main(int argc, char* argv[])
     cmd.AddValue("simTime",                    "Simulation time in seconds",             simTime);
     cmd.AddValue("routing_test",               "Small 3-vehicle/2-RSU/1-SDN test network", routing_test);
     cmd.AddValue("beaconInterval",             "Vehicle beacon period",                  beaconInterval);
+    cmd.AddValue("txPower",                     "PHY Tx power in dBm for all 802.11p radios (DSRC RSU EIRP limit ~40)", txPowerDbm);
     cmd.AddValue("beaconJitterMax",            "Maximum random V2V beacon timing jitter in seconds", beaconJitterMax);
     cmd.AddValue("rsuReportInterval",          "RSU→Controller report period",           rsuReportInterval);
     cmd.AddValue("sybil_attack_enabled",       "Enable Sybil attack behavior",           sybil_attack_enabled);
@@ -9557,50 +9596,50 @@ main(int argc, char* argv[])
     YansWifiPhyHelper wifiPhy_184;
 
     wifiPhy.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy.Set("Frequency",    UintegerValue(5890));
     wifiPhy.Set("ChannelNumber",UintegerValue(178));
     wifiPhy.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_172.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_172.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_172.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_172.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_172.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_172.Set("Frequency",    UintegerValue(5860));
     wifiPhy_172.Set("ChannelNumber",UintegerValue(172));
     wifiPhy_172.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_174.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_174.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_174.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_174.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_174.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_174.Set("Frequency",    UintegerValue(5870));
     wifiPhy_174.Set("ChannelNumber",UintegerValue(174));
     wifiPhy_174.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_176.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_176.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_176.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_176.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_176.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_176.Set("Frequency",    UintegerValue(5880));
     wifiPhy_176.Set("ChannelNumber",UintegerValue(176));
     wifiPhy_176.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_180.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_180.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_180.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_180.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_180.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_180.Set("Frequency",    UintegerValue(5900));
     wifiPhy_180.Set("ChannelNumber",UintegerValue(180));
     wifiPhy_180.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_182.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_182.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_182.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_182.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_182.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_182.Set("Frequency",    UintegerValue(5910));
     wifiPhy_182.Set("ChannelNumber",UintegerValue(182));
     wifiPhy_182.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_184.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_184.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_184.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_184.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_184.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_184.Set("Frequency",    UintegerValue(5920));
     wifiPhy_184.Set("ChannelNumber",UintegerValue(184));
     wifiPhy_184.Set("ChannelWidth", UintegerValue(10));
