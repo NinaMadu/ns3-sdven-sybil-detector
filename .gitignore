@@ -28,6 +28,9 @@
 !sybil-attack/scripts/
 !sybil-attack/scripts/**
 !sybil-attack/mobility_routing_test_report.md
+!sybil-attack/fl/
+!sybil-attack/fl/scripts/
+!sybil-attack/fl/scripts/**
 
 # Keep runtime CSVs loaded directly by the simulation.
 !sybil-attack/inputs/*.csv
@@ -89,3 +92,4 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *:Zone.Identifier
+*.Zone.Identifier

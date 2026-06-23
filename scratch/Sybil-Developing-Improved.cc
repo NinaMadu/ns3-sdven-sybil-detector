@@ -121,7 +121,7 @@ std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_tab
 std::string rsuVehicleTableCsv = "sybil-attack/outputs/rsu_vehicle_table_log.csv";
 std::string rsuVehicleObservationCsv = "sybil-attack/outputs/rsu_vehicle_observation_rows_log.csv";
 std::string rsuRegionalAwarenessCsv = "sybil-attack/outputs/rsu_regional_awareness_log.csv";
-std::string rsuPassiveBeaconEvidenceCsv = "sybil-attack/outputs/rsu_passive_beacon_evidence_log.csv";
+std::string computedDetectionEvidenceCsv = "sybil-attack/outputs/computed_detection_evidence_log.csv";
 std::string controllerVehicleTableCsv = "sybil-attack/outputs/controller_vehicle_table_log.csv";
 std::string controllerGlobalAwarenessCsv = "sybil-attack/outputs/controller_global_awareness_log.csv";
 std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
@@ -292,12 +292,39 @@ struct ControllerTokenCommitmentRecord
     std::string tokenRecordCid;
 };
 
+struct FlModelConsensusRecord
+{
+    uint32_t round = 0;
+    std::string acceptedModelCid;
+    std::string modelHashHex;
+    uint32_t agreeingControllers = 0;
+    double loss = 0.0;
+    double consensusTime = 0.0;
+};
+
+struct IsolationRecord
+{
+    std::string entityType;
+    uint32_t entityId = 0;
+    double isolationTimestamp = 0.0;
+    std::string attackVariant;
+    std::string aggregatedEvidenceHashHex;
+    std::vector<std::string> evidenceCids;
+    std::string authorityTier;
+    std::string thresholdSignatureHex;
+    std::string isolationCid;
+};
+
 static std::vector<ControllerLocalRegistrationState> g_controllerLocalRegistrationStates;
 static std::map<std::string, ControllerRegistrationQuorumState> g_controllerRegistrationQuorums;
 static std::map<uint32_t, ControllerTokenCommitmentRecord> g_controllerTokenCommitments;
 static std::string g_latestTokenManifestCid;
 static std::vector<std::map<uint32_t, std::string> > g_rsuTokenRecordCidCache;
 static std::vector<std::map<uint32_t, std::string> > g_rsuTokenHashCache;
+static std::string g_latestAcceptedFlModelCid;
+static std::map<uint32_t, FlModelConsensusRecord> g_flModelConsensusByRound;
+static std::vector<std::string> g_rsuAcceptedFlModelCid;
+static std::map<std::string, IsolationRecord> g_isolationRecordsByEntity;
 
 // Vehicle↔Controller E2E secure channel globals.
 std::vector<std::vector<uint8_t>>         g_vehicleCertSigs;         // CA sig per vehicle (64B)
@@ -388,7 +415,7 @@ struct TrajectorySample
     double heading;
 };
 
-struct RsuPassiveBeaconEvidenceRecord
+struct ComputedDetectionEvidenceRecord
 {
     uint32_t rsuId = 0;
     uint32_t realVehicleId = 0;
@@ -402,6 +429,12 @@ struct RsuPassiveBeaconEvidenceRecord
     double rssiDbm = -999.0;
     bool signatureValid = false;
     uint32_t suspicionFlags = SUSPICION_NONE;
+    double detectionScore = 0.0;
+    double signatureScore = 0.0;
+    double revocationTimestamp = 0.0;
+    std::string attackVariant;
+    std::string evidenceVectorHashHex;
+    std::string currentSignatureHex;
     std::string evidenceCid;
 };
 
@@ -418,8 +451,8 @@ static std::vector<std::map<uint32_t, uint32_t> > g_rssiCoLocationFlags;
 static std::vector<std::map<uint32_t, std::deque<TrajectorySample> > > g_vehicleTrajectoryWindows;
 static std::vector<std::map<uint32_t, uint32_t> > g_trajectoryShadowingFlags;
 static std::vector<std::set<uint32_t> > g_sdnUnsupportedRsuApprovals;
-static std::vector<std::map<uint32_t, std::vector<RsuPassiveBeaconEvidenceRecord> > >
-    g_rsuPassiveBeaconEvidenceTables;
+static std::vector<std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> > >
+    g_computedDetectionEvidenceTables;
 
 static void
 ResetAwarenessTables()
@@ -445,8 +478,8 @@ ResetAwarenessTables()
         N_Vehicles, std::map<uint32_t, std::deque<TrajectorySample> >());
     g_trajectoryShadowingFlags.assign(N_Vehicles, std::map<uint32_t, uint32_t>());
     g_sdnUnsupportedRsuApprovals.assign(N_RSUs, std::set<uint32_t>());
-    g_rsuPassiveBeaconEvidenceTables.assign(
-        N_RSUs, std::map<uint32_t, std::vector<RsuPassiveBeaconEvidenceRecord> >());
+    g_computedDetectionEvidenceTables.assign(
+        N_RSUs, std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> >());
     g_vehicleLastRssiByClaimedId.assign(N_Vehicles, std::map<uint32_t, double>());
 }
 
@@ -508,12 +541,12 @@ static const double kPathLossExp       =  3.3772;  ///< Effective exponent = B/1
 static const double kRssiDistMismatchM =  25.0;    ///< Mismatch threshold (metres)
 
 static void
-RecordRsuPassiveBeaconEvidence(uint32_t rsuIndex,
-                               const SybilPacketTag& tag,
-                               const BsmCoreData& bsm,
-                               bool signatureValid,
-                               uint32_t triggerSeq,
-                               double measuredRssiDbm);
+RecordComputedDetectionEvidence(uint32_t rsuIndex,
+                                const SybilPacketTag& tag,
+                                const BsmCoreData& bsm,
+                                bool signatureValid,
+                                uint32_t triggerSeq,
+                                double measuredRssiDbm);
 
 static double
 RssiToDistance(double rssiDbm)
@@ -571,6 +604,61 @@ BytesToHex(const std::vector<uint8_t>& bytes)
     return out;
 }
 
+static std::vector<uint8_t>
+StringToBytes(const std::string& value)
+{
+    return std::vector<uint8_t>(value.begin(), value.end());
+}
+
+static std::string
+HashStringHex(const std::string& value)
+{
+    return BytesToHex(CryptoSha256(StringToBytes(value)));
+}
+
+static std::string
+GetVehicleKyberPublicKeyHex(uint32_t vehicleId)
+{
+    // Current-crypto placeholder: use the vehicle's existing public key bytes
+    // as the registration public-key material until Kyber is integrated.
+    if (vehicleId < g_vehiclePubKeys.size() && !g_vehiclePubKeys[vehicleId].empty())
+        return BytesToHex(g_vehiclePubKeys[vehicleId]);
+
+    std::ostringstream fallback;
+    fallback << "simulated_kyber_public_key_vehicle_" << vehicleId;
+    return HashStringHex(fallback.str());
+}
+
+static std::string
+SignWithCurrentControllerKeyHex(uint32_t controllerId, const std::string& message)
+{
+    std::vector<uint8_t> hash = CryptoSha256(StringToBytes(message));
+    std::vector<uint8_t> sig;
+    if (g_ctrlSignPrivKey.size() == 32)
+        sig = CryptoEcdsaSign(g_ctrlSignPrivKey, hash);
+    else
+        sig = CryptoSha256(hash);
+
+    std::ostringstream os;
+    os << "current_ecdsa_controller_" << controllerId << ":" << BytesToHex(sig);
+    return os.str();
+}
+
+static std::string
+SignWithCurrentRsuKeyHex(uint32_t rsuId, const std::string& message)
+{
+    std::vector<uint8_t> hash = CryptoSha256(StringToBytes(message));
+    std::vector<uint8_t> sig;
+    if (rsuId < g_rsuPrivKeys.size() && g_rsuPrivKeys[rsuId].size() == 32)
+        sig = CryptoEcdsaSign(g_rsuPrivKeys[rsuId], hash);
+    else
+        sig = CryptoSha256(hash);
+
+    std::ostringstream os;
+    os << "current_ecdsa_rsu_" << rsuId << ":" << BytesToHex(sig);
+    return os.str();
+}
+
 static uint32_t
 GetControllerRegistrationThreshold()
 {
@@ -581,36 +669,39 @@ GetControllerRegistrationThreshold()
 }
 
 static std::string
-BuildControllerRegistrationJson(uint32_t vehicleId,
-                                uint32_t originRsuId,
-                                uint32_t primaryControllerId,
-                                uint64_t vin,
-                                double gpsX,
-                                double gpsY,
-                                double requestTime)
+BuildVehicleRegistrationRecordJson(uint32_t vehicleId,
+                                   uint32_t originRsuId,
+                                   uint32_t primaryControllerId,
+                                   uint64_t vin,
+                                   double gpsX,
+                                   double gpsY,
+                                   double requestTime)
 {
     std::ostringstream os;
     os << "{\n"
-       << "  \"type\": \"controller_threshold_registration_request\",\n"
+       << "  \"type\": \"vehicle_registration_record\",\n"
        << "  \"vehicle_id\": " << vehicleId << ",\n"
-       << "  \"origin_rsu_id\": " << originRsuId << ",\n"
-       << "  \"primary_controller_id\": " << primaryControllerId << ",\n"
        << "  \"vin\": " << vin << ",\n"
-       << "  \"gps_x\": " << gpsX << ",\n"
-       << "  \"gps_y\": " << gpsY << ",\n"
-       << "  \"request_time\": " << requestTime << "\n"
+       << "  \"gps\": {\n"
+       << "    \"x\": " << gpsX << ",\n"
+       << "    \"y\": " << gpsY << "\n"
+       << "  },\n"
+       << "  \"timestamp\": " << requestTime << ",\n"
+       << "  \"kyber_public_key\": \"" << GetVehicleKyberPublicKeyHex(vehicleId) << "\",\n"
+       << "  \"relay_origin_rsu_id\": " << originRsuId << ",\n"
+       << "  \"endorsing_primary_controller_id\": " << primaryControllerId << "\n"
        << "}\n";
     return os.str();
 }
 
 static std::string
-PublishControllerRegistrationToIpfs(uint32_t vehicleId,
-                                    uint32_t originRsuId,
-                                    uint32_t primaryControllerId,
-                                    uint64_t vin,
-                                    double gpsX,
-                                    double gpsY,
-                                    double requestTime)
+PublishVehicleRegistrationRecordToIpfs(uint32_t vehicleId,
+                                       uint32_t originRsuId,
+                                       uint32_t primaryControllerId,
+                                       uint64_t vin,
+                                       double gpsX,
+                                       double gpsY,
+                                       double requestTime)
 {
     static bool warnedIpfsUnavailable = false;
     const std::string dir = "sybil-attack/outputs/ipfs-registration";
@@ -625,20 +716,20 @@ PublishControllerRegistrationToIpfs(uint32_t vehicleId,
 
     {
         std::ofstream out(path.str().c_str(), std::ios::out);
-        out << BuildControllerRegistrationJson(vehicleId,
-                                               originRsuId,
-                                               primaryControllerId,
-                                               vin,
-                                               gpsX,
-                                               gpsY,
-                                               requestTime);
+        out << BuildVehicleRegistrationRecordJson(vehicleId,
+                                                  originRsuId,
+                                                  primaryControllerId,
+                                                  vin,
+                                                  gpsX,
+                                                  gpsY,
+                                                  requestTime);
     }
 
     std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
     if (cid.empty() && !warnedIpfsUnavailable)
     {
-        std::cerr << "[IPFS] WARNING: controller registration IPFS publish failed. "
-                  << "Evidence JSON files are still written under " << dir << ".\n";
+        std::cerr << "[IPFS] WARNING: vehicle registration IPFS publish failed. "
+                  << "Registration JSON files are still written under " << dir << ".\n";
         warnedIpfsUnavailable = true;
     }
     if (cid.empty())
@@ -681,13 +772,13 @@ ApproveControllerThresholdRegistration(uint32_t primaryControllerId,
     if (g_controllerLocalRegistrationStates.size() < N_Controllers)
         g_controllerLocalRegistrationStates.resize(N_Controllers);
 
-    std::string cid = PublishControllerRegistrationToIpfs(vehicleId,
-                                                          originRsuId,
-                                                          primaryControllerId,
-                                                          vin,
-                                                          gpsX,
-                                                          gpsY,
-                                                          requestTime);
+    std::string cid = PublishVehicleRegistrationRecordToIpfs(vehicleId,
+                                                             originRsuId,
+                                                             primaryControllerId,
+                                                             vin,
+                                                             gpsX,
+                                                             gpsY,
+                                                             requestTime);
     registrationCidOut = cid;
 
     ControllerRegistrationQuorumState& quorum = g_controllerRegistrationQuorums[cid];
@@ -1062,11 +1153,228 @@ StoreThresholdApprovedToken(uint32_t vehicleId,
 }
 
 static std::string
-BuildPassiveBeaconEvidenceJson(const RsuPassiveBeaconEvidenceRecord& rec)
+BuildFlGlobalModelJson(uint32_t round,
+                       const std::string& modelHashHex,
+                       double loss)
 {
     std::ostringstream os;
     os << "{\n"
-       << "  \"type\": \"rsu_passive_v2v_beacon_evidence\",\n"
+       << "  \"type\": \"fl_global_model\",\n"
+       << "  \"round\": " << round << ",\n"
+       << "  \"model_hash\": \"" << modelHashHex << "\",\n"
+       << "  \"loss\": " << loss << ",\n"
+       << "  \"weights_source\": \"hardcoded_simulation_model\",\n"
+       << "  \"issued_time\": " << Simulator::Now().GetSeconds() << "\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishFlGlobalModelToIpfs(uint32_t round,
+                           uint32_t controllerId,
+                           const std::string& modelHashHex,
+                           double loss)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-fl-models";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/round" << round
+         << "_ctrl" << controllerId
+         << "_model.json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildFlGlobalModelJson(round, modelHashHex, loss);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: FL model IPFS publish failed. "
+                  << "FL model JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local-fl-model://" + modelHashHex;
+    return cid;
+}
+
+static std::string
+BuildFlConsensusManifestJson(const FlModelConsensusRecord& rec)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"fl_model_consensus_manifest\",\n"
+       << "  \"round\": " << rec.round << ",\n"
+       << "  \"accepted_model_cid\": \"" << rec.acceptedModelCid << "\",\n"
+       << "  \"model_hash\": \"" << rec.modelHashHex << "\",\n"
+       << "  \"agreeing_controllers\": " << rec.agreeingControllers << ",\n"
+       << "  \"controller_threshold\": " << GetControllerRegistrationThreshold() << ",\n"
+       << "  \"loss\": " << rec.loss << ",\n"
+       << "  \"consensus_time\": " << rec.consensusTime << "\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishFlConsensusManifestToIpfs(const FlModelConsensusRecord& rec)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-fl-model-consensus";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/round" << rec.round << "_consensus.json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildFlConsensusManifestJson(rec);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: FL consensus manifest IPFS publish failed. "
+                  << "Consensus JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local://" + path.str();
+    return cid;
+}
+
+static void
+RunFlModelCidConsensus(uint32_t round, double loss)
+{
+    std::map<std::string, uint32_t> cidCounts;
+    std::map<std::string, std::string> modelHashByCid;
+
+    for (uint32_t controllerId = 0; controllerId < N_Controllers; ++controllerId)
+    {
+        std::ostringstream modelSeed;
+        modelSeed << "fl_global_model_round_" << round << "_baseline";
+        if (sybil_attack_enabled && g_controllerIsMalicious && controllerId == 0)
+            modelSeed << "_poisoned_controller_" << controllerId;
+
+        std::string modelHashHex = HashStringHex(modelSeed.str());
+        std::string cid =
+            PublishFlGlobalModelToIpfs(round, controllerId, modelHashHex, loss);
+        cidCounts[cid]++;
+        modelHashByCid[cid] = modelHashHex;
+
+        std::cout << "[FL_MODEL_IPFS] round=" << round
+                  << " controller=" << controllerId
+                  << " model_hash=" << modelHashHex
+                  << " cid=" << cid << std::endl;
+    }
+
+    std::string bestCid;
+    uint32_t bestCount = 0;
+    for (auto it = cidCounts.begin(); it != cidCounts.end(); ++it)
+    {
+        if (it->second > bestCount)
+        {
+            bestCid = it->first;
+            bestCount = it->second;
+        }
+    }
+
+    uint32_t threshold = GetControllerRegistrationThreshold();
+    if (!bestCid.empty() && bestCount >= threshold)
+    {
+        FlModelConsensusRecord rec;
+        rec.round = round;
+        rec.acceptedModelCid = bestCid;
+        rec.modelHashHex = modelHashByCid[bestCid];
+        rec.agreeingControllers = bestCount;
+        rec.loss = loss;
+        rec.consensusTime = Simulator::Now().GetSeconds();
+        g_flModelConsensusByRound[round] = rec;
+        g_latestAcceptedFlModelCid = bestCid;
+        if (g_rsuAcceptedFlModelCid.size() < N_RSUs)
+            g_rsuAcceptedFlModelCid.resize(N_RSUs);
+        for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
+            g_rsuAcceptedFlModelCid[rsuId] = bestCid;
+
+        std::string manifestCid = PublishFlConsensusManifestToIpfs(rec);
+        std::cout << "[FL_MODEL_CONSENSUS] round=" << round
+                  << " accepted_cid=" << bestCid
+                  << " votes=" << bestCount << "/" << N_Controllers
+                  << " manifest_cid=" << manifestCid
+                  << std::endl;
+    }
+    else
+    {
+        std::cout << "[FL_MODEL_CONSENSUS] round=" << round
+                  << " no CID reached threshold=" << threshold
+                  << std::endl;
+    }
+}
+
+static uint32_t
+CountSuspicionBits(uint32_t flags)
+{
+    uint32_t count = 0;
+    while (flags)
+    {
+        count += flags & 1u;
+        flags >>= 1;
+    }
+    return count;
+}
+
+static std::string
+DescribeAttackVariantFromFlags(uint32_t flags)
+{
+    if (flags & SUSPICION_ID_MISMATCH)
+        return "identity_mismatch";
+    if (flags & SUSPICION_INVALID_V2V_SIGNATURE)
+        return "invalid_v2v_signature";
+    if (flags & SUSPICION_RSSI_DISTANCE_MISMATCH)
+        return "rssi_distance_mismatch";
+    if (flags & SUSPICION_RANGE_ANOMALY)
+        return "range_anomaly";
+    if (flags & SUSPICION_RSSI_COLOCATION)
+        return "rssi_colocation";
+    if (flags != SUSPICION_NONE)
+        return "cross_tier_suspicion";
+    return "none";
+}
+
+static std::string
+BuildComputedEvidenceVectorString(const ComputedDetectionEvidenceRecord& rec)
+{
+    std::ostringstream os;
+    os << rec.rsuId << "|"
+       << rec.realVehicleId << "|"
+       << rec.claimedVehicleId << "|"
+       << rec.observableSourceId << "|"
+       << rec.sequenceNumber << "|"
+       << rec.observationTime << "|"
+       << rec.bsm.positionX << "|"
+       << rec.bsm.positionY << "|"
+       << rec.bsm.speed << "|"
+       << rec.bsm.heading << "|"
+       << rec.claimedDistanceToRsu << "|"
+       << rec.rssiEstimatedDistance << "|"
+       << rec.rssiDbm << "|"
+       << (rec.signatureValid ? 1 : 0) << "|"
+       << rec.suspicionFlags << "|"
+       << rec.detectionScore << "|"
+       << rec.signatureScore << "|"
+       << rec.revocationTimestamp << "|"
+       << rec.attackVariant;
+    return os.str();
+}
+
+static std::string
+BuildComputedDetectionEvidenceJson(const ComputedDetectionEvidenceRecord& rec)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"computed_detection_evidence\",\n"
        << "  \"rsu_id\": " << rec.rsuId << ",\n"
        << "  \"real_vehicle_id\": " << rec.realVehicleId << ",\n"
        << "  \"claimed_vehicle_id\": " << rec.claimedVehicleId << ",\n"
@@ -1087,7 +1395,14 @@ BuildPassiveBeaconEvidenceJson(const RsuPassiveBeaconEvidenceRecord& rec)
        << "  \"rssi_estimated_distance_m\": " << rec.rssiEstimatedDistance << ",\n"
        << "  \"rssi_dbm\": " << rec.rssiDbm << ",\n"
        << "  \"signature_valid\": " << JsonBool(rec.signatureValid) << ",\n"
-       << "  \"suspicion_flags\": " << rec.suspicionFlags << "\n"
+       << "  \"suspicion_flags\": " << rec.suspicionFlags << ",\n"
+       << "  \"detection_score\": " << rec.detectionScore << ",\n"
+       << "  \"signature_score\": " << rec.signatureScore << ",\n"
+       << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
+       << "  \"evidence_vector_hash\": \"" << rec.evidenceVectorHashHex << "\",\n"
+       << "  \"current_partial_signature\": \"" << rec.currentSignatureHex << "\",\n"
+       << "  \"signature_scheme\": \"current_ecdsa_placeholder_for_future_dilithium\",\n"
+       << "  \"revocation_timestamp\": " << rec.revocationTimestamp << "\n"
        << "}\n";
     return os.str();
 }
@@ -1108,10 +1423,10 @@ GetIpfsBinaryPath()
 }
 
 static std::string
-PublishPassiveBeaconEvidenceToIpfs(const RsuPassiveBeaconEvidenceRecord& rec)
+PublishComputedDetectionEvidenceToIpfs(const ComputedDetectionEvidenceRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-evidence";
+    const std::string dir = "sybil-attack/outputs/ipfs-computed-detection-evidence";
     std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
 
     std::ostringstream path;
@@ -1123,18 +1438,120 @@ PublishPassiveBeaconEvidenceToIpfs(const RsuPassiveBeaconEvidenceRecord& rec)
 
     {
         std::ofstream out(path.str().c_str(), std::ios::out);
-        out << BuildPassiveBeaconEvidenceJson(rec);
+        out << BuildComputedDetectionEvidenceJson(rec);
     }
 
     std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
     if (cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: real IPFS publish failed. Install/start IPFS "
-                  << "and ensure `ipfs add -Q` works. Evidence JSON files are still "
+                  << "and ensure `ipfs add -Q` works. Computed evidence JSON files are still "
                   << "written under " << dir << ".\n";
         warnedIpfsUnavailable = true;
     }
+    if (cid.empty())
+        cid = "local://" + path.str();
     return cid;
+}
+
+static std::string
+BuildIsolationRecordJson(const IsolationRecord& rec)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"isolation_record\",\n"
+       << "  \"entity_type\": \"" << rec.entityType << "\",\n"
+       << "  \"entity_id\": " << rec.entityId << ",\n"
+       << "  \"isolation_timestamp\": " << rec.isolationTimestamp << ",\n"
+       << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
+       << "  \"aggregated_evidence_hash\": \"" << rec.aggregatedEvidenceHashHex << "\",\n"
+       << "  \"evidence_cids\": [";
+    for (std::size_t i = 0; i < rec.evidenceCids.size(); ++i)
+    {
+        if (i > 0)
+            os << ", ";
+        os << "\"" << rec.evidenceCids[i] << "\"";
+    }
+    os << "],\n"
+       << "  \"authority_tier\": \"" << rec.authorityTier << "\",\n"
+       << "  \"threshold_signature\": \"" << rec.thresholdSignatureHex << "\",\n"
+       << "  \"signature_scheme\": \"current_ecdsa_placeholder_for_future_threshold_dilithium\"\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishIsolationRecordToIpfs(const IsolationRecord& rec)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-isolation-records";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/" << rec.entityType
+         << rec.entityId
+         << "_t" << static_cast<uint64_t>(rec.isolationTimestamp * 1000000.0)
+         << ".json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildIsolationRecordJson(rec);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: isolation record IPFS publish failed. "
+                  << "Isolation JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local://" + path.str();
+    return cid;
+}
+
+static std::string
+RevokeEntityCurrentCrypto(const std::string& entityType,
+                          uint32_t entityId,
+                          uint32_t authorityId,
+                          const std::string& attackVariant,
+                          const std::vector<std::string>& evidenceCids,
+                          const std::string& aggregatedEvidenceHashHex)
+{
+    std::ostringstream key;
+    key << entityType << ":" << entityId;
+    if (g_isolationRecordsByEntity.find(key.str()) != g_isolationRecordsByEntity.end())
+        return g_isolationRecordsByEntity[key.str()].isolationCid;
+
+    IsolationRecord rec;
+    rec.entityType = entityType;
+    rec.entityId = entityId;
+    rec.isolationTimestamp = Simulator::Now().GetSeconds();
+    rec.attackVariant = attackVariant;
+    rec.aggregatedEvidenceHashHex = aggregatedEvidenceHashHex;
+    rec.evidenceCids = evidenceCids;
+    rec.authorityTier = (entityType == "vehicle") ? "rsu" : "controller";
+
+    std::ostringstream signMsg;
+    signMsg << entityType << "|" << entityId << "|"
+            << rec.isolationTimestamp << "|"
+            << attackVariant << "|"
+            << aggregatedEvidenceHashHex;
+    if (rec.authorityTier == "rsu")
+        rec.thresholdSignatureHex = SignWithCurrentRsuKeyHex(authorityId, signMsg.str());
+    else
+        rec.thresholdSignatureHex = SignWithCurrentControllerKeyHex(authorityId, signMsg.str());
+
+    rec.isolationCid = PublishIsolationRecordToIpfs(rec);
+    g_isolationRecordsByEntity[key.str()] = rec;
+
+    std::cout << "[ISOLATION_RECORD] entity=" << entityType
+              << "/" << entityId
+              << " variant=" << attackVariant
+              << " cid=" << rec.isolationCid
+              << " signer=" << rec.authorityTier << "/" << authorityId
+              << std::endl;
+    return rec.isolationCid;
 }
 static const double kTrajectoryWindowSec = 5.0;
 static const double kTrajectoryAlignmentSec = 0.35;
@@ -1884,12 +2301,12 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
                     std::vector<uint8_t> sigBytes(sigTag.sig, sigTag.sig + 64);
                     sigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
                 }
-                RecordRsuPassiveBeaconEvidence(rsuIndex,
-                                               tag,
-                                               bsmTag.GetBsm(),
-                                               sigValid,
-                                               tag.GetSequenceNumber(),
-                                               signalNoise.signal);
+                RecordComputedDetectionEvidence(rsuIndex,
+                                                tag,
+                                                bsmTag.GetBsm(),
+                                                sigValid,
+                                                tag.GetSequenceNumber(),
+                                                signalNoise.signal);
             }
         }
     }
@@ -2884,13 +3301,15 @@ InitializeRsuRegionalAwarenessCsv()
 }
 
 static void
-InitializeRsuPassiveBeaconEvidenceCsv()
+InitializeComputedDetectionEvidenceCsv()
 {
-    std::ofstream out(rsuPassiveBeaconEvidenceCsv.c_str(), std::ios::out);
+    std::ofstream out(computedDetectionEvidenceCsv.c_str(), std::ios::out);
     out << "time,event,rsu_id,real_vehicle_id,claimed_vehicle_id,observable_source_id,"
         << "sequence_number,bsm_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,"
         << "claimed_distance_to_rsu_m,rssi_estimated_distance_m,rssi_dbm,"
-        << "signature_valid,suspicion_flags,evidence_count_for_claimed_id,"
+        << "signature_valid,suspicion_flags,detection_score,signature_score,"
+        << "attack_variant,evidence_vector_hash,current_partial_signature,"
+        << "revocation_timestamp,evidence_count_for_claimed_id,"
         << "ipfs_cid,trigger_seq,status\n";
 }
 
@@ -2944,13 +3363,13 @@ LogRssiVerification(uint32_t observerVehicleId,
 }
 
 static void
-LogRsuPassiveBeaconEvidenceEvent(const std::string& event,
-                                 const RsuPassiveBeaconEvidenceRecord& rec,
-                                 uint32_t evidenceCountForClaimedId,
-                                 const std::string& status,
-                                 uint32_t triggerSeq = 0)
+LogComputedDetectionEvidenceEvent(const std::string& event,
+                                  const ComputedDetectionEvidenceRecord& rec,
+                                  uint32_t evidenceCountForClaimedId,
+                                  const std::string& status,
+                                  uint32_t triggerSeq = 0)
 {
-    std::ofstream out(rsuPassiveBeaconEvidenceCsv.c_str(), std::ios::app);
+    std::ofstream out(computedDetectionEvidenceCsv.c_str(), std::ios::app);
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << rec.rsuId << ","
@@ -2969,6 +3388,12 @@ LogRsuPassiveBeaconEvidenceEvent(const std::string& event,
         << rec.rssiDbm << ","
         << (rec.signatureValid ? 1 : 0) << ","
         << rec.suspicionFlags << ","
+        << rec.detectionScore << ","
+        << rec.signatureScore << ","
+        << rec.attackVariant << ","
+        << rec.evidenceVectorHashHex << ","
+        << rec.currentSignatureHex << ","
+        << rec.revocationTimestamp << ","
         << evidenceCountForClaimedId << ","
         << rec.evidenceCid << ","
         << triggerSeq << ","
@@ -3007,19 +3432,19 @@ DistanceBetween(const Vector& a, const Vector& b)
 }
 
 static void
-RecordRsuPassiveBeaconEvidence(uint32_t rsuIndex,
-                               const SybilPacketTag& tag,
-                               const BsmCoreData& bsm,
-                               bool signatureValid,
-                               uint32_t triggerSeq,
-                               double measuredRssiDbm)
+RecordComputedDetectionEvidence(uint32_t rsuIndex,
+                                const SybilPacketTag& tag,
+                                const BsmCoreData& bsm,
+                                bool signatureValid,
+                                uint32_t triggerSeq,
+                                double measuredRssiDbm)
 {
     if (!LightweightDecisionModeActive())
         return;
     if (rsuIndex >= N_RSUs || rsuIndex >= g_rsuNodes.GetN())
         return;
 
-    RsuPassiveBeaconEvidenceRecord rec;
+    ComputedDetectionEvidenceRecord rec;
     rec.rsuId = rsuIndex;
     rec.realVehicleId = tag.GetRealNodeId();
     rec.claimedVehicleId = tag.GetClaimedNodeId();
@@ -3071,30 +3496,54 @@ RecordRsuPassiveBeaconEvidence(uint32_t rsuIndex,
         rec.bsm.positionY,
         g_rsuFirstSeenClaimedIds,
         g_rsuTemporalNewIdEvents,
-        "RSU_PASSIVE_BEACON");
+        "COMPUTED_DETECTION_EVIDENCE");
 
-    rec.evidenceCid = PublishPassiveBeaconEvidenceToIpfs(rec);
+    rec.detectionScore = std::min(1.0, 0.20 * static_cast<double>(CountSuspicionBits(rec.suspicionFlags)));
+    rec.signatureScore = signatureValid ? 1.0 : 0.0;
+    rec.revocationTimestamp = Simulator::Now().GetSeconds();
+    rec.attackVariant = DescribeAttackVariantFromFlags(rec.suspicionFlags);
+    rec.evidenceVectorHashHex = HashStringHex(BuildComputedEvidenceVectorString(rec));
+    rec.currentSignatureHex =
+        SignWithCurrentRsuKeyHex(rsuIndex,
+                                 rec.evidenceVectorHashHex + "|" +
+                                     std::to_string(rec.revocationTimestamp));
 
-    auto& records = g_rsuPassiveBeaconEvidenceTables[rsuIndex][rec.claimedVehicleId];
+    if (rec.suspicionFlags == SUSPICION_NONE)
+        return;
+
+    rec.evidenceCid = PublishComputedDetectionEvidenceToIpfs(rec);
+
+    auto& records = g_computedDetectionEvidenceTables[rsuIndex][rec.claimedVehicleId];
     records.push_back(rec);
     static const uint32_t kMaxPassiveEvidenceRowsPerId = 50;
     if (records.size() > kMaxPassiveEvidenceRowsPerId)
         records.erase(records.begin());
 
-    LogRsuPassiveBeaconEvidenceEvent("passive_v2v_beacon_observed",
-                                     records.back(),
-                                     static_cast<uint32_t>(records.size()),
-                                     rec.evidenceCid.empty() ? "ipfs_publish_failed_or_unavailable"
-                                                             : "ipfs_published",
-                                     triggerSeq);
+    LogComputedDetectionEvidenceEvent("computed_detection_evidence_published",
+                                      records.back(),
+                                      static_cast<uint32_t>(records.size()),
+                                      rec.evidenceCid.empty() ? "ipfs_publish_failed_or_unavailable"
+                                                              : "ipfs_published",
+                                      triggerSeq);
 
-    std::cout << "[RSU_PASSIVE_EVIDENCE] RSU=" << rsuIndex
+    std::cout << "[COMPUTED_DETECTION_EVIDENCE] RSU=" << rsuIndex
               << " ClaimedId=" << rec.claimedVehicleId
               << " RealId=" << rec.realVehicleId
               << " Seq=" << rec.sequenceNumber
               << " Flags=" << rec.suspicionFlags
+              << " Score=" << rec.detectionScore
               << " CID=" << (rec.evidenceCid.empty() ? "(none)" : rec.evidenceCid)
               << std::endl;
+
+    std::vector<std::string> evidenceCids;
+    if (!rec.evidenceCid.empty())
+        evidenceCids.push_back(rec.evidenceCid);
+    RevokeEntityCurrentCrypto("vehicle",
+                              rec.claimedVehicleId,
+                              rsuIndex,
+                              rec.attackVariant,
+                              evidenceCids,
+                              rec.evidenceVectorHashHex);
 }
 
 static double
@@ -3594,10 +4043,13 @@ RunFLRound()
     double mpcOverhead = 2.5 + 0.5 * static_cast<double>(g_flRoundCounter % 3);
 
     g_secMetrics->OnFLRound(loss, mpcOverhead, true);
+    RunFlModelCidConsensus(g_flRoundCounter, loss);
 
     std::cout << "[FL] Round=" << g_flRoundCounter
               << "  Loss=" << loss
               << "  MPC_overhead_ms=" << mpcOverhead
+              << "  AcceptedModelCID="
+              << (g_latestAcceptedFlModelCid.empty() ? "(none)" : g_latestAcceptedFlModelCid)
               << std::endl;
 }
 
@@ -8089,52 +8541,58 @@ LogReceivedPacket(const std::string& receiverRole,
         // beacon reaches a vehicle, FLEMDS is utilized to verify whether the
         // message belongs to normal flow or abnormal flow."
         //
-        // Features are sourced from:
-        //   • BsmCoreData (bsm)          — position, speed, heading, acceleration
-        //   • NeighborAwarenessRecord     — suspicion flags, RSSI state, distances
-        //   • SybilPacketTag (tag)        — claimedId (ground truth for metrics)
-        //   • Simulator::Now()            — receive timestamp
+        // Features are sourced from observable V2V neighbor-table state only.
+        // Ground truth IDs are used below only for metrics labels, not as model
+        // inputs.
         // ─────────────────────────────────────────────────────────────────────
         if (FLSolutionModeActive() && g_secMetrics)
         {
-            uint32_t claimedId      = tag.GetClaimedNodeId();
+            uint32_t claimedId       = tag.GetClaimedNodeId();
             bool     isActuallySybil = (tag.GetRealNodeId() != claimedId);
             double   now            = Simulator::Now().GetSeconds();
 
             double feat[FLSybilDetector::kNumFeatures] = {};
 
-            // f[0]: out-of-registry — claimedId outside valid vehicle range
-            feat[0] = (claimedId >= N_Vehicles) ? 1.0 : 0.0;
-
-            // f[1]–f[8]: from the neighbor record updated just above
             if (receiverId < g_vehicleNeighborTables.size() &&
                 g_vehicleNeighborTables[receiverId].count(claimedId))
             {
                 const NeighborAwarenessRecord& rec =
                     g_vehicleNeighborTables[receiverId].at(claimedId);
 
-                feat[1] = (rec.rssiVerificationState == RSSI_MISMATCH) ? 1.0 : 0.0;
-                feat[2] = (rec.suspicionFlags & SUSPICION_POSITION_CONFLICT)    ? 1.0 : 0.0;
-                feat[3] = (rec.suspicionFlags & SUSPICION_DUPLICATE_ID)         ? 1.0 : 0.0;
-                feat[4] = (rec.suspicionFlags & SUSPICION_RSSI_COLOCATION)      ? 1.0 : 0.0;
-                feat[5] = (rec.suspicionFlags & SUSPICION_ID_MISMATCH)          ? 1.0 : 0.0;
-                feat[6] = (rec.suspicionFlags & SUSPICION_TEMPORAL_BURST)       ? 1.0 : 0.0;
+                auto clamp01 = [](double value) {
+                    return std::max(0.0, std::min(1.0, value));
+                };
 
-                double claimedDist = rec.claimedDistance;
-                double rssiDist    = rec.rssiEstimatedDistance;
-                if (rssiDist > 0.0 && claimedDist > 0.0)
-                    feat[7] = std::min(1.0,
-                                       std::abs(rssiDist - claimedDist) / 25.0);
+                const double neighborAge =
+                    std::max(0.0, rec.lastSeenTime - rec.firstSeenTime);
+                const double beaconCount =
+                    std::max(1.0, static_cast<double>(rec.receivedBeaconCount));
+                const double meanBeaconInterval = neighborAge / beaconCount;
+                const double reportStaleness =
+                    (rec.lastReportedToRsuTime >= 0.0)
+                        ? std::max(0.0, now - rec.lastReportedToRsuTime)
+                        : 30.0;
+                const double headingRad =
+                    rec.lastBsm.heading * 3.14159265358979323846 / 180.0;
+                const double positionRadius =
+                    std::sqrt(rec.lastBsm.positionX * rec.lastBsm.positionX +
+                              rec.lastBsm.positionY * rec.lastBsm.positionY);
 
-                feat[8] = std::min(1.0,
-                                   static_cast<double>(rec.receivedBeaconCount) / 10.0);
+                feat[0] = clamp01(rec.lastBsm.speed / 50.0);
+                feat[1] = clamp01(rec.claimedDistance / 300.0);
+                feat[2] = clamp01(static_cast<double>(rec.receivedBeaconCount) / 20.0);
+                feat[3] = clamp01(static_cast<double>(
+                                      g_vehicleNeighborTables[receiverId].size()) / 80.0);
+                feat[4] = clamp01(neighborAge / 60.0);
+                feat[5] = clamp01(meanBeaconInterval / 5.0);
+                feat[6] = std::sin(headingRad);
+                feat[7] = std::cos(headingRad);
+                feat[8] = clamp01(reportStaleness / 30.0);
+                feat[9] = clamp01(positionRadius / 5000.0);
             }
 
-            // f[9]: normalized vehicle speed from the BSM
-            feat[9] = std::min(1.0, bsm.speed / 20.0);
-
             double pred           = FLSybilDetector::RunInference(feat);
-            bool   predictedSybil = (pred > 0.56);
+            bool   predictedSybil = (pred >= 0.5);
 
             g_secMetrics->RecordFLPacketDecision(
                 claimedId, isActuallySybil, predictedSybil, "vehicle", now);
@@ -9448,6 +9906,10 @@ main(int argc, char* argv[])
     g_latestTokenManifestCid.clear();
     g_rsuTokenRecordCidCache.assign(N_RSUs, std::map<uint32_t, std::string>());
     g_rsuTokenHashCache.assign(N_RSUs, std::map<uint32_t, std::string>());
+    g_latestAcceptedFlModelCid.clear();
+    g_flModelConsensusByRound.clear();
+    g_rsuAcceptedFlModelCid.assign(N_RSUs, std::string());
+    g_isolationRecordsByEntity.clear();
     if (sybil_attacker_level < 1) sybil_attacker_level = 1;
     if (sybil_attacker_level > 4) sybil_attacker_level = 4;
     g_rsuVehicleTables.assign(N_RSUs, std::map<uint32_t, RsuVehicleRecord>());
@@ -9486,7 +9948,7 @@ main(int argc, char* argv[])
     InitializeRsuVehicleTableCsv();
     InitializeRsuVehicleObservationCsv();
     InitializeRsuRegionalAwarenessCsv();
-    InitializeRsuPassiveBeaconEvidenceCsv();
+    InitializeComputedDetectionEvidenceCsv();
     InitializeControllerVehicleTableCsv();
     InitializeControllerGlobalAwarenessCsv();
     InitializeRssiVerificationCsv();
@@ -9933,6 +10395,7 @@ main(int argc, char* argv[])
     std::cout << "RSU table CSV: " << rsuVehicleTableCsv << std::endl;
     std::cout << "RSU observation rows CSV: " << rsuVehicleObservationCsv << std::endl;
     std::cout << "RSU regional awareness CSV: " << rsuRegionalAwarenessCsv << std::endl;
+    std::cout << "Computed detection evidence CSV: " << computedDetectionEvidenceCsv << std::endl;
     std::cout << "Controller table CSV: " << controllerVehicleTableCsv << std::endl;
     std::cout << "Controller global awareness CSV: " << controllerGlobalAwarenessCsv << std::endl;
 

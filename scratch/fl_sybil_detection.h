@@ -17,17 +17,17 @@
 // evaluation works — PyTorch trains the model, the network simulator measures
 // protocol overhead and detection metrics.
 //
-// Feature vector (10 features, all binary or normalised [0, 1]):
-//   f[0]  out_of_registry      1.0 if claimedId >= N_Vehicles, else 0.0
-//   f[1]  rssi_mismatch        1.0 if RSSI_MISMATCH state, else 0.0
-//   f[2]  position_conflict    1.0 if SUSPICION_POSITION_CONFLICT flag set
-//   f[3]  duplicate_id         1.0 if SUSPICION_DUPLICATE_ID flag set
-//   f[4]  rssi_colocation      1.0 if SUSPICION_RSSI_COLOCATION flag set
-//   f[5]  id_mismatch          1.0 if SUSPICION_ID_MISMATCH flag set
-//   f[6]  temporal_burst       1.0 if SUSPICION_TEMPORAL_BURST flag set
-//   f[7]  dist_mismatch_norm   |rssiDist − claimedDist| / 25 m, clamped [0,1]
-//   f[8]  beacon_count_norm    receivedBeaconCount / 10, clamped [0,1]
-//   f[9]  speed_norm           bsm.speed / 20 m/s, clamped [0,1]
+// Feature vector (10 features, observable V2V/neighbor-table values):
+//   f[0]  bsm_speed_norm
+//   f[1]  estimated_distance_norm
+//   f[2]  received_beacon_count_norm
+//   f[3]  neighbor_table_size_norm
+//   f[4]  neighbor_age_norm
+//   f[5]  mean_beacon_interval_norm
+//   f[6]  heading_sin
+//   f[7]  heading_cos
+//   f[8]  report_staleness_norm
+//   f[9]  position_radius_norm
 //
 // Five-step integration (mirrors rssi_sybil_detection.h API style):
 //   1. #include "fl_sybil_detection.h"
@@ -56,54 +56,26 @@ static const int kNumFeatures = 10;
 // Pre-trained weights (logistic regression, equivalent to a 1-layer neural
 // network with sigmoid output).
 //
-// Trained offline: gradient descent, 500 epochs, lr = 0.01,
-// binary cross-entropy loss, on simulation observation CSV data.
-// Expected performance: accuracy ~70-80%, balanced precision/recall.
-//
-// Weight calibration notes (active features in ns-3 simulation):
-//   f[0] out_of_registry:  REDUCED — cannot be the sole discriminant; alone it
-//        gives sigmoid(2.0-2.80)=0.31, below threshold.  Forces model to rely
-//        on corroborating spatial evidence before classification.
-//   f[1] rssi_mismatch:    HIGH — binary flag when |rssiDist-claimedDist|>25m.
-//        Primary detection signal for large-offset attacks.
-//   f[7] dist_mismatch_norm: HIGH continuous signal — captures moderate offsets
-//        (10-24m) that don't cross the binary mismatch threshold but still
-//        contribute proportionally.  Primary nuanced discriminant.
-//   f[4] rssi_colocation:  REDUCED — supplementary signal for simultaneous
-//        multi-ID attacks; alone insufficient, strengthens RSSI evidence.
-//   f[2],[f3],[f5],[f6]:   Present in the feature vector but currently produce
-//        zero at the vehicle inference tier (those flags are set at RSU tier).
-//        Retained for forward compatibility when higher-tier aggregation feeds
-//        back to vehicles.
-//   f[8] beacon_count_norm: negative — established vehicles are less suspicious.
-//   f[9] speed_norm:       near-zero — weak differentiating signal.
-//   bias = -2.80:          strong pull toward Normal ensuring that a vehicle
-//        with no detected anomalies is classified as legitimate by default.
-//
-// Detection decision examples with calibrated weights and threshold 0.56:
-//   All features zero (legitimate): sigmoid(-2.80) = 0.057 → Normal  ✓
-//   out_of_registry only:           sigmoid(2.0-2.80) = 0.310 → Normal ✓
-//     (ID check alone is insufficient — spatial evidence required)
-//   out_of_registry + RSSI mismatch: sigmoid(6.5-2.80) = 0.976 → Sybil ✓
-//   dist_mismatch_norm=0.8 (20m):   sigmoid(0+4.5*0.8-2.80)=sigmoid(0.80)=0.690 → Sybil ✓
-//   out_of_registry + dist=0.4 (10m): sigmoid(2.0+1.80-2.80)=sigmoid(1.0)=0.731 → Sybil ✓
-//   dist_mismatch_norm=0.16 (4m):   sigmoid(0.72-2.80)=0.111 → Normal ✓
+// Trained offline with sybil-attack/fl/scripts/train_hierarchical_fl.py on the
+// mixed dataset built from vehicle_neighbor_table_log.csv.  Labels use
+// simulation ground truth, but these features do not include real-vs-claimed ID
+// leakage, out-of-registry checks, or suspicion flags.
 // ---------------------------------------------------------------------------
 
 static const double kWeights[kNumFeatures] = {
-    2.00,   // f[0] out_of_registry       (reduced: ID alone insufficient)
-    4.50,   // f[1] rssi_mismatch         (strong: binary spatial anomaly)
-    3.50,   // f[2] position_conflict     (retained for RSU-fed aggregation)
-    4.00,   // f[3] duplicate_id          (retained for RSU-fed aggregation)
-    0.30,   // f[4] rssi_colocation       (weak supplementary: high alone → always-TP)
-    4.00,   // f[5] id_mismatch           (retained for RSU-fed aggregation)
-    2.50,   // f[6] temporal_burst        (retained for RSU-fed aggregation)
-    4.50,   // f[7] dist_mismatch_norm    (boosted: primary continuous signal)
-   -0.50,   // f[8] beacon_count_norm     (established vehicle → less suspicious)
-    0.20    // f[9] speed_norm            (weak signal)
+   -0.00999634256134, // f[0] bsm_speed_norm
+    0.613558340902,   // f[1] estimated_distance_norm
+   -1.34743487139,    // f[2] received_beacon_count_norm
+    0.539274862506,   // f[3] neighbor_table_size_norm
+   -0.988876275683,   // f[4] neighbor_age_norm
+   -0.0486799016935,  // f[5] mean_beacon_interval_norm
+    0.0593113933106,  // f[6] heading_sin
+    0.165896379578,   // f[7] heading_cos
+    0.029867438012,   // f[8] report_staleness_norm
+   -0.122046508331    // f[9] position_radius_norm
 };
 
-static const double kBias = -2.80;
+static const double kBias = -0.00168292708603;
 
 // ---------------------------------------------------------------------------
 // Sigmoid activation
@@ -122,17 +94,6 @@ inline double Sigmoid(double z)
 // Returns:
 //   Sybil probability in [0, 1].  Threshold: > 0.5 → classify as Sybil.
 //
-// Expected outputs for representative cases:
-//   All features zero (legitimate vehicle, no flags):
-//     sigmoid(-2.80) = 0.057  → Normal  ✓
-//   out_of_registry = 1 only:
-//     sigmoid(6.00 - 2.80) = sigmoid(3.20) = 0.961  → Sybil  ✓
-//   duplicate_id = 1 only:
-//     sigmoid(5.00 - 2.80) = sigmoid(2.20) = 0.900  → Sybil  ✓
-//   rssi_mismatch=1 + position_conflict=1:
-//     sigmoid(4.50 + 3.50 - 2.80) = sigmoid(5.20) = 0.994  → Sybil  ✓
-//   temporal_burst = 1 only (ambiguous):
-//     sigmoid(2.50 - 2.80) = sigmoid(-0.30) = 0.426  → Normal  ✓
 // ---------------------------------------------------------------------------
 inline double RunInference(const double features[kNumFeatures])
 {
