@@ -59,7 +59,7 @@ static void LogControllerGlobalAwarenessEvent(
 
 uint32_t N_Vehicles = 8;              ///< Number of vehicle nodes.
 uint32_t N_RSUs = 2;                  ///< Number of RSU edge nodes.
-uint32_t N_Controllers = 1;           ///< Number of SDN controller nodes.
+uint32_t N_Controllers = 4;           ///< Number of SDN controller nodes.
 double simTime = 12.0;                ///< Total simulation time (seconds).
 double txPowerDbm = 40.0;             ///< PHY Tx power (dBm) for all 802.11p radios. DSRC RSU EIRP limit ~40 dBm.
 double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
