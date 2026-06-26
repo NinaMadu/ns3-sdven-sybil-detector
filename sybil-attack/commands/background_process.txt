@@ -1,0 +1,41 @@
+Check if simulation is running:
+
+
+# See the process with its arguments
+ps aux | grep "Sybil-Developing" | grep -v grep
+
+# Short view — just PID and status
+pgrep -a waf
+pgrep -a Sybil
+
+# Watch it live (refreshes every 2s)
+watch -n 2 'ps aux | grep Sybil | grep -v grep'
+Check progress without console output (quietMode):
+
+
+# Watch the output CSV grow in real time
+watch -n 3 'wc -l ~/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/outputs/communication_log.csv'
+
+# Or watch file sizes of all output CSVs
+watch -n 3 'ls -lh ~/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/outputs/*.csv'
+Stop the simulation:
+
+
+# Graceful stop — sends SIGTERM (lets NS3 flush files cleanly)
+pkill -f "Sybil-Developing"
+
+# Force kill if it doesn't stop (use if graceful fails after ~5s)
+pkill -9 -f "Sybil-Developing"
+
+# If you know the PID from ps aux output
+kill <PID>
+kill -9 <PID>
+One-liner to get PID and kill in one step:
+
+
+# Graceful
+pkill -f "Sybil-Developing" && echo "stopped"
+
+# Force
+pkill -9 -f waf && pkill -9 -f Sybil && echo "force stopped"
+Note: With --quietMode=true, the CSV files are written via persistent open handles — a clean pkill (SIGTERM) will flush and close them properly. A kill -9 (SIGKILL) bypasses the destructor so the last unflushed buffer (~4KB) might be lost. Use graceful stop first.

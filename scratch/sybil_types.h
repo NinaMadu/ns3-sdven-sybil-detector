@@ -1581,11 +1581,9 @@ BuildBsmCoreData(uint32_t realVehicleId, uint32_t temporaryId, uint32_t messageC
             bsm.positionZ = pos.z;
         }
 
-        Ptr<ConstantVelocityMobilityModel> cv =
-            g_vehicleNodes.Get(realVehicleId)->GetObject<ConstantVelocityMobilityModel>();
-        if (cv)
+        if (mob)
         {
-            Vector vel = cv->GetVelocity();
+            Vector vel = mob->GetVelocity();
             bsm.speed = std::sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
             if (bsm.speed > 0.0)
             {

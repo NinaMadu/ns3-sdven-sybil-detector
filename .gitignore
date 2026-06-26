@@ -29,6 +29,9 @@
 !sybil-attack/scripts/**
 !sybil-attack/commands/
 !sybil-attack/commands/**
+!sybil-attack/notebooks/
+!sybil-attack/notebooks/**
+.ipynb_checkpoints/
 !sybil-attack/mobility_routing_test_report.md
 
 # Keep runtime CSVs loaded directly by the simulation.
