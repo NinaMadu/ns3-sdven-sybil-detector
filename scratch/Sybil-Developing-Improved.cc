@@ -59,9 +59,10 @@ static void LogControllerGlobalAwarenessEvent(
 
 uint32_t N_Vehicles = 8;              ///< Number of vehicle nodes.
 uint32_t N_RSUs = 2;                  ///< Number of RSU edge nodes.
-uint32_t N_Controllers = 1;           ///< Number of SDN controller nodes.
+uint32_t N_Controllers = 4;           ///< Number of SDN controller nodes.
 double simTime = 12.0;                ///< Total simulation time (seconds).
-double beaconInterval = 1.0;          ///< V2V/V2RSU beacon period.
+double txPowerDbm = 40.0;             ///< PHY Tx power (dBm) for all 802.11p radios. DSRC RSU EIRP limit ~40 dBm.
+double beaconInterval = 0.1;          ///< V2V/V2RSU beacon period (10 Hz default).
 double beaconJitterMax = 0.02;        ///< Maximum random V2V beacon timing jitter (seconds).
 double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
 bool routing_test = true;             ///< true → small 3-vehicle/2-RSU/1-SDN test network.
@@ -70,10 +71,12 @@ bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
 uint32_t sybil_attacker_level = 2;    ///< Attacker sophistication: 1=basic, 2=standard, 3=stealth, 4=advanced.
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
+
 const uint32_t kNoLegacyProposedMethod = std::numeric_limits<uint32_t>::max();
 uint32_t solution_mode = MODE_NO_DETECTION; ///< 1=FL (FLEMDS) 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=none.
 uint32_t full_crypto_profile = 1;        ///< Inside full mode: 1=current classical, 2=real PQC Kyber + Dilithium/ML-DSA.
 uint32_t proposed_method = kNoLegacyProposedMethod; ///< Backward-compatible alias for old proposed_method values.
+
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
 double v2vReliableRange = 100.0;      ///< Reliable local V2V beacon evaluation radius (metres).
@@ -90,8 +93,20 @@ double channelHandshakeTimeout = 1.0;        ///< Retry V2RSU CHAN_HELLO after p
 double cloudPresenceSyncInterval = 1.0;      ///< Seconds between controller cache syncs from cloud presence table.
 double cloudPresenceTimeout = 8.0;           ///< Seconds before global vehicle presence rows expire.
 bool boundedRoadMobility = true;             ///< Keep vehicles inside a bounded road corridor.
-uint32_t mobility_mode = 2;                  ///< 1=test, 2=programmed road, 3-5=SUMO/ns-2 traces.
+uint32_t mobility_mode = 2;                  ///< 1=test, 2=programmed, 3=barcelona-t0-sumo, 4=kl-cheras, 5=klbb-staggered.
 bool sumoAutoConfig = true;                  ///< Auto-set N_Vehicles/N_RSUs from SUMO trace files.
+
+// RSSI detector tuning — exposed as CLI args, applied before RssiSybilDetector::Init()
+double   rssiClusterRadius  = 25.0;   ///< Co-location cluster radius (m)
+double   rssiDist1Thresh    = 15.0;   ///< 1-RSU fallback distance threshold (m)
+double   rssiWindowSec      =  2.0;   ///< Rolling observation window (s)
+uint32_t rssiMinSamples     =  8;     ///< Min samples per (RSU,claimedId) before detection
+uint32_t rssiStreakRequired  =  2;     ///< Consecutive windows needed to confirm Sybil
+
+// Sweep mode — suppresses all per-packet logging so threshold sweeps run fast
+bool sweepMode = false;
+// Quiet mode — silences all console (stdout) prints; CSV file writes are unaffected
+bool quietMode = false;
 double roadStartX = 20.0;                    ///< Road corridor start x-coordinate.
 double roadLength = 800.0;                   ///< Road corridor length in metres.
 double roadBaseY = 40.0;                     ///< Centre y-coordinate of the road corridor.
@@ -107,15 +122,15 @@ double maxVehicleSpeed = 16.0;               ///< Fastest vehicle speed in m/s.
 double mobilityUpdateInterval = 0.5;         ///< Seconds between bounded-road wrap checks.
 std::string mobilityTraceFile = "";          ///< Optional one-run override for the selected SUMO trace.
 std::string mobilityRsuPositionFile = "";    ///< Optional one-run override for selected SUMO RSU CSV.
-std::string mobilityMode3Name = "sumo_synthetic_urban";
-std::string mobilityMode3TraceFile = "sybil-attack/inputs/mobility/synthetic-urban/sumo_mobility.tcl";
-std::string mobilityMode3RsuPositionFile = "sybil-attack/inputs/mobility/synthetic-urban/synthetic_urban_rsus.csv";
+std::string mobilityMode3Name = "barcelona_t0_sumo";
+std::string mobilityMode3TraceFile = "sybil-attack/inputs/mobility/barcelona/barcelona_mobility.tcl";
+std::string mobilityMode3RsuPositionFile = "sybil-attack/inputs/mobility/barcelona/barcelona_rsus_8x8.csv";
 std::string mobilityMode4Name = "sumo_kl_cheras";
 std::string mobilityMode4TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_mobility.tcl";
 std::string mobilityMode4RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_rsus_200m.csv";
 std::string mobilityMode5Name = "sumo_kuala_lumpur_bb";
-std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_mobility.tcl";
-std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_rsus_200m.csv";
+std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_mobility.tcl";
+std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_rsus_8x8.csv";
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
 std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_table_log.csv";
@@ -127,6 +142,18 @@ std::string controllerVehicleTableCsv = "sybil-attack/outputs/controller_vehicle
 std::string controllerGlobalAwarenessCsv = "sybil-attack/outputs/controller_global_awareness_log.csv";
 std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
 std::string rssiVerificationCsv = "sybil-attack/outputs/rssi_verification_log.csv";
+
+// Persistent CSV file handles — opened once after headers are written, closed at program exit.
+// Eliminates per-row open/write/close syscall overhead (hundreds of thousands of operations).
+std::ofstream g_csvComm;
+std::ofstream g_csvVehicleNeighbor;
+std::ofstream g_csvRsuVehicleTable;
+std::ofstream g_csvRsuObservation;
+std::ofstream g_csvRsuRegional;
+std::ofstream g_csvRsuPassive;
+std::ofstream g_csvControllerVehicle;
+std::ofstream g_csvControllerGlobal;
+std::ofstream g_csvRssiVerif;
 
 // ---------------------------------------------------------------------------
 // Global containers (NOT static — extern'd in sybil_types.h so attack
@@ -2727,20 +2754,6 @@ FLSolutionModeActive()
     return solution_mode == MODE_BASELINE_FL;
 }
 
-static uint32_t
-MapLegacyProposedMethod(uint32_t legacyMode)
-{
-    switch (legacyMode)
-    {
-    case 0: return MODE_NO_DETECTION;
-    case 1: return MODE_LIGHTWEIGHT;
-    case 2: return MODE_BASELINE_ML;
-    case 3: return MODE_BASELINE_FL;
-    case 4: return MODE_FULL;
-    default: return legacyMode;
-    }
-}
-
 static std::string
 SolutionModeToString(uint32_t mode)
 {
@@ -3029,6 +3042,8 @@ RecordUnblockedLightweightGlobalMiss(const ControllerGlobalAwarenessRecord& reco
                           evidence);
 }
 
+static double DistanceBetween(const Vector& a, const Vector& b);
+
 static void
 WifiMonitorSnifferRx(uint32_t observerIndex,
                      Ptr<const Packet> packet,
@@ -3056,6 +3071,18 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
         uint32_t rsuIndex = observerIndex - N_Vehicles;
         if (rsuIndex < N_RSUs)
         {
+            // Feed actual PHY-layer RSSI into the Φcoloc detector — this replaces
+            // the position-derived software model previously computed in ReceivePacket().
+            if (RssiSolutionModeActive())
+            {
+                RssiSybilDetector::FeedObservation(
+                    rsuIndex,
+                    tag.GetClaimedNodeId(),
+                    tag.GetRealNodeId(),
+                    signalNoise.signal,
+                    Simulator::Now().GetSeconds());
+            }
+
             BsmCoreDataTag bsmTag;
             if (packet->PeekPacketTag(bsmTag))
             {
@@ -3070,12 +3097,55 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
                     std::vector<uint8_t> sigBytes(sigTag.sig, sigTag.sig + 64);
                     sigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
                 }
+
+                BsmCoreData bsm = bsmTag.GetBsm();
+                RecordRsuPassiveBeaconEvidence(rsuIndex,
+                                               tag,
+                                               bsm,
+                                               sigValid,
+                                               tag.GetSequenceNumber(),
+                                               signalNoise.signal);
+
+                // Log RSU-level RSSI to rssi_verification_log so the RSSI
+                // Analyzer dataset contains RSU observations (not just V2V).
+                // Observer ID is encoded as N_Vehicles + rsuIndex to distinguish
+                // RSU rows from vehicle rows in the CSV.
+                if (signalNoise.signal > -998.0)
+                {
+                    Ptr<MobilityModel> rsuMob =
+                        g_rsuNodes.Get(rsuIndex)->GetObject<MobilityModel>();
+                    Vector rsuPos = rsuMob ? rsuMob->GetPosition() : Vector(0, 0, 0);
+                    Vector claimedPos(bsm.positionX, bsm.positionY, bsm.positionZ);
+                    double claimedDist = DistanceBetween(rsuPos, claimedPos);
+                    double rssiDist    = RssiToDistance(signalNoise.signal);
+                    double mismatch    = std::fabs(rssiDist - claimedDist);
+                    std::string stateStr = (mismatch > kRssiDistMismatchM) ? "MISMATCH" : "VERIFIED";
+                    uint32_t sflags = (mismatch > kRssiDistMismatchM)
+                                          ? SUSPICION_RSSI_DISTANCE_MISMATCH
+                                          : SUSPICION_NONE;
+                    sflags |= GetRssiCoLocationFlags(observerIndex, tag.GetClaimedNodeId());
+
+                    auto& rout = g_csvRssiVerif;
+                    rout << Simulator::Now().GetSeconds() << ","
+                         << (N_Vehicles + rsuIndex) << ","
+                         << tag.GetClaimedNodeId() << ","
+                         << tag.GetRealNodeId() << ","
+                         << signalNoise.signal << ","
+                         << rssiDist << ","
+                         << claimedDist << ","
+                         << mismatch << ","
+                         << kRssiDistMismatchM << ","
+                         << stateStr << ","
+                         << sflags << "\n";
+                }
+
                 RecordComputedDetectionEvidence(rsuIndex,
                                                 tag,
                                                 bsmTag.GetBsm(),
                                                 sigValid,
                                                 tag.GetSequenceNumber(),
                                                 signalNoise.signal);
+
             }
         }
     }
@@ -4104,6 +4174,20 @@ InitializeRssiVerificationCsv()
 }
 
 static void
+OpenPersistentCsvHandles()
+{
+    g_csvComm.open           (communicationCsv.c_str(),           std::ios::app);
+    g_csvVehicleNeighbor.open(vehicleNeighborTableCsv.c_str(),    std::ios::app);
+    g_csvRsuVehicleTable.open(rsuVehicleTableCsv.c_str(),         std::ios::app);
+    g_csvRsuObservation.open (rsuVehicleObservationCsv.c_str(),   std::ios::app);
+    g_csvRsuRegional.open    (rsuRegionalAwarenessCsv.c_str(),    std::ios::app);
+    g_csvRsuPassive.open     (rsuPassiveBeaconEvidenceCsv.c_str(),std::ios::app);
+    g_csvControllerVehicle.open(controllerVehicleTableCsv.c_str(),std::ios::app);
+    g_csvControllerGlobal.open(controllerGlobalAwarenessCsv.c_str(),std::ios::app);
+    g_csvRssiVerif.open      (rssiVerificationCsv.c_str(),        std::ios::app);
+}
+
+static void
 LogRssiVerification(uint32_t observerVehicleId,
                     uint32_t observedClaimedId,
                     uint32_t observedRealId,
@@ -4117,7 +4201,7 @@ LogRssiVerification(uint32_t observerVehicleId,
 
     double mismatch = std::fabs(record.rssiEstimatedDistance - record.claimedDistance);
 
-    std::ofstream out(rssiVerificationCsv.c_str(), std::ios::app);
+    auto& out = g_csvRssiVerif;
     out << Simulator::Now().GetSeconds() << ","
         << observerVehicleId << ","
         << observedClaimedId << ","
@@ -4138,6 +4222,9 @@ LogComputedDetectionEvidenceEvent(const std::string& event,
                                   const std::string& status,
                                   uint32_t triggerSeq = 0)
 {
+
+    if (sweepMode) return;
+    auto& out = g_csvRsuPassive;
     std::ofstream out(computedDetectionEvidenceCsv.c_str(), std::ios::app);
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
@@ -4208,8 +4295,10 @@ RecordComputedDetectionEvidence(uint32_t rsuIndex,
                                 uint32_t triggerSeq,
                                 double measuredRssiDbm)
 {
+
     if (!LightweightDecisionModeActive() && !FullCryptoMechanismActive())
         return;
+
     if (rsuIndex >= N_RSUs || rsuIndex >= g_rsuNodes.GetN())
         return;
 
@@ -4575,7 +4664,7 @@ AutoConfigureSumoMode()
     if (mobility_mode < 3 || mobility_mode > 5) return;
 
     MobilityScenario scenario = GetMobilityScenario(mobility_mode);
-    if (!scenario.usesSumoTrace || scenario.traceFile.empty()) return;
+    if (scenario.traceFile.empty()) return;
     if (!FileExists(scenario.traceFile)) return;
 
     uint32_t traceVehicles = CountSumoTraceVehicles(scenario.traceFile);
@@ -4768,6 +4857,107 @@ InstallSumoTraceMobility(const MobilityScenario& scenario)
               << scenario.traceFile << "\n";
 }
 
+// Mode 3 — KLBB SUMO trace, all vehicles active from t=0.
+// Reads the same ns-2 TCL trace as mode 5.  For each vehicle, subtracts its
+// earliest event time so all vehicles start moving at t=0 on realistic SUMO
+// road paths.  Writes the shifted trace to /tmp and loads it via Ns2MobilityHelper.
+static std::string
+BuildMode3ShiftedTrace(const std::string& sourceTrace)
+{
+    struct Event {
+        uint32_t    nodeId;
+        double      origT;
+        std::string payload; // everything from the space after "at T" to end-of-line
+    };
+
+    std::vector<std::string>   nonEventLines;
+    std::vector<Event>         events;
+    std::map<uint32_t, double> minT;
+
+    std::ifstream fin(sourceTrace.c_str());
+    if (!fin.is_open())
+    {
+        std::cerr << "[Mobility] Mode3 shift: cannot open " << sourceTrace << "\n";
+        return sourceTrace;
+    }
+
+    std::string line;
+    while (std::getline(fin, line))
+    {
+        if (line.compare(0, 8, "$ns_ at ") != 0)
+        {
+            nonEventLines.push_back(line);
+            continue;
+        }
+        std::istringstream ss(line.substr(8));
+        double      t;
+        std::string rest;
+        if (!(ss >> t) || !std::getline(ss, rest))
+        {
+            nonEventLines.push_back(line);
+            continue;
+        }
+        size_t nStart = rest.find("$node_(");
+        size_t nEnd   = (nStart != std::string::npos) ? rest.find(")", nStart) : std::string::npos;
+        if (nEnd == std::string::npos)
+        {
+            nonEventLines.push_back(line);
+            continue;
+        }
+        uint32_t nodeId = static_cast<uint32_t>(
+            std::stoul(rest.substr(nStart + 7, nEnd - nStart - 7)));
+        events.push_back({nodeId, t, rest});
+        auto it = minT.find(nodeId);
+        if (it == minT.end() || t < it->second)
+            minT[nodeId] = t;
+    }
+    fin.close();
+
+    // Derive tmp filename from source trace basename
+    std::string baseName = sourceTrace;
+    size_t slashPos = baseName.rfind('/');
+    if (slashPos != std::string::npos) baseName = baseName.substr(slashPos + 1);
+    size_t dotPos = baseName.rfind('.');
+    if (dotPos != std::string::npos) baseName = baseName.substr(0, dotPos);
+    const std::string outPath = "/tmp/" + baseName + "_mode3_t0.tcl";
+    std::ofstream fout(outPath.c_str());
+    if (!fout.is_open())
+    {
+        std::cerr << "[Mobility] Mode3 shift: cannot write to " << outPath << "\n";
+        return sourceTrace;
+    }
+
+    for (const auto& l : nonEventLines)
+        fout << l << "\n";
+
+    std::sort(events.begin(), events.end(), [&](const Event& a, const Event& b) {
+        double ta = a.origT - minT.at(a.nodeId);
+        double tb = b.origT - minT.at(b.nodeId);
+        return (ta != tb) ? (ta < tb) : (a.nodeId < b.nodeId);
+    });
+
+    for (const auto& ev : events)
+    {
+        double shifted = ev.origT - minT.at(ev.nodeId);
+        char tBuf[32];
+        std::snprintf(tBuf, sizeof(tBuf), "%.1f", shifted);
+        fout << "$ns_ at " << tBuf << ev.payload << "\n";
+    }
+    fout.close();
+
+    std::cout << "[Mobility] Mode 3 (klbb_t0_sumo): shifted "
+              << minT.size() << " vehicles to t=0 -> " << outPath << "\n";
+    return outPath;
+}
+
+static void
+InstallMode3SumoMobility(const MobilityScenario& scenario)
+{
+    MobilityScenario shifted  = scenario;
+    shifted.traceFile         = BuildMode3ShiftedTrace(scenario.traceFile);
+    InstallSumoTraceMobility(shifted);
+}
+
 static void
 InstallSelectedMobility()
 {
@@ -4792,6 +4982,9 @@ InstallSelectedMobility()
         InstallConstantVelocityVehicles(true);
         break;
     case 3:
+        boundedRoadMobility = false;
+        InstallMode3SumoMobility(scenario);
+        break;
     case 4:
     case 5:
         boundedRoadMobility = false;
@@ -4847,6 +5040,14 @@ InitializeRssiSolution()
         Vector p = g_rsuNodes.Get(u)->GetObject<MobilityModel>()->GetPosition();
         rsuPos.push_back({p.x, p.y});
     }
+
+    // Apply CLI-tuned thresholds before Init() so Init() prints the correct values
+    RssiSybilDetector::kClusterRadiusM   = rssiClusterRadius;
+    RssiSybilDetector::kDist1RsuThreshM  = rssiDist1Thresh;
+    RssiSybilDetector::kWindowSec        = rssiWindowSec;
+    RssiSybilDetector::kMinSamplesForMle = rssiMinSamples;
+    RssiSybilDetector::kStreakRequired   = rssiStreakRequired;
+
     RssiSybilDetector::Init(N_RSUs, rsuPos);
 }
 
@@ -4858,11 +5059,12 @@ LogRsuVehicleTableEvent(const std::string& event,
                         const std::string& status,
                         uint32_t triggerSeq = 0)
 {
+    if (sweepMode) return;
     uint32_t tableSize = (rsuIndex < g_rsuVehicleTables.size())
                          ? g_rsuVehicleTables[rsuIndex].size()
                          : 0;
 
-    std::ofstream out(rsuVehicleTableCsv.c_str(), std::ios::app);
+    auto& out = g_csvRsuVehicleTable;
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << rsuIndex << ","
@@ -4889,7 +5091,7 @@ LogVehicleNeighborTableEvent(const std::string& event,
                          ? g_vehicleNeighborTables[record.observerVehicleId].size()
                          : 0;
 
-    std::ofstream out(vehicleNeighborTableCsv.c_str(), std::ios::app);
+    auto& out = g_csvVehicleNeighbor;
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << record.observerVehicleId << ","
@@ -4921,6 +5123,7 @@ LogRsuVehicleObservationRowEvent(const std::string& event,
                                  const std::string& status,
                                  uint32_t triggerSeq = 0)
 {
+    if (sweepMode) return;
     uint32_t rowsForClaimedId = 0;
     if (rsuIndex < g_rsuVehicleObservationTables.size())
     {
@@ -4929,7 +5132,7 @@ LogRsuVehicleObservationRowEvent(const std::string& event,
             rowsForClaimedId = tableIt->second.size();
     }
 
-    std::ofstream out(rsuVehicleObservationCsv.c_str(), std::ios::app);
+    auto& out = g_csvRsuObservation;
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << rsuIndex << ","
@@ -5285,7 +5488,7 @@ LogControllerVehicleTableEvent(const std::string& event,
                                const std::string& status,
                                uint32_t triggerSeq = 0)
 {
-    std::ofstream out(controllerVehicleTableCsv.c_str(), std::ios::app);
+    auto& out = g_csvControllerVehicle;
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << record.servingRsuId << ","
@@ -5309,11 +5512,12 @@ LogRsuRegionalAwarenessEvent(const std::string& event,
                              const std::string& status,
                              uint32_t triggerSeq)
 {
+    if (sweepMode) return;
     uint32_t tableSize = (rsuIndex < g_rsuRegionalAwarenessTables.size())
                          ? g_rsuRegionalAwarenessTables[rsuIndex].size()
                          : 0;
 
-    std::ofstream out(rsuRegionalAwarenessCsv.c_str(), std::ios::app);
+    auto& out = g_csvRsuRegional;
     bool rssiFalseDataDecision =
         record.rssiMismatchCount > 0 &&
         record.rssiVerifiedProbability < 0.5;
@@ -5350,7 +5554,7 @@ LogControllerGlobalAwarenessEvent(const std::string& event,
                                   const std::string& status,
                                   uint32_t triggerSeq)
 {
-    std::ofstream out(controllerGlobalAwarenessCsv.c_str(), std::ios::app);
+    auto& out = g_csvControllerGlobal;
     bool rssiFalseDataDecision =
         record.rssiMismatchCount > 0 &&
         record.rssiVerifiedProbability < 0.5;
@@ -8603,6 +8807,7 @@ LogReceivedPacket(const std::string& receiverRole,
                   const SybilPacketTag& tag,
                   bool hasTag)
 {
+    if (sweepMode) return;
     uint32_t triggerSeq  = hasTag ? tag.GetSequenceNumber() : 0;
     double   delay       = hasTag ? Simulator::Now().GetSeconds() - tag.GetCreatedTime() : 0.0;
     uint32_t messageType = hasTag ? tag.GetMessageType() : 0;
@@ -9344,7 +9549,7 @@ LogReceivedPacket(const std::string& receiverRole,
     if (receiverRole == "rsu_edge" && receiverId < g_rsuReportCount.size())
         aggCount = g_rsuReportCount[receiverId];
 
-    std::ofstream out(communicationCsv.c_str(), std::ios::app);
+    auto& out = g_csvComm;
     BsmCoreDataTag bsmTag;
     bool hasBsm = packet->PeekPacketTag(bsmTag);
     BsmCoreData bsm = hasBsm ? bsmTag.GetBsm() : BsmCoreData();
@@ -9529,12 +9734,48 @@ LogReceivedPacket(const std::string& receiverRole,
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.suspicionFlags   : 0u) << ","
         << (hasTag ? "received_tagged" : "received_untagged") << "\n";
 
-    // M1 PDR: only credit V2V beacon delivery when the receiver is another vehicle.
+    // M1 PDR accounting.
+    //   Unicast (non-beacon): one intended receiver -> always credited (M1.1).
+    //   V2V broadcast beacon: credit only vehicle receivers WITHIN v2vReliableRange
+    //   of the sender, matching the intended-receiver denominator counted at
+    //   transmit (SendTaggedPacket). This keeps broadcast PDR (M1.2) in [0,1];
+    //   receptions beyond v2vReliableRange are bonus coverage, not "intended".
     bool isV2VBroadcast = hasTag && tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
-    bool countForPDR    = !isV2VBroadcast || receiverRole == "vehicle";
+    bool countForPDR;
+    if (isV2VBroadcast)
+    {
+        countForPDR = false;
+        uint32_t senderIdx = hasTag ? tag.GetRealNodeId() : 0xFFFFFFFF;
+        if (receiverRole == "vehicle" &&
+            senderIdx < g_vehicleNodes.GetN() && receiverId < g_vehicleNodes.GetN())
+        {
+            Ptr<MobilityModel> sMob = g_vehicleNodes.Get(senderIdx)->GetObject<MobilityModel>();
+            Ptr<MobilityModel> rMob = g_vehicleNodes.Get(receiverId)->GetObject<MobilityModel>();
+            if (sMob && rMob && sMob->GetDistanceFrom(rMob) <= v2vReliableRange)
+            {
+                // De-duplicate the multi-channel copies of one beacon: a limited
+                // broadcast egresses all 7 WAVE channel devices, so the same beacon
+                // (identical sequence) is received several times. Count it once per
+                // (receiver, sender) so M1.2 matches the single-count denominator.
+                static std::map<uint64_t, uint32_t> s_lastBeaconSeq;
+                uint64_t key = (static_cast<uint64_t>(receiverId) << 32) | senderIdx;
+                uint32_t seq = hasTag ? tag.GetSequenceNumber() : 0;
+                auto it = s_lastBeaconSeq.find(key);
+                if (it == s_lastBeaconSeq.end() || it->second != seq)
+                {
+                    s_lastBeaconSeq[key] = seq;
+                    countForPDR = true;
+                }
+            }
+        }
+    }
+    else
+    {
+        countForPDR = true;
+    }
 
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
-    MetricsOnReceive(isSybil, delay, countForPDR);
+    MetricsOnReceive(isSybil, delay, countForPDR, isV2VBroadcast);
     if (hasTag)
     {
         MetricsOnReceiveForMessage(messageType, delay, countForPDR);
@@ -9573,37 +9814,8 @@ ReceivePacket(std::string receiverRole, uint32_t receiverId,
         bool hasTag = packet->PeekPacketTag(tag);
         LogReceivedPacket(receiverRole, receiverId, channel, packet, tag, hasTag);
 
-        if (RssiSolutionModeActive() && receiverRole == "rsu_edge" && hasTag)
-        {
-            double rssiDbm = -80.0;
-            uint32_t realId = tag.GetRealNodeId();
-            if (realId < g_vehicleNodes.GetN() &&
-                receiverId < g_rsuNodes.GetN())
-            {
-                Ptr<MobilityModel> vehicleMob =
-                    g_vehicleNodes.Get(realId)->GetObject<MobilityModel>();
-                Ptr<MobilityModel> rsuMob =
-                    g_rsuNodes.Get(receiverId)->GetObject<MobilityModel>();
-                double dist = std::max(0.5, vehicleMob->GetDistanceFrom(rsuMob));
-                double pl = std::abs(RssiSybilDetector::kRef1mDbm)
-                          + 10.0 * RssiSybilDetector::kPathLossExp
-                          * std::log10(dist);
-                rssiDbm = RssiSybilDetector::kTxPowerDbm - pl;
-                static std::mt19937 rng_r(std::random_device{}());
-                static std::uniform_real_distribution<double> uni(0.0, 1.0);
-                double sigma_ch = 0.7071;
-                double rayleighGain =
-                    sigma_ch * std::sqrt(-2.0 * std::log(std::max(uni(rng_r), 1e-9)));
-                rssiDbm += 20.0 * std::log10(rayleighGain);
-            }
-
-            RssiSybilDetector::FeedObservation(
-                receiverId,
-                tag.GetClaimedNodeId(),
-                tag.GetRealNodeId(),
-                rssiDbm,
-                Simulator::Now().GetSeconds());
-        }
+        // RSSI observations are now fed by WifiMonitorSnifferRx using actual
+        // PHY-layer signal strength (signalNoise.signal) — no software model here.
     }
 }
 
@@ -10224,7 +10436,7 @@ static void
 SendControllerRsuCommand(uint32_t rsuIndex)
 {
     if (RssiSolutionModeActive() && rsuIndex == 0)
-        RssiSybilDetector::RunDetection(0.0, 200.0, 20.0, 110.0, 65.0);
+        RssiSybilDetector::RunDetection();
 
     // Type 6: malicious controller injects Sybil records into its global table.
     // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections
@@ -10624,6 +10836,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getUint  ("N_Controllers",                   N_Controllers);
     getUint  ("controllerRegistrationThreshold", controllerRegistrationThreshold);
     getDouble("simTime",                         simTime);
+    getDouble("txPowerDbm",                      txPowerDbm);
     getBool  ("routing_test",                    routing_test);
     getDouble("beaconInterval",                  beaconInterval);
     getDouble("beaconJitterMax",                 beaconJitterMax);
@@ -10633,10 +10846,6 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getUint  ("sybil_attack_percentage",         sybil_attack_percentage);
     getUint  ("sybil_attacker_level",            sybil_attacker_level);
     getBool  ("controller_malicious_assumption", controller_malicious_assumption);
-    uint32_t legacyProposedMethod = kNoLegacyProposedMethod;
-    getUint  ("proposed_method",                 legacyProposedMethod);
-    if (legacyProposedMethod != kNoLegacyProposedMethod)
-        solution_mode = MapLegacyProposedMethod(legacyProposedMethod);
     getUint  ("solution_mode",                   solution_mode);
     getUint  ("full_crypto_profile",             full_crypto_profile);
     getDouble("rsuCoverageRange",                rsuCoverageRange);
@@ -10722,6 +10931,7 @@ main(int argc, char* argv[])
     cmd.AddValue("simTime",                    "Simulation time in seconds",             simTime);
     cmd.AddValue("routing_test",               "Small 3-vehicle/2-RSU/1-SDN test network", routing_test);
     cmd.AddValue("beaconInterval",             "Vehicle beacon period",                  beaconInterval);
+    cmd.AddValue("txPower",                     "PHY Tx power in dBm for all 802.11p radios (DSRC RSU EIRP limit ~40)", txPowerDbm);
     cmd.AddValue("beaconJitterMax",            "Maximum random V2V beacon timing jitter in seconds", beaconJitterMax);
     cmd.AddValue("rsuReportInterval",          "RSU→Controller report period",           rsuReportInterval);
     cmd.AddValue("sybil_attack_enabled",       "Enable Sybil attack behavior",           sybil_attack_enabled);
@@ -10729,9 +10939,11 @@ main(int argc, char* argv[])
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
     cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
+
     cmd.AddValue("solution_mode",              "Solution mode: 1=FLEMDS FL 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=no detection",solution_mode);
     cmd.AddValue("full_crypto_profile",       "Inside solution_mode=5: 1=current classical full, 2=real PQC Kyber768 + Dilithium/ML-DSA-65", full_crypto_profile);
     cmd.AddValue("proposed_method",            "Legacy alias: 0=none 1=old rule/lightweight 2=old ML 3=old FL 4=old hybrid/full",proposed_method);
+  
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
     cmd.AddValue("v2vReliableRange",           "Reliable local V2V beacon evaluation radius in metres", v2vReliableRange);
     cmd.AddValue("rsuVehicleRecordTimeout",    "Seconds before an RSU forgets a vehicle",rsuVehicleRecordTimeout);
@@ -10746,7 +10958,7 @@ main(int argc, char* argv[])
     cmd.AddValue("cloudPresenceSyncInterval",  "Seconds between controller cache syncs from cloud presence table",cloudPresenceSyncInterval);
     cmd.AddValue("cloudPresenceTimeout",       "Seconds before cloud vehicle presence rows expire",cloudPresenceTimeout);
     cmd.AddValue("channelHandshakeTimeout",    "Seconds before retrying a pending V2RSU channel handshake",channelHandshakeTimeout);
-    cmd.AddValue("mobility_mode",              "Mobility mode: 1=test 2=programmed road 3=SUMO trace1 4=SUMO trace2 5=SUMO trace3",mobility_mode);
+    cmd.AddValue("mobility_mode",              "Mobility mode: 1=test 2=programmed road 3=SUMO Barcelona all-at-t0 4=SUMO kl-cheras 5=SUMO klbb staggered",mobility_mode);
     cmd.AddValue("sumoAutoConfig",             "Auto-set N_Vehicles/N_RSUs from SUMO trace files (default true)",sumoAutoConfig);
     cmd.AddValue("boundedRoadMobility",        "Keep vehicles inside a bounded multi-lane road corridor",boundedRoadMobility);
     cmd.AddValue("roadStartX",                 "Bounded road start x-coordinate",roadStartX);
@@ -10772,10 +10984,20 @@ main(int argc, char* argv[])
     cmd.AddValue("mobilityMode5Name",          "Display name for mobility_mode=5 placeholder",mobilityMode5Name);
     cmd.AddValue("mobilityMode5TraceFile",     "SUMO/ns-2 mobility trace for mobility_mode=5",mobilityMode5TraceFile);
     cmd.AddValue("mobilityMode5RsuPositionFile","Optional RSU CSV for mobility_mode=5",mobilityMode5RsuPositionFile);
+    // RSSI detector tuning
+    cmd.AddValue("rssiClusterRadius",  "Co-location cluster radius (m) [default 25]",      rssiClusterRadius);
+    cmd.AddValue("rssiDist1Thresh",    "1-RSU fallback distance threshold (m) [default 15]",rssiDist1Thresh);
+    cmd.AddValue("rssiWindowSec",      "Rolling observation window (s) [default 2.0]",      rssiWindowSec);
+    cmd.AddValue("rssiMinSamples",     "Min samples per RSU before including in detection [default 8]", rssiMinSamples);
+    cmd.AddValue("rssiStreak",         "Consecutive windows to confirm Sybil [default 2]",  rssiStreakRequired);
+    cmd.AddValue("sweepMode",          "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
+    cmd.AddValue("quietMode",          "Suppress all console output; CSV writes are unaffected", quietMode);
     cmd.Parse(argc, argv);
-    if (proposed_method != kNoLegacyProposedMethod)
-        solution_mode = MapLegacyProposedMethod(proposed_method);
     ConfigureSolutionMode();
+
+    static std::ofstream devNull("/dev/null");
+    if (quietMode)
+        std::cout.rdbuf(devNull.rdbuf());
 
     if (routing_test)
     {
@@ -10850,6 +11072,7 @@ main(int argc, char* argv[])
     InitializeControllerVehicleTableCsv();
     InitializeControllerGlobalAwarenessCsv();
     InitializeRssiVerificationCsv();
+    OpenPersistentCsvHandles();
     InitializeMetricsCsvFiles();
 
     g_secMetrics = Create<SecurityEvaluationMetrics>();
@@ -10893,19 +11116,26 @@ main(int argc, char* argv[])
     YansWifiChannelHelper wifiChannel_184;
 
     wifiChannel.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                   "Frequency", DoubleValue(5.9e9));
     wifiChannel_172.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_172.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_172.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_174.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_174.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_174.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_176.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_176.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_176.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_180.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_180.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_180.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_182.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_182.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_182.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
     wifiChannel_184.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel_184.AddPropagationLoss("ns3::Cost231PropagationLossModel");
+    wifiChannel_184.AddPropagationLoss("ns3::Cost231PropagationLossModel",
+                                       "Frequency", DoubleValue(5.9e9));
 
     // --- Physical layer helpers (one per channel) ---
     YansWifiPhyHelper wifiPhy;
@@ -10917,50 +11147,50 @@ main(int argc, char* argv[])
     YansWifiPhyHelper wifiPhy_184;
 
     wifiPhy.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy.Set("Frequency",    UintegerValue(5890));
     wifiPhy.Set("ChannelNumber",UintegerValue(178));
     wifiPhy.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_172.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_172.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_172.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_172.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_172.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_172.Set("Frequency",    UintegerValue(5860));
     wifiPhy_172.Set("ChannelNumber",UintegerValue(172));
     wifiPhy_172.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_174.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_174.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_174.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_174.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_174.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_174.Set("Frequency",    UintegerValue(5870));
     wifiPhy_174.Set("ChannelNumber",UintegerValue(174));
     wifiPhy_174.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_176.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_176.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_176.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_176.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_176.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_176.Set("Frequency",    UintegerValue(5880));
     wifiPhy_176.Set("ChannelNumber",UintegerValue(176));
     wifiPhy_176.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_180.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_180.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_180.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_180.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_180.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_180.Set("Frequency",    UintegerValue(5900));
     wifiPhy_180.Set("ChannelNumber",UintegerValue(180));
     wifiPhy_180.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_182.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_182.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_182.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_182.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_182.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_182.Set("Frequency",    UintegerValue(5910));
     wifiPhy_182.Set("ChannelNumber",UintegerValue(182));
     wifiPhy_182.Set("ChannelWidth", UintegerValue(10));
 
     wifiPhy_184.SetErrorRateModel("ns3::NistErrorRateModel");
-    wifiPhy_184.Set("TxPowerStart", DoubleValue(23.0));
-    wifiPhy_184.Set("TxPowerEnd",   DoubleValue(23.0));
+    wifiPhy_184.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    wifiPhy_184.Set("TxPowerEnd",   DoubleValue(txPowerDbm));
     wifiPhy_184.Set("Frequency",    UintegerValue(5920));
     wifiPhy_184.Set("ChannelNumber",UintegerValue(184));
     wifiPhy_184.Set("ChannelWidth", UintegerValue(10));
@@ -10977,8 +11207,8 @@ main(int argc, char* argv[])
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211p);
     wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                 "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                 "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                 "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                 "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                  "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac;
     wifiMac.SetType("ns3::AdhocWifiMac");
@@ -10986,8 +11216,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_172;
     wifi_172.SetStandard(WIFI_STANDARD_80211p);
     wifi_172.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_172;
     wifiMac_172.SetType("ns3::AdhocWifiMac");
@@ -10995,8 +11225,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_174;
     wifi_174.SetStandard(WIFI_STANDARD_80211p);
     wifi_174.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_174;
     wifiMac_174.SetType("ns3::AdhocWifiMac");
@@ -11004,8 +11234,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_176;
     wifi_176.SetStandard(WIFI_STANDARD_80211p);
     wifi_176.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_176;
     wifiMac_176.SetType("ns3::AdhocWifiMac");
@@ -11013,8 +11243,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_180;
     wifi_180.SetStandard(WIFI_STANDARD_80211p);
     wifi_180.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_180;
     wifiMac_180.SetType("ns3::AdhocWifiMac");
@@ -11022,8 +11252,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_182;
     wifi_182.SetStandard(WIFI_STANDARD_80211p);
     wifi_182.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_182;
     wifiMac_182.SetType("ns3::AdhocWifiMac");
@@ -11031,8 +11261,8 @@ main(int argc, char* argv[])
     WifiHelper wifi_184;
     wifi_184.SetStandard(WIFI_STANDARD_80211p);
     wifi_184.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode",        StringValue("OfdmRate6MbpsBW10MHz"),
-                                     "ControlMode",     StringValue("OfdmRate6MbpsBW10MHz"),
+                                     "DataMode",        StringValue("OfdmRate24MbpsBW10MHz"),
+                                     "ControlMode",     StringValue("OfdmRate24MbpsBW10MHz"),
                                      "RtsCtsThreshold", UintegerValue(2200));
     WifiMacHelper wifiMac_184;
     wifiMac_184.SetType("ns3::AdhocWifiMac");
@@ -11301,7 +11531,7 @@ main(int argc, char* argv[])
             std::cout << "SDN Controller:    MALICIOUS" << std::endl;
     }
 
-    std::cout << "WiFi: 802.11p DSRC @ 5.9 GHz, 10 MHz, 23 dBm, Cost231" << std::endl;
+    std::cout << "WiFi: 802.11p DSRC @ 5.9 GHz, 10 MHz, " << txPowerDbm << " dBm, Cost231@5.9GHz" << std::endl;
     std::cout << "Backhaul: CSMA 1000 Mbps / 10 us" << std::endl;
     std::cout << "CSV: " << communicationCsv << std::endl;
     std::cout << "Vehicle neighbor CSV: " << vehicleNeighborTableCsv << std::endl;

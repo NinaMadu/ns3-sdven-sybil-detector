@@ -1,0 +1,4 @@
+Open JupiterNotebook
+cd ~/FYP/ns-allinone-3.35/ns-3.35
+source .venv/bin/activate
+jupyter notebook --notebook-dir=sybil-attack/notebooks --no-browser --port=8888

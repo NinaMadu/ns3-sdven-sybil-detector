@@ -1,0 +1,19 @@
+<configuration>
+  <input>
+    <net-file value="barcelona_2km.net.xml"/>
+    <route-files value="barcelona.rou.xml"/>
+    <additional-files value="barcelona_vtypes.add.xml"/>
+  </input>
+  <time>
+    <begin value="0"/>
+    <end value="300"/>
+    <step-length value="0.1"/>
+  </time>
+  <output>
+    <fcd-output value="barcelona_fcd.xml"/>
+    <fcd-output.geo value="false"/>
+  </output>
+  <processing>
+    <time-to-teleport value="60"/>
+  </processing>
+</configuration>
