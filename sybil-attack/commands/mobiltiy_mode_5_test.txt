@@ -1,0 +1,18 @@
+SUMO GUI
+cd /home/sdvn_defense_sybil/35_sybil_attack_project/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb
+sumo-gui -c klbb2km.sumocfg
+
+Run Simulation
+cd /home/sdvn_defense_sybil/35_sybil_attack_project/ns-allinone-3.35/ns-3.35
+./waf --run "Sybil-Developing-Improved --mobility_mode=5 --solution_mode=2 \
+    --routing_test=false \
+    --sybil_attack_enabled=true --sybil_attack_type=1 --sybil_attack_percentage=20 \
+    --simTime=120 --beaconInterval=0.1 --txPower=40" 2>&1 | tee /tmp/mode5_run.log
+
+NetAnim
+cd /home/sdvn_defense_sybil/35_sybil_attack_project/ns-allinone-3.35/netanim-3.108
+./NetAnim
+
+NetAnim Output
+/home/sdvn_defense_sybil/35_sybil_attack_project/ns-allinone-3.35/ns-3.35/sybil-attack/outputs/sybil-developing-netanim.xml
+

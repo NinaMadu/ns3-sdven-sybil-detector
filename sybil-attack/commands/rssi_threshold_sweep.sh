@@ -11,22 +11,23 @@
 #   Total runs        : 3 × 6 = 18
 #
 # Usage:
-#   cd /root/FYP/ns-allinone-3.35/ns-3.35
 #   bash sybil-attack/commands/rssi_threshold_sweep.sh
 # =============================================================================
 
-SIM_DIR="/root/FYP/ns-allinone-3.35/ns-3.35"
+# Resolve SIM_DIR from this script's location (commands/ -> sybil-attack/ -> ns-3.35)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SIM_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUT_DIR="$SIM_DIR/sybil-attack/outputs"
 METRICS_CSV="$OUT_DIR/rssi_percentage_sweep.csv"
 TMP_DIR="$OUT_DIR/rssi_pct_tmp"
 
-N_PARALLEL=4
+N_PARALLEL=24
 
-ATTACK_TYPES="2 3 4"
+ATTACK_TYPES="1 2 3 4 5"
 ATTACK_PERCENTAGES="0 20 40 60 80 100"
 
 # ── Fixed detector settings (best found) ──────────────────────────────────────
-SIM_TIME=30
+SIM_TIME=120
 CLUSTER_R=1
 DIST1_THRESH=1
 STREAK=2
@@ -131,4 +132,4 @@ echo ""
 cat "$METRICS_CSV"
 echo ""
 echo "Run the grapher:"
-echo "  python3 sybil-attack/scripts/plot_rssi_results.py"
+echo "  python3 sybil-attack/commands/plot_rssi_results.py"
