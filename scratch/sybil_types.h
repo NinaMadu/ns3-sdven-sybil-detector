@@ -39,6 +39,8 @@ const uint16_t VEHICLE_PORT    = 9000;   ///< V2V beacon / RSU→Vehicle command
 const uint16_t RSU_PORT        = 9100;   ///< V2RSU report port
 const uint16_t CONTROLLER_PORT = 9200;   ///< RSU↔Controller backhaul port
 static const uint32_t MAX_V2RSU_NEIGHBOR_OBSERVATIONS = 4;
+static const uint32_t KYBER768_PUBLIC_KEY_BYTES = 1184;
+static const uint32_t KYBER768_CIPHERTEXT_BYTES = 1088;
 
 // ---------------------------------------------------------------------------
 // Message type taxonomy — extended with SYBIL_INJECTION for attack traffic
@@ -423,6 +425,7 @@ class ChanHelloTag : public Tag
 
     uint32_t vehicleId = 0;
     uint8_t  ecdhPub[ECDH_BYTES]   = {};
+    uint8_t  kyberPublicKey[KYBER768_PUBLIC_KEY_BYTES] = {};
     uint8_t  nonceV [NONCE_BYTES]  = {};
 
     static TypeId GetTypeId()
@@ -433,18 +436,20 @@ class ChanHelloTag : public Tag
         return tid;
     }
     TypeId   GetInstanceTypeId() const override { return ChanHelloTag::GetTypeId(); }
-    uint32_t GetSerializedSize()  const override { return 4 + ECDH_BYTES + NONCE_BYTES; }
+    uint32_t GetSerializedSize()  const override { return 4 + ECDH_BYTES + KYBER768_PUBLIC_KEY_BYTES + NONCE_BYTES; }
 
     void Serialize(TagBuffer i) const override
     {
         i.WriteU32(vehicleId);
         i.Write(ecdhPub, ECDH_BYTES);
+        i.Write(kyberPublicKey, KYBER768_PUBLIC_KEY_BYTES);
         i.Write(nonceV,  NONCE_BYTES);
     }
     void Deserialize(TagBuffer i) override
     {
         vehicleId = i.ReadU32();
         i.Read(ecdhPub, ECDH_BYTES);
+        i.Read(kyberPublicKey, KYBER768_PUBLIC_KEY_BYTES);
         i.Read(nonceV,  NONCE_BYTES);
     }
     void Print(std::ostream& os) const override
@@ -476,6 +481,7 @@ class ChanAckTag : public Tag
 
     uint32_t rsuId = 0;
     uint8_t  ecdhPub      [ECDH_BYTES]  = {};  // RSU ephemeral pub
+    uint8_t  kyberCiphertext[KYBER768_CIPHERTEXT_BYTES] = {};
     uint8_t  nonceR       [NONCE_BYTES] = {};  // RSU nonce
     uint8_t  rsuLtPub     [ECDH_BYTES]  = {};  // RSU long-term pub (from cert)
     uint8_t  certSig      [SIG_BYTES]   = {};  // CA sig over (rsu_id||rsuLtPub)
@@ -491,13 +497,14 @@ class ChanAckTag : public Tag
     TypeId   GetInstanceTypeId() const override { return ChanAckTag::GetTypeId(); }
     uint32_t GetSerializedSize()  const override
     {
-        return 4 + ECDH_BYTES + NONCE_BYTES + ECDH_BYTES + SIG_BYTES + SIG_BYTES;
+        return 4 + ECDH_BYTES + KYBER768_CIPHERTEXT_BYTES + NONCE_BYTES + ECDH_BYTES + SIG_BYTES + SIG_BYTES;
     }
 
     void Serialize(TagBuffer i) const override
     {
         i.WriteU32(rsuId);
         i.Write(ecdhPub,      ECDH_BYTES);
+        i.Write(kyberCiphertext, KYBER768_CIPHERTEXT_BYTES);
         i.Write(nonceR,       NONCE_BYTES);
         i.Write(rsuLtPub,     ECDH_BYTES);
         i.Write(certSig,      SIG_BYTES);
@@ -507,6 +514,7 @@ class ChanAckTag : public Tag
     {
         rsuId = i.ReadU32();
         i.Read(ecdhPub,      ECDH_BYTES);
+        i.Read(kyberCiphertext, KYBER768_CIPHERTEXT_BYTES);
         i.Read(nonceR,       NONCE_BYTES);
         i.Read(rsuLtPub,     ECDH_BYTES);
         i.Read(certSig,      SIG_BYTES);
@@ -923,6 +931,7 @@ class V2CtrlHelloTag : public Tag
     uint8_t  vehicleLtPub  [ECDH_BYTES]  = {};
     uint8_t  vehicleCertSig[SIG_BYTES]   = {};
     uint8_t  ecdhPubV      [ECDH_BYTES]  = {};
+    uint8_t  kyberPublicKey[KYBER768_PUBLIC_KEY_BYTES] = {};
     uint8_t  nonceV        [NONCE_BYTES] = {};
     uint8_t  handshakeSig  [SIG_BYTES]   = {};
 
@@ -936,7 +945,7 @@ class V2CtrlHelloTag : public Tag
     TypeId   GetInstanceTypeId() const override { return V2CtrlHelloTag::GetTypeId(); }
     uint32_t GetSerializedSize()  const override
     {
-        return 4 + ECDH_BYTES + SIG_BYTES + ECDH_BYTES + NONCE_BYTES + SIG_BYTES;
+        return 4 + ECDH_BYTES + SIG_BYTES + ECDH_BYTES + KYBER768_PUBLIC_KEY_BYTES + NONCE_BYTES + SIG_BYTES;
     }
     void Serialize(TagBuffer i) const override
     {
@@ -944,6 +953,7 @@ class V2CtrlHelloTag : public Tag
         i.Write(vehicleLtPub,   ECDH_BYTES);
         i.Write(vehicleCertSig, SIG_BYTES);
         i.Write(ecdhPubV,       ECDH_BYTES);
+        i.Write(kyberPublicKey, KYBER768_PUBLIC_KEY_BYTES);
         i.Write(nonceV,         NONCE_BYTES);
         i.Write(handshakeSig,   SIG_BYTES);
     }
@@ -953,6 +963,7 @@ class V2CtrlHelloTag : public Tag
         i.Read(vehicleLtPub,   ECDH_BYTES);
         i.Read(vehicleCertSig, SIG_BYTES);
         i.Read(ecdhPubV,       ECDH_BYTES);
+        i.Read(kyberPublicKey, KYBER768_PUBLIC_KEY_BYTES);
         i.Read(nonceV,         NONCE_BYTES);
         i.Read(handshakeSig,   SIG_BYTES);
     }
@@ -993,6 +1004,7 @@ class Ctrl2VehicleAckTag : public Tag
     uint8_t  ctrlLtPub    [ECDH_BYTES]  = {};
     uint8_t  ctrlCertSig  [SIG_BYTES]   = {};
     uint8_t  ecdhPubC     [ECDH_BYTES]  = {};
+    uint8_t  kyberCiphertext[KYBER768_CIPHERTEXT_BYTES] = {};
     uint8_t  nonceC       [NONCE_BYTES] = {};
     uint8_t  handshakeSig [SIG_BYTES]   = {};
 
@@ -1006,13 +1018,14 @@ class Ctrl2VehicleAckTag : public Tag
     TypeId   GetInstanceTypeId() const override { return Ctrl2VehicleAckTag::GetTypeId(); }
     uint32_t GetSerializedSize()  const override
     {
-        return ECDH_BYTES + SIG_BYTES + ECDH_BYTES + NONCE_BYTES + SIG_BYTES;
+        return ECDH_BYTES + SIG_BYTES + ECDH_BYTES + KYBER768_CIPHERTEXT_BYTES + NONCE_BYTES + SIG_BYTES;
     }
     void Serialize(TagBuffer i) const override
     {
         i.Write(ctrlLtPub,    ECDH_BYTES);
         i.Write(ctrlCertSig,  SIG_BYTES);
         i.Write(ecdhPubC,     ECDH_BYTES);
+        i.Write(kyberCiphertext, KYBER768_CIPHERTEXT_BYTES);
         i.Write(nonceC,       NONCE_BYTES);
         i.Write(handshakeSig, SIG_BYTES);
     }
@@ -1021,6 +1034,7 @@ class Ctrl2VehicleAckTag : public Tag
         i.Read(ctrlLtPub,    ECDH_BYTES);
         i.Read(ctrlCertSig,  SIG_BYTES);
         i.Read(ecdhPubC,     ECDH_BYTES);
+        i.Read(kyberCiphertext, KYBER768_CIPHERTEXT_BYTES);
         i.Read(nonceC,       NONCE_BYTES);
         i.Read(handshakeSig, SIG_BYTES);
     }
@@ -1037,6 +1051,8 @@ struct VehicleCtrlPendingHandshake
     bool                   active  = false;
     std::vector<uint8_t>   ephPriv;   // 32 bytes
     std::vector<uint8_t>   ephPub;    // 64 bytes
+    std::vector<uint8_t>   kyberSecretKey;
+    std::vector<uint8_t>   kyberPublicKey;
     std::vector<uint8_t>   nonceV;    // 32 bytes
 };
 
@@ -1055,6 +1071,8 @@ struct VehicleChannelState
     {
         std::vector<uint8_t> ephPriv;  // 32 bytes
         std::vector<uint8_t> ephPub;   // 64 bytes
+        std::vector<uint8_t> kyberSecretKey;
+        std::vector<uint8_t> kyberPublicKey;
         std::vector<uint8_t> nonceV;   // 32 bytes
         double startTime = 0.0;         // simulation seconds
     };
@@ -1629,7 +1647,7 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
 
         // --- V2V Signature ---
         uint32_t senderIdx = tx->realNodeId;
-        if (LightweightCryptoMechanismActive() &&
+        if (CryptoMechanismActive() &&
             senderIdx < g_vehiclePrivKeys.size() && !g_vehiclePrivKeys[senderIdx].empty())
         {
             std::vector<uint8_t> payload  = SerializeBsmForSigning(bsm);

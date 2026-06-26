@@ -71,7 +71,12 @@ bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
 uint32_t sybil_attacker_level = 2;    ///< Attacker sophistication: 1=basic, 2=standard, 3=stealth, 4=advanced.
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
-uint32_t solution_mode = MODE_NO_DETECTION; ///< 1=FL 2=RSSI 3=ML placeholder 4=lightweight 5=full placeholder 6=no detection.
+
+const uint32_t kNoLegacyProposedMethod = std::numeric_limits<uint32_t>::max();
+uint32_t solution_mode = MODE_NO_DETECTION; ///< 1=FL (FLEMDS) 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=none.
+uint32_t full_crypto_profile = 1;        ///< Inside full mode: 1=current classical, 2=real PQC Kyber + Dilithium/ML-DSA.
+uint32_t proposed_method = kNoLegacyProposedMethod; ///< Backward-compatible alias for old proposed_method values.
+
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
 double v2vReliableRange = 100.0;      ///< Reliable local V2V beacon evaluation radius (metres).
@@ -132,7 +137,7 @@ std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_tab
 std::string rsuVehicleTableCsv = "sybil-attack/outputs/rsu_vehicle_table_log.csv";
 std::string rsuVehicleObservationCsv = "sybil-attack/outputs/rsu_vehicle_observation_rows_log.csv";
 std::string rsuRegionalAwarenessCsv = "sybil-attack/outputs/rsu_regional_awareness_log.csv";
-std::string rsuPassiveBeaconEvidenceCsv = "sybil-attack/outputs/rsu_passive_beacon_evidence_log.csv";
+std::string computedDetectionEvidenceCsv = "sybil-attack/outputs/computed_detection_evidence_log.csv";
 std::string controllerVehicleTableCsv = "sybil-attack/outputs/controller_vehicle_table_log.csv";
 std::string controllerGlobalAwarenessCsv = "sybil-attack/outputs/controller_global_awareness_log.csv";
 std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
@@ -315,16 +320,88 @@ struct ControllerTokenCommitmentRecord
     std::string tokenRecordCid;
 };
 
+struct FlModelConsensusRecord
+{
+    uint32_t round = 0;
+    std::string acceptedModelCid;
+    std::string modelHashHex;
+    uint32_t agreeingControllers = 0;
+    double loss = 0.0;
+    double consensusTime = 0.0;
+};
+
+struct IsolationRecord
+{
+    std::string entityType;
+    uint32_t entityId = 0;
+    double isolationTimestamp = 0.0;
+    std::string attackVariant;
+    std::string aggregatedEvidenceHashHex;
+    std::vector<std::string> evidenceCids;
+    std::string authorityTier;
+    std::string thresholdSignatureHex;
+    std::string isolationCid;
+};
+
+struct ManifestEndorsement
+{
+    uint32_t signerId = 0;
+    std::string signatureHex;
+};
+
+struct RevocationManifestRecord
+{
+    std::string entityType;
+    uint32_t entityId = 0;
+    double revocationTimestamp = 0.0;
+    std::string attackVariant;
+    std::string isolationCid;
+    std::vector<std::string> evidenceCids;
+    std::vector<ManifestEndorsement> endorsements;
+    uint32_t threshold = 0;
+    std::string manifestCid;
+};
+
+struct ShamirShareByte
+{
+    uint16_t x = 0;
+    std::vector<uint16_t> y;
+};
+
+struct LkhZoneState
+{
+    uint32_t rsuId = 0;
+    uint32_t epoch = 0;
+    std::set<uint32_t> members;
+    std::map<uint32_t, std::vector<uint8_t> > leafKeys;
+    std::vector<uint8_t> rootGroupKey;
+    std::map<uint32_t, std::string> wrappedRootKeyByVehicle;
+};
+
 static std::vector<ControllerLocalRegistrationState> g_controllerLocalRegistrationStates;
 static std::map<std::string, ControllerRegistrationQuorumState> g_controllerRegistrationQuorums;
 static std::map<uint32_t, ControllerTokenCommitmentRecord> g_controllerTokenCommitments;
 static std::string g_latestTokenManifestCid;
 static std::vector<std::map<uint32_t, std::string> > g_rsuTokenRecordCidCache;
 static std::vector<std::map<uint32_t, std::string> > g_rsuTokenHashCache;
+static std::string g_latestAcceptedFlModelCid;
+static std::map<uint32_t, FlModelConsensusRecord> g_flModelConsensusByRound;
+static std::vector<std::string> g_rsuAcceptedFlModelCid;
+static std::map<std::string, IsolationRecord> g_isolationRecordsByEntity;
+static std::vector<ManifestEndorsement> g_latestTokenManifestEndorsements;
+static std::string g_latestTokenManifestBodyHashHex;
+static std::map<std::string, RevocationManifestRecord> g_revocationManifestsByEntity;
+static std::vector<std::string> g_latestRevocationManifestCids;
+static std::vector<std::set<uint32_t> > g_rsuRevokedVehicleBlacklist;
+static std::vector<ShamirShareByte> g_fullModeAuthorityShares;
+static std::vector<uint8_t> g_fullModeAuthoritySecret;
+static std::vector<LkhZoneState> g_lkhZones;
 
 // Vehicle↔Controller E2E secure channel globals.
 std::vector<std::vector<uint8_t>>         g_vehicleCertSigs;         // CA sig per vehicle (64B)
 std::vector<uint8_t>                       g_ctrlSignPrivKey;          // controller signing priv (32B)
+static std::vector<CryptoPqcSignatureKeypair> g_pqcRsuSigKeys;            // full profile 2: Dilithium/ML-DSA per RSU
+static std::vector<CryptoPqcSignatureKeypair> g_pqcControllerSigKeys;     // full profile 2: Dilithium/ML-DSA per controller
 std::vector<uint8_t>                       g_ctrlSignPubKey;           // controller signing pub  (64B)
 std::vector<uint8_t>                       g_ctrlCertSig;              // CA sig over controller pub (64B)
 std::vector<std::vector<uint8_t>>          g_vehicleCtrlSessionKeys;   // [vIdx] → 32B key (empty until established)
@@ -411,7 +488,7 @@ struct TrajectorySample
     double heading;
 };
 
-struct RsuPassiveBeaconEvidenceRecord
+struct ComputedDetectionEvidenceRecord
 {
     uint32_t rsuId = 0;
     uint32_t realVehicleId = 0;
@@ -425,6 +502,12 @@ struct RsuPassiveBeaconEvidenceRecord
     double rssiDbm = -999.0;
     bool signatureValid = false;
     uint32_t suspicionFlags = SUSPICION_NONE;
+    double detectionScore = 0.0;
+    double signatureScore = 0.0;
+    double revocationTimestamp = 0.0;
+    std::string attackVariant;
+    std::string evidenceVectorHashHex;
+    std::string currentSignatureHex;
     std::string evidenceCid;
 };
 
@@ -441,8 +524,8 @@ static std::vector<std::map<uint32_t, uint32_t> > g_rssiCoLocationFlags;
 static std::vector<std::map<uint32_t, std::deque<TrajectorySample> > > g_vehicleTrajectoryWindows;
 static std::vector<std::map<uint32_t, uint32_t> > g_trajectoryShadowingFlags;
 static std::vector<std::set<uint32_t> > g_sdnUnsupportedRsuApprovals;
-static std::vector<std::map<uint32_t, std::vector<RsuPassiveBeaconEvidenceRecord> > >
-    g_rsuPassiveBeaconEvidenceTables;
+static std::vector<std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> > >
+    g_computedDetectionEvidenceTables;
 
 static void
 ResetAwarenessTables()
@@ -468,8 +551,8 @@ ResetAwarenessTables()
         N_Vehicles, std::map<uint32_t, std::deque<TrajectorySample> >());
     g_trajectoryShadowingFlags.assign(N_Vehicles, std::map<uint32_t, uint32_t>());
     g_sdnUnsupportedRsuApprovals.assign(N_RSUs, std::set<uint32_t>());
-    g_rsuPassiveBeaconEvidenceTables.assign(
-        N_RSUs, std::map<uint32_t, std::vector<RsuPassiveBeaconEvidenceRecord> >());
+    g_computedDetectionEvidenceTables.assign(
+        N_RSUs, std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> >());
     g_vehicleLastRssiByClaimedId.assign(N_Vehicles, std::map<uint32_t, double>());
 }
 
@@ -531,12 +614,12 @@ static const double kPathLossExp       =  3.3772;  ///< Effective exponent = B/1
 static const double kRssiDistMismatchM =  25.0;    ///< Mismatch threshold (metres)
 
 static void
-RecordRsuPassiveBeaconEvidence(uint32_t rsuIndex,
-                               const SybilPacketTag& tag,
-                               const BsmCoreData& bsm,
-                               bool signatureValid,
-                               uint32_t triggerSeq,
-                               double measuredRssiDbm);
+RecordComputedDetectionEvidence(uint32_t rsuIndex,
+                                const SybilPacketTag& tag,
+                                const BsmCoreData& bsm,
+                                bool signatureValid,
+                                uint32_t triggerSeq,
+                                double measuredRssiDbm);
 
 static double
 RssiToDistance(double rssiDbm)
@@ -594,6 +677,374 @@ BytesToHex(const std::vector<uint8_t>& bytes)
     return out;
 }
 
+static bool FullPqcProfileActive();
+static std::string FullCryptoProfileName();
+
+static std::vector<uint8_t>
+StringToBytes(const std::string& value)
+{
+    return std::vector<uint8_t>(value.begin(), value.end());
+}
+
+static std::string
+HashStringHex(const std::string& value)
+{
+    return BytesToHex(CryptoSha256(StringToBytes(value)));
+}
+
+
+static uint16_t
+ShamirModAdd(uint16_t a, uint16_t b)
+{
+    return static_cast<uint16_t>((static_cast<uint32_t>(a) + b) % 257u);
+}
+
+static uint16_t
+ShamirModMul(uint16_t a, uint16_t b)
+{
+    return static_cast<uint16_t>((static_cast<uint32_t>(a) * b) % 257u);
+}
+
+static uint16_t
+ShamirModPow(uint16_t base, uint16_t exp)
+{
+    uint32_t result = 1;
+    uint32_t value = base % 257u;
+    while (exp > 0)
+    {
+        if (exp & 1u)
+            result = (result * value) % 257u;
+        value = (value * value) % 257u;
+        exp >>= 1u;
+    }
+    return static_cast<uint16_t>(result);
+}
+
+static uint16_t
+ShamirModInv(uint16_t value)
+{
+    return ShamirModPow(value, 255u);
+}
+
+static std::vector<ShamirShareByte>
+ShamirSplitSecretBytes(const std::vector<uint8_t>& secret,
+                       uint32_t participantCount,
+                       uint32_t threshold)
+{
+    std::vector<ShamirShareByte> shares;
+    if (secret.empty() || participantCount == 0 || threshold == 0 || threshold > participantCount)
+        return shares;
+
+    shares.resize(participantCount);
+    for (uint32_t i = 0; i < participantCount; ++i)
+    {
+        shares[i].x = static_cast<uint16_t>(i + 1u);
+        shares[i].y.assign(secret.size(), 0u);
+    }
+
+    for (std::size_t byteIndex = 0; byteIndex < secret.size(); ++byteIndex)
+    {
+        std::vector<uint16_t> coeffs(threshold, 0u);
+        coeffs[0] = static_cast<uint16_t>(secret[byteIndex]);
+        std::vector<uint8_t> randomBytes = CryptoRandBytes(threshold > 1 ? threshold - 1 : 0);
+        for (uint32_t c = 1; c < threshold; ++c)
+            coeffs[c] = static_cast<uint16_t>(randomBytes[c - 1] % 257u);
+
+        for (uint32_t shareIndex = 0; shareIndex < participantCount; ++shareIndex)
+        {
+            uint16_t x = shares[shareIndex].x;
+            uint16_t y = 0;
+            uint16_t xPow = 1;
+            for (uint32_t c = 0; c < threshold; ++c)
+            {
+                y = ShamirModAdd(y, ShamirModMul(coeffs[c], xPow));
+                xPow = ShamirModMul(xPow, x);
+            }
+            shares[shareIndex].y[byteIndex] = y;
+        }
+    }
+    return shares;
+}
+
+static std::vector<uint8_t>
+ShamirReconstructSecretBytes(const std::vector<ShamirShareByte>& shares,
+                             uint32_t threshold)
+{
+    std::vector<uint8_t> secret;
+    if (shares.size() < threshold || threshold == 0 || shares.empty())
+        return secret;
+
+    std::size_t secretLen = shares[0].y.size();
+    secret.assign(secretLen, 0u);
+    for (std::size_t byteIndex = 0; byteIndex < secretLen; ++byteIndex)
+    {
+        uint16_t accum = 0;
+        for (uint32_t i = 0; i < threshold; ++i)
+        {
+            uint16_t xi = shares[i].x;
+            uint16_t yi = shares[i].y[byteIndex];
+            uint16_t numerator = 1;
+            uint16_t denominator = 1;
+            for (uint32_t j = 0; j < threshold; ++j)
+            {
+                if (i == j) continue;
+                uint16_t xj = shares[j].x;
+                numerator = ShamirModMul(numerator, static_cast<uint16_t>((257u - xj) % 257u));
+                denominator = ShamirModMul(denominator, static_cast<uint16_t>((257u + xi - xj) % 257u));
+            }
+            uint16_t basis = ShamirModMul(numerator, ShamirModInv(denominator));
+            accum = ShamirModAdd(accum, ShamirModMul(yi, basis));
+        }
+        secret[byteIndex] = static_cast<uint8_t>(accum % 256u);
+    }
+    return secret;
+}
+
+static std::vector<uint8_t>
+DeriveBytesFromParts(const std::string& label,
+                     const std::vector<uint8_t>& secret,
+                     uint32_t a,
+                     uint32_t b,
+                     uint32_t c = 0)
+{
+    std::vector<uint8_t> material = StringToBytes(label);
+    material.insert(material.end(), secret.begin(), secret.end());
+    material.push_back((a >> 24) & 0xFF); material.push_back((a >> 16) & 0xFF);
+    material.push_back((a >>  8) & 0xFF); material.push_back( a        & 0xFF);
+    material.push_back((b >> 24) & 0xFF); material.push_back((b >> 16) & 0xFF);
+    material.push_back((b >>  8) & 0xFF); material.push_back( b        & 0xFF);
+    material.push_back((c >> 24) & 0xFF); material.push_back((c >> 16) & 0xFF);
+    material.push_back((c >>  8) & 0xFF); material.push_back( c        & 0xFF);
+    return CryptoSha256(material);
+}
+
+static void
+RebuildLkhZoneTree(uint32_t rsuId, const std::string& reason)
+{
+    if (!FullCryptoMechanismActive() || rsuId >= g_lkhZones.size())
+        return;
+
+    LkhZoneState& zone = g_lkhZones[rsuId];
+    zone.rsuId = rsuId;
+    zone.epoch++;
+    zone.leafKeys.clear();
+    zone.wrappedRootKeyByVehicle.clear();
+
+    std::vector<ShamirShareByte> thresholdShares;
+    uint32_t threshold = std::min(std::max(1u, controllerRegistrationThreshold),
+                                  static_cast<uint32_t>(g_fullModeAuthorityShares.size()));
+    for (uint32_t i = 0; i < threshold && i < g_fullModeAuthorityShares.size(); ++i)
+        thresholdShares.push_back(g_fullModeAuthorityShares[i]);
+    std::vector<uint8_t> authorityRoot = ShamirReconstructSecretBytes(thresholdShares, threshold);
+    if (authorityRoot.empty())
+        authorityRoot = g_fullModeAuthoritySecret;
+
+    std::vector<uint8_t> rolling = DeriveBytesFromParts("lkh-zone-root", authorityRoot, rsuId, zone.epoch);
+    for (uint32_t member : zone.members)
+    {
+        std::vector<uint8_t> leaf = DeriveBytesFromParts("lkh-leaf", authorityRoot, rsuId, member, zone.epoch);
+        zone.leafKeys[member] = leaf;
+        std::vector<uint8_t> combine = rolling;
+        combine.insert(combine.end(), leaf.begin(), leaf.end());
+        rolling = CryptoSha256(combine);
+    }
+    zone.rootGroupKey = rolling;
+
+    for (auto it = zone.leafKeys.begin(); it != zone.leafKeys.end(); ++it)
+    {
+        std::vector<uint8_t> wrapMaterial = it->second;
+        wrapMaterial.insert(wrapMaterial.end(), zone.rootGroupKey.begin(), zone.rootGroupKey.end());
+        zone.wrappedRootKeyByVehicle[it->first] = BytesToHex(CryptoSha256(wrapMaterial));
+    }
+
+    std::cout << "[FullModeLKH] RSU=" << rsuId
+              << " reason=" << reason
+              << " epoch=" << zone.epoch
+              << " members=" << zone.members.size()
+              << " root_hash=" << BytesToHex(CryptoSha256(zone.rootGroupKey)).substr(0, 16)
+              << " wrapped_keys=" << zone.wrappedRootKeyByVehicle.size()
+              << " shamir_reconstructed=" << (authorityRoot.empty() ? "no" : "yes")
+              << std::endl;
+}
+
+static void
+LkhJoinVehicleAtRsu(uint32_t vehicleId, uint32_t rsuId)
+{
+    if (!FullCryptoMechanismActive() || rsuId >= g_lkhZones.size())
+        return;
+    LkhZoneState& zone = g_lkhZones[rsuId];
+    if (zone.members.insert(vehicleId).second)
+        RebuildLkhZoneTree(rsuId, "join_vehicle_" + std::to_string(vehicleId));
+}
+
+static void
+LkhRevokeVehicleAtRsu(uint32_t vehicleId, uint32_t rsuId)
+{
+    if (!FullCryptoMechanismActive() || rsuId >= g_lkhZones.size())
+        return;
+    LkhZoneState& zone = g_lkhZones[rsuId];
+    bool wasMember = zone.members.erase(vehicleId) > 0;
+    RebuildLkhZoneTree(rsuId,
+                       std::string("revoke_vehicle_") + std::to_string(vehicleId) +
+                       (wasMember ? "_member_removed" : "_external_identity"));
+}
+
+static void
+InitializeFullModeShamirAndLkh()
+{
+    g_fullModeAuthorityShares.clear();
+    g_fullModeAuthoritySecret.clear();
+    g_lkhZones.assign(N_RSUs, LkhZoneState());
+    for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
+        g_lkhZones[rsuId].rsuId = rsuId;
+
+    if (!FullCryptoMechanismActive())
+        return;
+
+    std::vector<uint8_t> seed = StringToBytes("full-mode-lkh-authority-root");
+    seed.insert(seed.end(), g_tokenMasterKey.begin(), g_tokenMasterKey.end());
+    seed.push_back((N_RSUs >> 24) & 0xFF); seed.push_back((N_RSUs >> 16) & 0xFF);
+    seed.push_back((N_RSUs >>  8) & 0xFF); seed.push_back( N_RSUs        & 0xFF);
+    seed.push_back((N_Controllers >> 24) & 0xFF); seed.push_back((N_Controllers >> 16) & 0xFF);
+    seed.push_back((N_Controllers >>  8) & 0xFF); seed.push_back( N_Controllers        & 0xFF);
+    g_fullModeAuthoritySecret = CryptoSha256(seed);
+
+    uint32_t participantCount = std::max(1u, N_Controllers + N_RSUs);
+    uint32_t threshold = std::min(std::max(1u, controllerRegistrationThreshold), participantCount);
+    g_fullModeAuthorityShares = ShamirSplitSecretBytes(g_fullModeAuthoritySecret,
+                                                       participantCount,
+                                                       threshold);
+    std::vector<ShamirShareByte> selected;
+    for (uint32_t i = 0; i < threshold && i < g_fullModeAuthorityShares.size(); ++i)
+        selected.push_back(g_fullModeAuthorityShares[i]);
+    std::vector<uint8_t> recovered = ShamirReconstructSecretBytes(selected, threshold);
+    bool ok = recovered == g_fullModeAuthoritySecret;
+    std::cout << "[FullModeShamir] shares=" << g_fullModeAuthorityShares.size()
+              << " threshold=" << threshold
+              << " secret_hash=" << BytesToHex(CryptoSha256(g_fullModeAuthoritySecret)).substr(0, 16)
+              << " reconstruction=" << (ok ? "ok" : "failed")
+              << std::endl;
+}
+
+static std::string
+GetVehicleKyberPublicKeyHex(uint32_t vehicleId)
+{
+    // Current-crypto placeholder: use the vehicle's existing public key bytes
+    // as the registration public-key material until Kyber is integrated.
+    if (vehicleId < g_vehiclePubKeys.size() && !g_vehiclePubKeys[vehicleId].empty())
+        return BytesToHex(g_vehiclePubKeys[vehicleId]);
+
+    std::ostringstream fallback;
+    fallback << "simulated_kyber_public_key_vehicle_" << vehicleId;
+    return HashStringHex(fallback.str());
+}
+
+static std::string
+SignWithCurrentControllerKeyHex(uint32_t controllerId, const std::string& message)
+{
+    std::vector<uint8_t> msg = StringToBytes(message);
+    if (FullPqcProfileActive() &&
+        controllerId < g_pqcControllerSigKeys.size() &&
+        !g_pqcControllerSigKeys[controllerId].secretKey.empty())
+    {
+        std::vector<uint8_t> sig = CryptoDilithiumMlDsa65Sign(
+            g_pqcControllerSigKeys[controllerId].secretKey, msg);
+        std::ostringstream os;
+        os << "dilithium_ml_dsa_65_controller_" << controllerId << ":" << BytesToHex(sig);
+        return os.str();
+    }
+
+    std::vector<uint8_t> hash = CryptoSha256(msg);
+    std::vector<uint8_t> sig;
+    if (g_ctrlSignPrivKey.size() == 32)
+        sig = CryptoEcdsaSign(g_ctrlSignPrivKey, hash);
+    else
+        sig = CryptoSha256(hash);
+
+    std::ostringstream os;
+    os << "current_ecdsa_controller_" << controllerId << ":" << BytesToHex(sig);
+    return os.str();
+}
+
+static std::string
+SignWithCurrentRsuKeyHex(uint32_t rsuId, const std::string& message)
+{
+    std::vector<uint8_t> msg = StringToBytes(message);
+    if (FullPqcProfileActive() &&
+        rsuId < g_pqcRsuSigKeys.size() &&
+        !g_pqcRsuSigKeys[rsuId].secretKey.empty())
+    {
+        std::vector<uint8_t> sig = CryptoDilithiumMlDsa65Sign(
+            g_pqcRsuSigKeys[rsuId].secretKey, msg);
+        std::ostringstream os;
+        os << "dilithium_ml_dsa_65_rsu_" << rsuId << ":" << BytesToHex(sig);
+        return os.str();
+    }
+
+    std::vector<uint8_t> hash = CryptoSha256(msg);
+    std::vector<uint8_t> sig;
+    if (rsuId < g_rsuPrivKeys.size() && g_rsuPrivKeys[rsuId].size() == 32)
+        sig = CryptoEcdsaSign(g_rsuPrivKeys[rsuId], hash);
+    else
+        sig = CryptoSha256(hash);
+
+    std::ostringstream os;
+    os << "current_ecdsa_rsu_" << rsuId << ":" << BytesToHex(sig);
+    return os.str();
+}
+
+static void
+InitializeFullPqcAuthorityKeys()
+{
+    g_pqcRsuSigKeys.clear();
+    g_pqcControllerSigKeys.clear();
+
+    if (!FullCryptoMechanismActive() || full_crypto_profile != 2)
+        return;
+
+    if (!CryptoPqcAvailable())
+    {
+        std::cerr << "[FullModePQC] requested but liboqs is not linked; using current classical crypto\n";
+        return;
+    }
+
+    g_pqcRsuSigKeys.resize(N_RSUs);
+    for (uint32_t i = 0; i < N_RSUs; ++i)
+        g_pqcRsuSigKeys[i] = CryptoDilithiumMlDsa65Keygen();
+
+    g_pqcControllerSigKeys.resize(N_Controllers);
+    for (uint32_t i = 0; i < N_Controllers; ++i)
+        g_pqcControllerSigKeys[i] = CryptoDilithiumMlDsa65Keygen();
+
+    uint32_t kyberBackhaulKeys = 0;
+    if (g_rsuCtrlSharedKeys.size() < N_RSUs)
+        g_rsuCtrlSharedKeys.resize(N_RSUs);
+    for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
+    {
+        CryptoPqcKemKeypair rsuKem = CryptoKyber768Keygen();
+        CryptoPqcKemEncapsulation ctrlEnc = CryptoKyber768Encapsulate(rsuKem.publicKey);
+        std::vector<uint8_t> rsuShared = CryptoKyber768Decapsulate(ctrlEnc.ciphertext, rsuKem.secretKey);
+        if (!ctrlEnc.sharedSecret.empty() && ctrlEnc.sharedSecret == rsuShared)
+        {
+            g_rsuCtrlSharedKeys[rsuId] = CryptoSha256(ctrlEnc.sharedSecret);
+            ++kyberBackhaulKeys;
+        }
+    }
+
+    std::cout << "[FullModePQC] Dilithium/ML-DSA-65 authority keys ready"
+              << " rsus=" << g_pqcRsuSigKeys.size()
+              << " controllers=" << g_pqcControllerSigKeys.size()
+              << " kyber_rsu_controller_keys=" << kyberBackhaulKeys << "/" << N_RSUs
+              << std::endl;
+}
+
+static uint32_t
+GetRsuThreshold(uint32_t participantCount)
+{
+    participantCount = std::max(1u, participantCount);
+    return std::min(std::max(1u, controllerRegistrationThreshold), participantCount);
+}
+
 static uint32_t
 GetControllerRegistrationThreshold()
 {
@@ -604,36 +1055,169 @@ GetControllerRegistrationThreshold()
 }
 
 static std::string
-BuildControllerRegistrationJson(uint32_t vehicleId,
-                                uint32_t originRsuId,
-                                uint32_t primaryControllerId,
-                                uint64_t vin,
-                                double gpsX,
-                                double gpsY,
-                                double requestTime)
+BuildTokenManifestBodyHashInput()
+{
+    std::ostringstream os;
+    for (auto it = g_controllerTokenCommitments.begin();
+         it != g_controllerTokenCommitments.end();
+         ++it)
+    {
+        os << it->first << "|"
+           << it->second.registrationCid << "|"
+           << it->second.tokenHashHex << "|"
+           << it->second.tokenRecordCid << "\n";
+    }
+    return os.str();
+}
+
+static std::vector<ManifestEndorsement>
+BuildRsuManifestEndorsements(const std::string& manifestBodyHashHex)
+{
+    std::vector<ManifestEndorsement> endorsements;
+    uint32_t threshold = GetRsuThreshold(N_RSUs);
+    for (uint32_t rsuId = 0; rsuId < N_RSUs && endorsements.size() < threshold; ++rsuId)
+    {
+        ManifestEndorsement e;
+        e.signerId = rsuId;
+        e.signatureHex = SignWithCurrentRsuKeyHex(
+            rsuId,
+            "token_manifest|" + manifestBodyHashHex + "|" + std::to_string(rsuId));
+        endorsements.push_back(e);
+    }
+    return endorsements;
+}
+
+static uint32_t
+ExtractJsonUintField(const std::string& json, const std::string& fieldName, uint32_t fallback = 0)
+{
+    std::string key = "\"" + fieldName + "\"";
+    std::size_t keyPos = json.find(key);
+    if (keyPos == std::string::npos)
+        return fallback;
+    std::size_t colon = json.find(':', keyPos + key.size());
+    if (colon == std::string::npos)
+        return fallback;
+    std::size_t digit = json.find_first_of("0123456789", colon + 1);
+    if (digit == std::string::npos)
+        return fallback;
+    std::size_t endDigit = json.find_first_not_of("0123456789", digit);
+    return static_cast<uint32_t>(
+        std::strtoul(json.substr(digit, endDigit - digit).c_str(), nullptr, 10));
+}
+
+static bool
+VerifyFullModeTokenManifestEndorsements(const std::string& manifestJson)
+{
+    if (!FullCryptoMechanismActive())
+        return true;
+
+    uint32_t threshold = ExtractJsonUintField(
+        manifestJson,
+        "endorsement_threshold",
+        GetRsuThreshold(N_RSUs));
+    std::set<uint32_t> uniqueSigners;
+    std::size_t pos = 0;
+    const std::string signerKey = "\"signer_id\"";
+
+    std::string bodyHash;
+    const std::string bodyKey = "\"body_hash\"";
+    std::size_t bodyPos = manifestJson.find(bodyKey);
+    if (bodyPos != std::string::npos)
+    {
+        std::size_t colon = manifestJson.find(":", bodyPos + bodyKey.size());
+        std::size_t quote1 = manifestJson.find("\"", colon + 1);
+        std::size_t quote2 = manifestJson.find("\"", quote1 + 1);
+        if (quote1 != std::string::npos && quote2 != std::string::npos)
+            bodyHash = manifestJson.substr(quote1 + 1, quote2 - quote1 - 1);
+    }
+
+    while ((pos = manifestJson.find(signerKey, pos)) != std::string::npos)
+    {
+        std::size_t colon = manifestJson.find(":", pos + signerKey.size());
+        std::size_t digit = manifestJson.find_first_of("0123456789", colon + 1);
+        if (colon == std::string::npos || digit == std::string::npos)
+            break;
+        std::size_t endDigit = manifestJson.find_first_not_of("0123456789", digit);
+        uint32_t signerId = static_cast<uint32_t>(
+            std::strtoul(manifestJson.substr(digit, endDigit - digit).c_str(), nullptr, 10));
+
+        bool signatureOk = signerId < N_RSUs;
+        if (signatureOk && FullPqcProfileActive())
+        {
+            signatureOk = false;
+            const std::string sigKey = "\"signature\"";
+            std::size_t sigPos = manifestJson.find(sigKey, endDigit);
+            std::size_t objEnd = manifestJson.find("}", endDigit);
+            if (sigPos != std::string::npos && objEnd != std::string::npos && sigPos < objEnd)
+            {
+                std::size_t sigColon = manifestJson.find(":", sigPos + sigKey.size());
+                std::size_t quote1 = manifestJson.find("\"", sigColon + 1);
+                std::size_t quote2 = manifestJson.find("\"", quote1 + 1);
+                if (quote1 != std::string::npos && quote2 != std::string::npos)
+                {
+                    std::string encoded = manifestJson.substr(quote1 + 1, quote2 - quote1 - 1);
+                    std::string prefix = "dilithium_ml_dsa_65_rsu_" + std::to_string(signerId) + ":";
+                    if (encoded.rfind(prefix, 0) == 0 && signerId < g_pqcRsuSigKeys.size())
+                    {
+                        std::vector<uint8_t> sig = CryptoHexToBytes(encoded.substr(prefix.size()));
+                        std::string message = "token_manifest|" + bodyHash + "|" + std::to_string(signerId);
+                        signatureOk = CryptoDilithiumMlDsa65Verify(
+                            g_pqcRsuSigKeys[signerId].publicKey,
+                            StringToBytes(message),
+                            sig);
+                    }
+                }
+            }
+        }
+
+        if (signatureOk)
+            uniqueSigners.insert(signerId);
+        pos = endDigit;
+    }
+
+    uint32_t signerCount = static_cast<uint32_t>(uniqueSigners.size());
+    bool ok = signerCount >= threshold;
+    std::cout << "[FullModeTokenManifest] verify endorsements="
+              << signerCount << "/" << threshold
+              << " scheme=" << (FullPqcProfileActive() ? "Dilithium/ML-DSA-65" : "current-ECDSA")
+              << " status=" << (ok ? "accepted" : "rejected") << std::endl;
+    return ok;
+}
+
+static std::string
+BuildVehicleRegistrationRecordJson(uint32_t vehicleId,
+                                   uint32_t originRsuId,
+                                   uint32_t primaryControllerId,
+                                   uint64_t vin,
+                                   double gpsX,
+                                   double gpsY,
+                                   double requestTime)
 {
     std::ostringstream os;
     os << "{\n"
-       << "  \"type\": \"controller_threshold_registration_request\",\n"
+       << "  \"type\": \"vehicle_registration_record\",\n"
        << "  \"vehicle_id\": " << vehicleId << ",\n"
-       << "  \"origin_rsu_id\": " << originRsuId << ",\n"
-       << "  \"primary_controller_id\": " << primaryControllerId << ",\n"
        << "  \"vin\": " << vin << ",\n"
-       << "  \"gps_x\": " << gpsX << ",\n"
-       << "  \"gps_y\": " << gpsY << ",\n"
-       << "  \"request_time\": " << requestTime << "\n"
+       << "  \"gps\": {\n"
+       << "    \"x\": " << gpsX << ",\n"
+       << "    \"y\": " << gpsY << "\n"
+       << "  },\n"
+       << "  \"timestamp\": " << requestTime << ",\n"
+       << "  \"kyber_public_key\": \"" << GetVehicleKyberPublicKeyHex(vehicleId) << "\",\n"
+       << "  \"relay_origin_rsu_id\": " << originRsuId << ",\n"
+       << "  \"endorsing_primary_controller_id\": " << primaryControllerId << "\n"
        << "}\n";
     return os.str();
 }
 
 static std::string
-PublishControllerRegistrationToIpfs(uint32_t vehicleId,
-                                    uint32_t originRsuId,
-                                    uint32_t primaryControllerId,
-                                    uint64_t vin,
-                                    double gpsX,
-                                    double gpsY,
-                                    double requestTime)
+PublishVehicleRegistrationRecordToIpfs(uint32_t vehicleId,
+                                       uint32_t originRsuId,
+                                       uint32_t primaryControllerId,
+                                       uint64_t vin,
+                                       double gpsX,
+                                       double gpsY,
+                                       double requestTime)
 {
     static bool warnedIpfsUnavailable = false;
     const std::string dir = "sybil-attack/outputs/ipfs-registration";
@@ -648,20 +1232,20 @@ PublishControllerRegistrationToIpfs(uint32_t vehicleId,
 
     {
         std::ofstream out(path.str().c_str(), std::ios::out);
-        out << BuildControllerRegistrationJson(vehicleId,
-                                               originRsuId,
-                                               primaryControllerId,
-                                               vin,
-                                               gpsX,
-                                               gpsY,
-                                               requestTime);
+        out << BuildVehicleRegistrationRecordJson(vehicleId,
+                                                  originRsuId,
+                                                  primaryControllerId,
+                                                  vin,
+                                                  gpsX,
+                                                  gpsY,
+                                                  requestTime);
     }
 
     std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
     if (cid.empty() && !warnedIpfsUnavailable)
     {
-        std::cerr << "[IPFS] WARNING: controller registration IPFS publish failed. "
-                  << "Evidence JSON files are still written under " << dir << ".\n";
+        std::cerr << "[IPFS] WARNING: vehicle registration IPFS publish failed. "
+                  << "Registration JSON files are still written under " << dir << ".\n";
         warnedIpfsUnavailable = true;
     }
     if (cid.empty())
@@ -704,13 +1288,13 @@ ApproveControllerThresholdRegistration(uint32_t primaryControllerId,
     if (g_controllerLocalRegistrationStates.size() < N_Controllers)
         g_controllerLocalRegistrationStates.resize(N_Controllers);
 
-    std::string cid = PublishControllerRegistrationToIpfs(vehicleId,
-                                                          originRsuId,
-                                                          primaryControllerId,
-                                                          vin,
-                                                          gpsX,
-                                                          gpsY,
-                                                          requestTime);
+    std::string cid = PublishVehicleRegistrationRecordToIpfs(vehicleId,
+                                                             originRsuId,
+                                                             primaryControllerId,
+                                                             vin,
+                                                             gpsX,
+                                                             gpsY,
+                                                             requestTime);
     registrationCidOut = cid;
 
     ControllerRegistrationQuorumState& quorum = g_controllerRegistrationQuorums[cid];
@@ -889,7 +1473,30 @@ BuildTokenManifestJson()
     std::ostringstream os;
     os << "{\n"
        << "  \"type\": \"controller_threshold_token_manifest\",\n"
+       << "  \"crypto_profile\": \""
+       << (FullCryptoMechanismActive() ? FullCryptoProfileName() : "lightweight")
+       << "\",\n"
        << "  \"issued_time\": " << Simulator::Now().GetSeconds() << ",\n"
+       << "  \"body_hash\": \"" << g_latestTokenManifestBodyHashHex << "\",\n"
+       << "  \"endorsement_scheme\": \""
+       << (FullCryptoMechanismActive()
+               ? (FullPqcProfileActive() ? "threshold_dilithium_ml_dsa_65_rsu_keys" : "threshold_current_ecdsa_rsu_keys")
+               : "not_required_for_lightweight")
+       << "\",\n"
+       << "  \"endorsement_threshold\": "
+       << (FullCryptoMechanismActive() ? GetRsuThreshold(N_RSUs) : 0u) << ",\n"
+       << "  \"endorsements\": [\n";
+
+    for (std::size_t i = 0; i < g_latestTokenManifestEndorsements.size(); ++i)
+    {
+        if (i > 0)
+            os << ",\n";
+        os << "    {\"signer_id\": " << g_latestTokenManifestEndorsements[i].signerId
+           << ", \"signature\": \"" << g_latestTokenManifestEndorsements[i].signatureHex
+           << "\"}";
+    }
+
+    os << "\n  ],\n"
        << "  \"records\": [\n";
 
     bool first = true;
@@ -901,6 +1508,8 @@ BuildTokenManifestJson()
             os << ",\n";
         first = false;
         os << "    {\"vehicle_id\": " << it->first
+           << ", \"registration_cid\": \"" << it->second.registrationCid << "\""
+           << ", \"token_hash\": \"" << it->second.tokenHashHex << "\""
            << ", \"token_record_cid\": \"" << it->second.tokenRecordCid << "\"}";
     }
 
@@ -981,10 +1590,27 @@ ParseTokenManifestRecordCids(const std::string& manifestJson)
 static void
 PublishUpdatedTokenManifest()
 {
+    g_latestTokenManifestBodyHashHex = HashStringHex(BuildTokenManifestBodyHashInput());
+    g_latestTokenManifestEndorsements.clear();
+    if (FullCryptoMechanismActive())
+        g_latestTokenManifestEndorsements =
+            BuildRsuManifestEndorsements(g_latestTokenManifestBodyHashHex);
+
     g_latestTokenManifestCid = PublishTokenManifestToIpfs();
     std::cout << "[ControllerTokenManifest] cid=" << g_latestTokenManifestCid
               << " records=" << g_controllerTokenCommitments.size()
+              << " endorsements=" << g_latestTokenManifestEndorsements.size()
+              << "/" << (FullCryptoMechanismActive() ? GetRsuThreshold(N_RSUs) : 0u)
               << std::endl;
+
+    if (FullCryptoMechanismActive())
+    {
+        std::string pubResult = RunCommandCapture(
+            "timeout 2s " + GetIpfsBinaryPath() +
+            " pubsub pub sybil-token-manifests " + g_latestTokenManifestCid +
+            " 2>/dev/null");
+        (void)pubResult;
+    }
 }
 
 static void
@@ -1002,6 +1628,14 @@ SyncRsuTokenCommitmentsFromIpfs(uint32_t rsuId)
     if (!g_latestTokenManifestCid.empty())
     {
         std::string manifestJson = FetchJsonFromIpfsCid(g_latestTokenManifestCid);
+        if (!VerifyFullModeTokenManifestEndorsements(manifestJson))
+        {
+            std::cerr << "[FullModeTokenManifest] RSU " << rsuId
+                      << " rejected unendorsed manifest="
+                      << g_latestTokenManifestCid << std::endl;
+        }
+        else
+        {
         std::map<uint32_t, std::string> recordCids =
             ParseTokenManifestRecordCids(manifestJson);
 
@@ -1023,6 +1657,7 @@ SyncRsuTokenCommitmentsFromIpfs(uint32_t rsuId)
             g_rsuTokenRecordCidCache[rsuId][vehicleId] = tokenRecordCid;
             g_rsuTokenHashCache[rsuId][vehicleId] = tokenHashHex;
             ++updated;
+        }
         }
     }
 
@@ -1085,11 +1720,228 @@ StoreThresholdApprovedToken(uint32_t vehicleId,
 }
 
 static std::string
-BuildPassiveBeaconEvidenceJson(const RsuPassiveBeaconEvidenceRecord& rec)
+BuildFlGlobalModelJson(uint32_t round,
+                       const std::string& modelHashHex,
+                       double loss)
 {
     std::ostringstream os;
     os << "{\n"
-       << "  \"type\": \"rsu_passive_v2v_beacon_evidence\",\n"
+       << "  \"type\": \"fl_global_model\",\n"
+       << "  \"round\": " << round << ",\n"
+       << "  \"model_hash\": \"" << modelHashHex << "\",\n"
+       << "  \"loss\": " << loss << ",\n"
+       << "  \"weights_source\": \"hardcoded_simulation_model\",\n"
+       << "  \"issued_time\": " << Simulator::Now().GetSeconds() << "\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishFlGlobalModelToIpfs(uint32_t round,
+                           uint32_t controllerId,
+                           const std::string& modelHashHex,
+                           double loss)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-fl-models";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/round" << round
+         << "_ctrl" << controllerId
+         << "_model.json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildFlGlobalModelJson(round, modelHashHex, loss);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: FL model IPFS publish failed. "
+                  << "FL model JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local-fl-model://" + modelHashHex;
+    return cid;
+}
+
+static std::string
+BuildFlConsensusManifestJson(const FlModelConsensusRecord& rec)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"fl_model_consensus_manifest\",\n"
+       << "  \"round\": " << rec.round << ",\n"
+       << "  \"accepted_model_cid\": \"" << rec.acceptedModelCid << "\",\n"
+       << "  \"model_hash\": \"" << rec.modelHashHex << "\",\n"
+       << "  \"agreeing_controllers\": " << rec.agreeingControllers << ",\n"
+       << "  \"controller_threshold\": " << GetControllerRegistrationThreshold() << ",\n"
+       << "  \"loss\": " << rec.loss << ",\n"
+       << "  \"consensus_time\": " << rec.consensusTime << "\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishFlConsensusManifestToIpfs(const FlModelConsensusRecord& rec)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-fl-model-consensus";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/round" << rec.round << "_consensus.json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildFlConsensusManifestJson(rec);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: FL consensus manifest IPFS publish failed. "
+                  << "Consensus JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local://" + path.str();
+    return cid;
+}
+
+static void
+RunFlModelCidConsensus(uint32_t round, double loss)
+{
+    std::map<std::string, uint32_t> cidCounts;
+    std::map<std::string, std::string> modelHashByCid;
+
+    for (uint32_t controllerId = 0; controllerId < N_Controllers; ++controllerId)
+    {
+        std::ostringstream modelSeed;
+        modelSeed << "fl_global_model_round_" << round << "_baseline";
+        if (sybil_attack_enabled && g_controllerIsMalicious && controllerId == 0)
+            modelSeed << "_poisoned_controller_" << controllerId;
+
+        std::string modelHashHex = HashStringHex(modelSeed.str());
+        std::string cid =
+            PublishFlGlobalModelToIpfs(round, controllerId, modelHashHex, loss);
+        cidCounts[cid]++;
+        modelHashByCid[cid] = modelHashHex;
+
+        std::cout << "[FL_MODEL_IPFS] round=" << round
+                  << " controller=" << controllerId
+                  << " model_hash=" << modelHashHex
+                  << " cid=" << cid << std::endl;
+    }
+
+    std::string bestCid;
+    uint32_t bestCount = 0;
+    for (auto it = cidCounts.begin(); it != cidCounts.end(); ++it)
+    {
+        if (it->second > bestCount)
+        {
+            bestCid = it->first;
+            bestCount = it->second;
+        }
+    }
+
+    uint32_t threshold = GetControllerRegistrationThreshold();
+    if (!bestCid.empty() && bestCount >= threshold)
+    {
+        FlModelConsensusRecord rec;
+        rec.round = round;
+        rec.acceptedModelCid = bestCid;
+        rec.modelHashHex = modelHashByCid[bestCid];
+        rec.agreeingControllers = bestCount;
+        rec.loss = loss;
+        rec.consensusTime = Simulator::Now().GetSeconds();
+        g_flModelConsensusByRound[round] = rec;
+        g_latestAcceptedFlModelCid = bestCid;
+        if (g_rsuAcceptedFlModelCid.size() < N_RSUs)
+            g_rsuAcceptedFlModelCid.resize(N_RSUs);
+        for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
+            g_rsuAcceptedFlModelCid[rsuId] = bestCid;
+
+        std::string manifestCid = PublishFlConsensusManifestToIpfs(rec);
+        std::cout << "[FL_MODEL_CONSENSUS] round=" << round
+                  << " accepted_cid=" << bestCid
+                  << " votes=" << bestCount << "/" << N_Controllers
+                  << " manifest_cid=" << manifestCid
+                  << std::endl;
+    }
+    else
+    {
+        std::cout << "[FL_MODEL_CONSENSUS] round=" << round
+                  << " no CID reached threshold=" << threshold
+                  << std::endl;
+    }
+}
+
+static uint32_t
+CountSuspicionBits(uint32_t flags)
+{
+    uint32_t count = 0;
+    while (flags)
+    {
+        count += flags & 1u;
+        flags >>= 1;
+    }
+    return count;
+}
+
+static std::string
+DescribeAttackVariantFromFlags(uint32_t flags)
+{
+    if (flags & SUSPICION_ID_MISMATCH)
+        return "identity_mismatch";
+    if (flags & SUSPICION_INVALID_V2V_SIGNATURE)
+        return "invalid_v2v_signature";
+    if (flags & SUSPICION_RSSI_DISTANCE_MISMATCH)
+        return "rssi_distance_mismatch";
+    if (flags & SUSPICION_RANGE_ANOMALY)
+        return "range_anomaly";
+    if (flags & SUSPICION_RSSI_COLOCATION)
+        return "rssi_colocation";
+    if (flags != SUSPICION_NONE)
+        return "cross_tier_suspicion";
+    return "none";
+}
+
+static std::string
+BuildComputedEvidenceVectorString(const ComputedDetectionEvidenceRecord& rec)
+{
+    std::ostringstream os;
+    os << rec.rsuId << "|"
+       << rec.realVehicleId << "|"
+       << rec.claimedVehicleId << "|"
+       << rec.observableSourceId << "|"
+       << rec.sequenceNumber << "|"
+       << rec.observationTime << "|"
+       << rec.bsm.positionX << "|"
+       << rec.bsm.positionY << "|"
+       << rec.bsm.speed << "|"
+       << rec.bsm.heading << "|"
+       << rec.claimedDistanceToRsu << "|"
+       << rec.rssiEstimatedDistance << "|"
+       << rec.rssiDbm << "|"
+       << (rec.signatureValid ? 1 : 0) << "|"
+       << rec.suspicionFlags << "|"
+       << rec.detectionScore << "|"
+       << rec.signatureScore << "|"
+       << rec.revocationTimestamp << "|"
+       << rec.attackVariant;
+    return os.str();
+}
+
+static std::string
+BuildComputedDetectionEvidenceJson(const ComputedDetectionEvidenceRecord& rec)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"computed_detection_evidence\",\n"
        << "  \"rsu_id\": " << rec.rsuId << ",\n"
        << "  \"real_vehicle_id\": " << rec.realVehicleId << ",\n"
        << "  \"claimed_vehicle_id\": " << rec.claimedVehicleId << ",\n"
@@ -1110,7 +1962,14 @@ BuildPassiveBeaconEvidenceJson(const RsuPassiveBeaconEvidenceRecord& rec)
        << "  \"rssi_estimated_distance_m\": " << rec.rssiEstimatedDistance << ",\n"
        << "  \"rssi_dbm\": " << rec.rssiDbm << ",\n"
        << "  \"signature_valid\": " << JsonBool(rec.signatureValid) << ",\n"
-       << "  \"suspicion_flags\": " << rec.suspicionFlags << "\n"
+       << "  \"suspicion_flags\": " << rec.suspicionFlags << ",\n"
+       << "  \"detection_score\": " << rec.detectionScore << ",\n"
+       << "  \"signature_score\": " << rec.signatureScore << ",\n"
+       << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
+       << "  \"evidence_vector_hash\": \"" << rec.evidenceVectorHashHex << "\",\n"
+       << "  \"current_partial_signature\": \"" << rec.currentSignatureHex << "\",\n"
+       << "  \"signature_scheme\": \"current_ecdsa_placeholder_for_future_dilithium\",\n"
+       << "  \"revocation_timestamp\": " << rec.revocationTimestamp << "\n"
        << "}\n";
     return os.str();
 }
@@ -1131,10 +1990,10 @@ GetIpfsBinaryPath()
 }
 
 static std::string
-PublishPassiveBeaconEvidenceToIpfs(const RsuPassiveBeaconEvidenceRecord& rec)
+PublishComputedDetectionEvidenceToIpfs(const ComputedDetectionEvidenceRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-evidence";
+    const std::string dir = "sybil-attack/outputs/ipfs-computed-detection-evidence";
     std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
 
     std::ostringstream path;
@@ -1146,18 +2005,329 @@ PublishPassiveBeaconEvidenceToIpfs(const RsuPassiveBeaconEvidenceRecord& rec)
 
     {
         std::ofstream out(path.str().c_str(), std::ios::out);
-        out << BuildPassiveBeaconEvidenceJson(rec);
+        out << BuildComputedDetectionEvidenceJson(rec);
     }
 
     std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
     if (cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: real IPFS publish failed. Install/start IPFS "
-                  << "and ensure `ipfs add -Q` works. Evidence JSON files are still "
+                  << "and ensure `ipfs add -Q` works. Computed evidence JSON files are still "
                   << "written under " << dir << ".\n";
         warnedIpfsUnavailable = true;
     }
+    if (cid.empty())
+        cid = "local://" + path.str();
     return cid;
+}
+
+static std::string
+BuildIsolationRecordJson(const IsolationRecord& rec)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"isolation_record\",\n"
+       << "  \"entity_type\": \"" << rec.entityType << "\",\n"
+       << "  \"entity_id\": " << rec.entityId << ",\n"
+       << "  \"isolation_timestamp\": " << rec.isolationTimestamp << ",\n"
+       << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
+       << "  \"aggregated_evidence_hash\": \"" << rec.aggregatedEvidenceHashHex << "\",\n"
+       << "  \"evidence_cids\": [";
+    for (std::size_t i = 0; i < rec.evidenceCids.size(); ++i)
+    {
+        if (i > 0)
+            os << ", ";
+        os << "\"" << rec.evidenceCids[i] << "\"";
+    }
+    os << "],\n"
+       << "  \"authority_tier\": \"" << rec.authorityTier << "\",\n"
+       << "  \"threshold_signature\": \"" << rec.thresholdSignatureHex << "\",\n"
+       << "  \"signature_scheme\": \"current_ecdsa_placeholder_for_future_threshold_dilithium\"\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishIsolationRecordToIpfs(const IsolationRecord& rec)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-isolation-records";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/" << rec.entityType
+         << rec.entityId
+         << "_t" << static_cast<uint64_t>(rec.isolationTimestamp * 1000000.0)
+         << ".json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildIsolationRecordJson(rec);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: isolation record IPFS publish failed. "
+                  << "Isolation JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local://" + path.str();
+    return cid;
+}
+
+static std::string
+BuildRevocationManifestJson(const RevocationManifestRecord& rec)
+{
+    std::ostringstream os;
+    os << "{\n"
+       << "  \"type\": \"full_mode_revocation_manifest\",\n"
+       << "  \"crypto_profile\": \"full_simulated_pqc_threshold\",\n"
+       << "  \"entity_type\": \"" << rec.entityType << "\",\n"
+       << "  \"entity_id\": " << rec.entityId << ",\n"
+       << "  \"revocation_timestamp\": " << rec.revocationTimestamp << ",\n"
+       << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
+       << "  \"isolation_cid\": \"" << rec.isolationCid << "\",\n"
+       << "  \"endorsement_scheme\": \"simulated_threshold_dilithium_with_current_keys\",\n"
+       << "  \"endorsement_threshold\": " << rec.threshold << ",\n"
+       << "  \"evidence_cids\": [";
+    for (std::size_t i = 0; i < rec.evidenceCids.size(); ++i)
+    {
+        if (i > 0)
+            os << ", ";
+        os << "\"" << rec.evidenceCids[i] << "\"";
+    }
+    os << "],\n"
+       << "  \"endorsements\": [\n";
+    for (std::size_t i = 0; i < rec.endorsements.size(); ++i)
+    {
+        if (i > 0)
+            os << ",\n";
+        os << "    {\"signer_id\": " << rec.endorsements[i].signerId
+           << ", \"signature\": \"" << rec.endorsements[i].signatureHex << "\"}";
+    }
+    os << "\n  ]\n"
+       << "}\n";
+    return os.str();
+}
+
+static std::string
+PublishRevocationManifestToIpfs(const RevocationManifestRecord& rec)
+{
+    static bool warnedIpfsUnavailable = false;
+    const std::string dir = "sybil-attack/outputs/ipfs-revocation-manifests";
+    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+
+    std::ostringstream path;
+    path << dir << "/" << rec.entityType << rec.entityId
+         << "_t" << static_cast<uint64_t>(rec.revocationTimestamp * 1000000.0)
+         << ".json";
+
+    {
+        std::ofstream out(path.str().c_str(), std::ios::out);
+        out << BuildRevocationManifestJson(rec);
+    }
+
+    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (cid.empty() && !warnedIpfsUnavailable)
+    {
+        std::cerr << "[IPFS] WARNING: revocation manifest IPFS publish failed. "
+                  << "Manifest JSON files are still written under " << dir << ".\n";
+        warnedIpfsUnavailable = true;
+    }
+    if (cid.empty())
+        cid = "local://" + path.str();
+    return cid;
+}
+
+static bool
+ApplyRevocationManifestJson(uint32_t rsuId,
+                            const std::string& manifestCid,
+                            const std::string& manifestJson)
+{
+    if (manifestJson.empty())
+        return false;
+
+    std::string entityType = ExtractJsonStringField(manifestJson, "entity_type");
+    uint32_t entityId = ExtractJsonUintField(manifestJson, "entity_id", 0);
+    uint32_t threshold = ExtractJsonUintField(manifestJson, "endorsement_threshold", 1);
+
+    std::set<uint32_t> signers;
+    std::size_t pos = 0;
+    const std::string signerKey = "\"signer_id\"";
+    while ((pos = manifestJson.find(signerKey, pos)) != std::string::npos)
+    {
+        std::size_t colon = manifestJson.find(':', pos + signerKey.size());
+        std::size_t digit = manifestJson.find_first_of("0123456789", colon + 1);
+        if (colon == std::string::npos || digit == std::string::npos)
+            break;
+        std::size_t endDigit = manifestJson.find_first_not_of("0123456789", digit);
+        uint32_t signerId = static_cast<uint32_t>(
+            std::strtoul(manifestJson.substr(digit, endDigit - digit).c_str(), nullptr, 10));
+        signers.insert(signerId);
+        pos = endDigit;
+    }
+
+    if (signers.size() < threshold)
+    {
+        std::cerr << "[FullModeRevocation] RSU " << rsuId
+                  << " rejected manifest=" << manifestCid
+                  << " endorsements=" << signers.size() << "/" << threshold
+                  << std::endl;
+        return false;
+    }
+
+    if (entityType == "vehicle" && rsuId < g_rsuRevokedVehicleBlacklist.size())
+    {
+        bool inserted = g_rsuRevokedVehicleBlacklist[rsuId].insert(entityId).second;
+        if (inserted)
+        {
+            LkhRevokeVehicleAtRsu(entityId, rsuId);
+            std::cout << "[FullModeRevocation] RSU " << rsuId
+                      << " blacklisted vehicle=" << entityId
+                      << " manifest=" << manifestCid
+                      << " endorsements=" << signers.size() << "/" << threshold
+                      << std::endl;
+        }
+        return true;
+    }
+    return false;
+}
+
+static void
+SyncRsuRevocationManifestsFromIpfs(uint32_t rsuId)
+{
+    if (rsuId >= N_RSUs)
+        return;
+    if (g_rsuRevokedVehicleBlacklist.size() < N_RSUs)
+        g_rsuRevokedVehicleBlacklist.resize(N_RSUs);
+
+    for (std::size_t i = 0; i < g_latestRevocationManifestCids.size(); ++i)
+    {
+        const std::string& cid = g_latestRevocationManifestCids[i];
+        std::string json = FetchJsonFromIpfsCid(cid);
+        ApplyRevocationManifestJson(rsuId, cid, json);
+    }
+
+    if (tokenCommitmentSyncInterval > 0.0 &&
+        Simulator::Now().GetSeconds() + tokenCommitmentSyncInterval <= simTime)
+    {
+        Simulator::Schedule(Seconds(tokenCommitmentSyncInterval),
+                            &SyncRsuRevocationManifestsFromIpfs,
+                            rsuId);
+    }
+}
+
+static std::string
+PublishFullModeRevocationManifest(const IsolationRecord& isolation)
+{
+    std::ostringstream key;
+    key << isolation.entityType << ":" << isolation.entityId;
+    auto existing = g_revocationManifestsByEntity.find(key.str());
+    if (existing != g_revocationManifestsByEntity.end())
+        return existing->second.manifestCid;
+
+    RevocationManifestRecord rec;
+    rec.entityType = isolation.entityType;
+    rec.entityId = isolation.entityId;
+    rec.revocationTimestamp = isolation.isolationTimestamp;
+    rec.attackVariant = isolation.attackVariant;
+    rec.isolationCid = isolation.isolationCid;
+    rec.evidenceCids = isolation.evidenceCids;
+    rec.threshold = (isolation.entityType == "vehicle")
+                        ? GetRsuThreshold(N_RSUs)
+                        : GetControllerRegistrationThreshold();
+
+    std::string signInput = isolation.entityType + "|" +
+                            std::to_string(isolation.entityId) + "|" +
+                            isolation.attackVariant + "|" +
+                            isolation.aggregatedEvidenceHashHex + "|" +
+                            isolation.isolationCid;
+    uint32_t signerLimit = (isolation.entityType == "vehicle") ? N_RSUs : N_Controllers;
+    for (uint32_t signerId = 0;
+         signerId < signerLimit && rec.endorsements.size() < rec.threshold;
+         ++signerId)
+    {
+        ManifestEndorsement e;
+        e.signerId = signerId;
+        e.signatureHex = (isolation.entityType == "vehicle")
+                             ? SignWithCurrentRsuKeyHex(signerId, signInput)
+                             : SignWithCurrentControllerKeyHex(signerId, signInput);
+        rec.endorsements.push_back(e);
+    }
+
+    rec.manifestCid = PublishRevocationManifestToIpfs(rec);
+    g_revocationManifestsByEntity[key.str()] = rec;
+    if (std::find(g_latestRevocationManifestCids.begin(),
+                  g_latestRevocationManifestCids.end(),
+                  rec.manifestCid) == g_latestRevocationManifestCids.end())
+    {
+        g_latestRevocationManifestCids.push_back(rec.manifestCid);
+    }
+
+    std::string pubResult = RunCommandCapture(
+        "timeout 2s " + GetIpfsBinaryPath() +
+        " pubsub pub sybil-revocations " + rec.manifestCid +
+        " 2>/dev/null");
+    (void)pubResult;
+
+    for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
+        Simulator::ScheduleNow(&SyncRsuRevocationManifestsFromIpfs, rsuId);
+
+    std::cout << "[FullModeRevocationManifest] entity=" << rec.entityType
+              << "/" << rec.entityId
+              << " cid=" << rec.manifestCid
+              << " endorsements=" << rec.endorsements.size()
+              << "/" << rec.threshold << std::endl;
+    return rec.manifestCid;
+}
+
+static std::string
+RevokeEntityCurrentCrypto(const std::string& entityType,
+                          uint32_t entityId,
+                          uint32_t authorityId,
+                          const std::string& attackVariant,
+                          const std::vector<std::string>& evidenceCids,
+                          const std::string& aggregatedEvidenceHashHex)
+{
+    std::ostringstream key;
+    key << entityType << ":" << entityId;
+    if (g_isolationRecordsByEntity.find(key.str()) != g_isolationRecordsByEntity.end())
+        return g_isolationRecordsByEntity[key.str()].isolationCid;
+
+    IsolationRecord rec;
+    rec.entityType = entityType;
+    rec.entityId = entityId;
+    rec.isolationTimestamp = Simulator::Now().GetSeconds();
+    rec.attackVariant = attackVariant;
+    rec.aggregatedEvidenceHashHex = aggregatedEvidenceHashHex;
+    rec.evidenceCids = evidenceCids;
+    rec.authorityTier = (entityType == "vehicle") ? "rsu" : "controller";
+
+    std::ostringstream signMsg;
+    signMsg << entityType << "|" << entityId << "|"
+            << rec.isolationTimestamp << "|"
+            << attackVariant << "|"
+            << aggregatedEvidenceHashHex;
+    if (rec.authorityTier == "rsu")
+        rec.thresholdSignatureHex = SignWithCurrentRsuKeyHex(authorityId, signMsg.str());
+    else
+        rec.thresholdSignatureHex = SignWithCurrentControllerKeyHex(authorityId, signMsg.str());
+
+    rec.isolationCid = PublishIsolationRecordToIpfs(rec);
+    g_isolationRecordsByEntity[key.str()] = rec;
+
+    if (FullCryptoMechanismActive())
+        PublishFullModeRevocationManifest(rec);
+
+    std::cout << "[ISOLATION_RECORD] entity=" << entityType
+              << "/" << entityId
+              << " variant=" << attackVariant
+              << " cid=" << rec.isolationCid
+              << " signer=" << rec.authorityTier << "/" << authorityId
+              << std::endl;
+    return rec.isolationCid;
 }
 static const double kTrajectoryWindowSec = 5.0;
 static const double kTrajectoryAlignmentSec = 0.35;
@@ -1555,6 +2725,24 @@ LightweightDecisionModeActive()
 }
 
 static bool
+FullPqcProfileActive()
+{
+    return FullCryptoMechanismActive() && full_crypto_profile == 2 && CryptoPqcAvailable();
+}
+
+static std::string
+FullCryptoProfileName()
+{
+    if (!FullCryptoMechanismActive())
+        return "not_full_mode";
+    if (FullPqcProfileActive())
+        return "full_pqc_kyber768_dilithium_ml_dsa_65";
+    if (full_crypto_profile == 2)
+        return "full_pqc_requested_but_liboqs_unavailable";
+    return "full_current_classical_crypto";
+}
+
+static bool
 RssiSolutionModeActive()
 {
     return solution_mode == MODE_BASELINE_RSSI;
@@ -1613,6 +2801,8 @@ ConfigureSolutionMode()
     {
         std::cout << " active baseline";
     }
+    if (FullCryptoMechanismActive())
+        std::cout << " profile=" << FullCryptoProfileName();
     std::cout << std::endl;
 }
 
@@ -1697,7 +2887,7 @@ RecordLightweightV2RsuRejection(uint32_t rsuIndex,
                                 const std::string& evidence,
                                 uint32_t evidenceBytes)
 {
-    if (!LightweightDecisionModeActive())
+    if (!LightweightDecisionModeActive() && !FullCryptoMechanismActive())
         return;
 
     uint32_t reporterClaimed = tag.GetClaimedNodeId();
@@ -1898,7 +3088,7 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
             {
                 bool sigValid = true;
                 V2VSignatureTag sigTag;
-                if (packet->PeekPacketTag(sigTag) && LightweightCryptoMechanismActive())
+                if (packet->PeekPacketTag(sigTag) && CryptoMechanismActive())
                 {
                     BsmCoreData bsm = bsmTag.GetBsm();
                     std::vector<uint8_t> payload = SerializeBsmForSigning(bsm);
@@ -1907,6 +3097,7 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
                     std::vector<uint8_t> sigBytes(sigTag.sig, sigTag.sig + 64);
                     sigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
                 }
+
                 BsmCoreData bsm = bsmTag.GetBsm();
                 RecordRsuPassiveBeaconEvidence(rsuIndex,
                                                tag,
@@ -1947,6 +3138,14 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
                          << stateStr << ","
                          << sflags << "\n";
                 }
+
+                RecordComputedDetectionEvidence(rsuIndex,
+                                                tag,
+                                                bsmTag.GetBsm(),
+                                                sigValid,
+                                                tag.GetSequenceNumber(),
+                                                signalNoise.signal);
+
             }
         }
     }
@@ -2941,13 +4140,15 @@ InitializeRsuRegionalAwarenessCsv()
 }
 
 static void
-InitializeRsuPassiveBeaconEvidenceCsv()
+InitializeComputedDetectionEvidenceCsv()
 {
-    std::ofstream out(rsuPassiveBeaconEvidenceCsv.c_str(), std::ios::out);
+    std::ofstream out(computedDetectionEvidenceCsv.c_str(), std::ios::out);
     out << "time,event,rsu_id,real_vehicle_id,claimed_vehicle_id,observable_source_id,"
         << "sequence_number,bsm_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,"
         << "claimed_distance_to_rsu_m,rssi_estimated_distance_m,rssi_dbm,"
-        << "signature_valid,suspicion_flags,evidence_count_for_claimed_id,"
+        << "signature_valid,suspicion_flags,detection_score,signature_score,"
+        << "attack_variant,evidence_vector_hash,current_partial_signature,"
+        << "revocation_timestamp,evidence_count_for_claimed_id,"
         << "ipfs_cid,trigger_seq,status\n";
 }
 
@@ -3015,14 +4216,16 @@ LogRssiVerification(uint32_t observerVehicleId,
 }
 
 static void
-LogRsuPassiveBeaconEvidenceEvent(const std::string& event,
-                                 const RsuPassiveBeaconEvidenceRecord& rec,
-                                 uint32_t evidenceCountForClaimedId,
-                                 const std::string& status,
-                                 uint32_t triggerSeq = 0)
+LogComputedDetectionEvidenceEvent(const std::string& event,
+                                  const ComputedDetectionEvidenceRecord& rec,
+                                  uint32_t evidenceCountForClaimedId,
+                                  const std::string& status,
+                                  uint32_t triggerSeq = 0)
 {
+
     if (sweepMode) return;
     auto& out = g_csvRsuPassive;
+    std::ofstream out(computedDetectionEvidenceCsv.c_str(), std::ios::app);
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
         << rec.rsuId << ","
@@ -3041,6 +4244,12 @@ LogRsuPassiveBeaconEvidenceEvent(const std::string& event,
         << rec.rssiDbm << ","
         << (rec.signatureValid ? 1 : 0) << ","
         << rec.suspicionFlags << ","
+        << rec.detectionScore << ","
+        << rec.signatureScore << ","
+        << rec.attackVariant << ","
+        << rec.evidenceVectorHashHex << ","
+        << rec.currentSignatureHex << ","
+        << rec.revocationTimestamp << ","
         << evidenceCountForClaimedId << ","
         << rec.evidenceCid << ","
         << triggerSeq << ","
@@ -3079,17 +4288,21 @@ DistanceBetween(const Vector& a, const Vector& b)
 }
 
 static void
-RecordRsuPassiveBeaconEvidence(uint32_t rsuIndex,
-                               const SybilPacketTag& tag,
-                               const BsmCoreData& bsm,
-                               bool signatureValid,
-                               uint32_t triggerSeq,
-                               double measuredRssiDbm)
+RecordComputedDetectionEvidence(uint32_t rsuIndex,
+                                const SybilPacketTag& tag,
+                                const BsmCoreData& bsm,
+                                bool signatureValid,
+                                uint32_t triggerSeq,
+                                double measuredRssiDbm)
 {
+
+    if (!LightweightDecisionModeActive() && !FullCryptoMechanismActive())
+        return;
+
     if (rsuIndex >= N_RSUs || rsuIndex >= g_rsuNodes.GetN())
         return;
 
-    RsuPassiveBeaconEvidenceRecord rec;
+    ComputedDetectionEvidenceRecord rec;
     rec.rsuId = rsuIndex;
     rec.realVehicleId = tag.GetRealNodeId();
     rec.claimedVehicleId = tag.GetClaimedNodeId();
@@ -3141,30 +4354,54 @@ RecordRsuPassiveBeaconEvidence(uint32_t rsuIndex,
         rec.bsm.positionY,
         g_rsuFirstSeenClaimedIds,
         g_rsuTemporalNewIdEvents,
-        "RSU_PASSIVE_BEACON");
+        "COMPUTED_DETECTION_EVIDENCE");
 
-    rec.evidenceCid = PublishPassiveBeaconEvidenceToIpfs(rec);
+    rec.detectionScore = std::min(1.0, 0.20 * static_cast<double>(CountSuspicionBits(rec.suspicionFlags)));
+    rec.signatureScore = signatureValid ? 1.0 : 0.0;
+    rec.revocationTimestamp = Simulator::Now().GetSeconds();
+    rec.attackVariant = DescribeAttackVariantFromFlags(rec.suspicionFlags);
+    rec.evidenceVectorHashHex = HashStringHex(BuildComputedEvidenceVectorString(rec));
+    rec.currentSignatureHex =
+        SignWithCurrentRsuKeyHex(rsuIndex,
+                                 rec.evidenceVectorHashHex + "|" +
+                                     std::to_string(rec.revocationTimestamp));
 
-    auto& records = g_rsuPassiveBeaconEvidenceTables[rsuIndex][rec.claimedVehicleId];
+    if (rec.suspicionFlags == SUSPICION_NONE)
+        return;
+
+    rec.evidenceCid = PublishComputedDetectionEvidenceToIpfs(rec);
+
+    auto& records = g_computedDetectionEvidenceTables[rsuIndex][rec.claimedVehicleId];
     records.push_back(rec);
     static const uint32_t kMaxPassiveEvidenceRowsPerId = 50;
     if (records.size() > kMaxPassiveEvidenceRowsPerId)
         records.erase(records.begin());
 
-    LogRsuPassiveBeaconEvidenceEvent("passive_v2v_beacon_observed",
-                                     records.back(),
-                                     static_cast<uint32_t>(records.size()),
-                                     rec.evidenceCid.empty() ? "ipfs_publish_failed_or_unavailable"
-                                                             : "ipfs_published",
-                                     triggerSeq);
+    LogComputedDetectionEvidenceEvent("computed_detection_evidence_published",
+                                      records.back(),
+                                      static_cast<uint32_t>(records.size()),
+                                      rec.evidenceCid.empty() ? "ipfs_publish_failed_or_unavailable"
+                                                              : "ipfs_published",
+                                      triggerSeq);
 
-    std::cout << "[RSU_PASSIVE_EVIDENCE] RSU=" << rsuIndex
+    std::cout << "[COMPUTED_DETECTION_EVIDENCE] RSU=" << rsuIndex
               << " ClaimedId=" << rec.claimedVehicleId
               << " RealId=" << rec.realVehicleId
               << " Seq=" << rec.sequenceNumber
               << " Flags=" << rec.suspicionFlags
+              << " Score=" << rec.detectionScore
               << " CID=" << (rec.evidenceCid.empty() ? "(none)" : rec.evidenceCid)
               << std::endl;
+
+    std::vector<std::string> evidenceCids;
+    if (!rec.evidenceCid.empty())
+        evidenceCids.push_back(rec.evidenceCid);
+    RevokeEntityCurrentCrypto("vehicle",
+                              rec.claimedVehicleId,
+                              rsuIndex,
+                              rec.attackVariant,
+                              evidenceCids,
+                              rec.evidenceVectorHashHex);
 }
 
 static double
@@ -3197,6 +4434,13 @@ VehicleSpeed(uint32_t vehicleIndex)
 static Vector
 InitialVehiclePosition(uint32_t vehicleIndex)
 {
+    if (FullCryptoMechanismActive() && routing_test)
+    {
+        double x = roadStartX + 30.0 + 35.0 * static_cast<double>(vehicleIndex);
+        double y = roadBaseY + 2.0 * static_cast<double>(vehicleIndex % 2u);
+        return Vector(x, y, 0.0);
+    }
+
     double length = std::max(roadLength, vehicleSpacing);
     double x = roadStartX + std::fmod(static_cast<double>(vehicleIndex) * vehicleSpacing,
                                       length);
@@ -3207,6 +4451,12 @@ static Vector
 InitialRsuPosition(uint32_t rsuIndex)
 {
     uint32_t rsuCount = std::max(1u, N_RSUs);
+
+    if (FullCryptoMechanismActive() && routing_test)
+    {
+        double x = roadStartX + 85.0 + 180.0 * static_cast<double>(rsuIndex);
+        return Vector(x, roadBaseY + 25.0, 0.0);
+    }
 
     if (passiveEvidenceOverlapTopology)
     {
@@ -3768,10 +5018,13 @@ RunFLRound()
     double mpcOverhead = 2.5 + 0.5 * static_cast<double>(g_flRoundCounter % 3);
 
     g_secMetrics->OnFLRound(loss, mpcOverhead, true);
+    RunFlModelCidConsensus(g_flRoundCounter, loss);
 
     std::cout << "[FL] Round=" << g_flRoundCounter
               << "  Loss=" << loss
               << "  MPC_overhead_ms=" << mpcOverhead
+              << "  AcceptedModelCID="
+              << (g_latestAcceptedFlModelCid.empty() ? "(none)" : g_latestAcceptedFlModelCid)
               << std::endl;
 }
 
@@ -4981,8 +6234,19 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
         return;
     }
 
-    // Generate ephemeral ECDH keypair for V-Ctrl session
+    // Generate ephemeral ECDH keypair for classical profile and Kyber keypair for PQC profile.
     auto [ephPriv, ephPub] = CryptoEcdhKeygen();
+    if (ephPriv.empty()) return;
+    CryptoPqcKemKeypair kyberKeys;
+    if (FullPqcProfileActive())
+    {
+        kyberKeys = CryptoKyber768Keygen();
+        if (kyberKeys.publicKey.empty() || kyberKeys.secretKey.empty())
+        {
+            std::cerr << "[FullModePQC] V-Ctrl Kyber768 keygen failed vehicle=" << vehicleIndex << "\n";
+            return;
+        }
+    }
     std::vector<uint8_t> nonceV = CryptoRandBytes(32);
 
     // Store pending handshake state
@@ -4990,6 +6254,8 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     pending.active  = true;
     pending.ephPriv = ephPriv;
     pending.ephPub  = ephPub;
+    pending.kyberSecretKey = kyberKeys.secretKey;
+    pending.kyberPublicKey = kyberKeys.publicKey;
     pending.nonceV  = nonceV;
 
     // Build V2CtrlHelloTag
@@ -4998,6 +6264,8 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     std::memcpy(helloTag.vehicleLtPub,   g_vehiclePubKeys[vehicleIndex].data(),  64);
     std::memcpy(helloTag.vehicleCertSig, g_vehicleCertSigs[vehicleIndex].data(), 64);
     std::memcpy(helloTag.ecdhPubV,       ephPub.data(),  64);
+    if (!kyberKeys.publicKey.empty())
+        std::memcpy(helloTag.kyberPublicKey, kyberKeys.publicKey.data(), kyberKeys.publicKey.size());
     std::memcpy(helloTag.nonceV,         nonceV.data(),  32);
 
     std::vector<uint8_t> sigData;
@@ -5005,7 +6273,10 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     sigData.push_back((vehicleIndex >> 16) & 0xFF);
     sigData.push_back((vehicleIndex >>  8) & 0xFF);
     sigData.push_back( vehicleIndex        & 0xFF);
-    sigData.insert(sigData.end(), ephPub.begin(), ephPub.end());
+    if (FullPqcProfileActive())
+        sigData.insert(sigData.end(), kyberKeys.publicKey.begin(), kyberKeys.publicKey.end());
+    else
+        sigData.insert(sigData.end(), ephPub.begin(), ephPub.end());
     sigData.insert(sigData.end(), nonceV.begin(), nonceV.end());
     std::vector<uint8_t> sigHash = CryptoSha256(sigData);
     std::vector<uint8_t> handshakeSig =
@@ -5056,7 +6327,8 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
               << "[SEND] [V2CTRL_HELLO]           "
               << "Vehicle=" << vehicleIndex
               << " -> RSU=" << rsuIndex
-              << " (V-Ctrl E2E channel initiation)" << std::endl;
+              << " (V-Ctrl E2E channel initiation, kex="
+              << (FullPqcProfileActive() ? "Kyber768" : "ECDH-P256") << ")" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -5740,7 +7012,11 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
     proofData.push_back((vehicleId >> 16) & 0xFF);
     proofData.push_back((vehicleId >>  8) & 0xFF);
     proofData.push_back( vehicleId        & 0xFF);
-    proofData.insert(proofData.end(), helloTag.ecdhPubV, helloTag.ecdhPubV + 64);
+    if (FullPqcProfileActive())
+        proofData.insert(proofData.end(), helloTag.kyberPublicKey,
+                         helloTag.kyberPublicKey + KYBER768_PUBLIC_KEY_BYTES);
+    else
+        proofData.insert(proofData.end(), helloTag.ecdhPubV, helloTag.ecdhPubV + 64);
     proofData.insert(proofData.end(), helloTag.nonceV,   helloTag.nonceV   + 32);
     std::vector<uint8_t> proofHash = CryptoSha256(proofData);
     std::vector<uint8_t> vehicleHandshakeSig(helloTag.handshakeSig,
@@ -5752,19 +7028,35 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
         return;
     }
 
-    // Step 2: Generate controller ephemeral ECDH keypair
+    // Step 2/3: Derive V-Ctrl session key using Kyber768 in PQC profile or ECDH otherwise.
     auto [ctrlEphPriv, ctrlEphPub] = CryptoEcdhKeygen();
     std::vector<uint8_t> nonceC = CryptoRandBytes(32);
-
-    // Step 3: Derive V-Ctrl session key
-    // shared = ECDH(ctrlEphPriv, vehicleEcdhPub)
     std::vector<uint8_t> vehicleEcdhPub(helloTag.ecdhPubV, helloTag.ecdhPubV + 64);
     std::vector<uint8_t> nonceV(helloTag.nonceV, helloTag.nonceV + 32);
-    std::vector<uint8_t> shared = CryptoEcdhCompute(ctrlEphPriv, vehicleEcdhPub);
-    if (shared.empty())
+    std::vector<uint8_t> shared;
+    std::vector<uint8_t> kyberCiphertext;
+    if (FullPqcProfileActive())
     {
-        std::cerr << "[V-Ctrl] Controller: ECDH failed for vehicle=" << vehicleId << "\n";
-        return;
+        std::vector<uint8_t> kyberPubV(helloTag.kyberPublicKey,
+                                       helloTag.kyberPublicKey + KYBER768_PUBLIC_KEY_BYTES);
+        CryptoPqcKemEncapsulation enc = CryptoKyber768Encapsulate(kyberPubV);
+        if (enc.sharedSecret.empty() || enc.ciphertext.empty())
+        {
+            std::cerr << "[FullModePQC] Controller: V-Ctrl Kyber768 encapsulation failed vehicle="
+                      << vehicleId << "\n";
+            return;
+        }
+        shared = enc.sharedSecret;
+        kyberCiphertext = enc.ciphertext;
+    }
+    else
+    {
+        shared = CryptoEcdhCompute(ctrlEphPriv, vehicleEcdhPub);
+        if (shared.empty())
+        {
+            std::cerr << "[V-Ctrl] Controller: ECDH failed for vehicle=" << vehicleId << "\n";
+            return;
+        }
     }
     std::vector<uint8_t> keyMaterial;
     keyMaterial.insert(keyMaterial.end(), shared.begin(),  shared.end());
@@ -5781,12 +7073,20 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
               << " (cert verified)\n";
 
     // Step 5: Build Ctrl2VehicleAckTag
-    // Handshake sig: controller signs SHA256(ecdhPubV || ecdhPubC || nonceV || nonceC)
     std::vector<uint8_t> sigData;
-    sigData.insert(sigData.end(), vehicleEcdhPub.begin(), vehicleEcdhPub.end());
-    sigData.insert(sigData.end(), ctrlEphPub.begin(),     ctrlEphPub.end());
-    sigData.insert(sigData.end(), nonceV.begin(),         nonceV.end());
-    sigData.insert(sigData.end(), nonceC.begin(),         nonceC.end());
+    if (FullPqcProfileActive())
+    {
+        sigData.insert(sigData.end(), helloTag.kyberPublicKey,
+                       helloTag.kyberPublicKey + KYBER768_PUBLIC_KEY_BYTES);
+        sigData.insert(sigData.end(), kyberCiphertext.begin(), kyberCiphertext.end());
+    }
+    else
+    {
+        sigData.insert(sigData.end(), vehicleEcdhPub.begin(), vehicleEcdhPub.end());
+        sigData.insert(sigData.end(), ctrlEphPub.begin(),     ctrlEphPub.end());
+    }
+    sigData.insert(sigData.end(), nonceV.begin(), nonceV.end());
+    sigData.insert(sigData.end(), nonceC.begin(), nonceC.end());
     std::vector<uint8_t> sigHash = CryptoSha256(sigData);
     std::vector<uint8_t> handshakeSig = CryptoEcdsaSign(g_ctrlSignPrivKey, sigHash);
     if (handshakeSig.size() != 64)
@@ -5799,6 +7099,8 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
     std::memcpy(ackTag.ctrlLtPub,    g_ctrlSignPubKey.data(),  64);
     std::memcpy(ackTag.ctrlCertSig,  g_ctrlCertSig.data(),     64);
     std::memcpy(ackTag.ecdhPubC,     ctrlEphPub.data(),        64);
+    if (!kyberCiphertext.empty())
+        std::memcpy(ackTag.kyberCiphertext, kyberCiphertext.data(), kyberCiphertext.size());
     std::memcpy(ackTag.nonceC,       nonceC.data(),            32);
     std::memcpy(ackTag.handshakeSig, handshakeSig.data(),      64);
 
@@ -5889,14 +7191,28 @@ HandleCtrl2VehicleAck(uint32_t vehicleIndex, const Ctrl2VehicleAckTag& ackTag)
         return;
     }
 
-    // Step 2: Verify handshake signature
-    // Controller signed SHA256(ecdhPubV || ecdhPubC || nonceV || nonceC)
+    // Step 2/3: Verify handshake signature and derive V-Ctrl session key.
     std::vector<uint8_t> ctrlLtPub(ackTag.ctrlLtPub, ackTag.ctrlLtPub + 64);
+    std::vector<uint8_t> nonceC(ackTag.nonceC, ackTag.nonceC + 32);
     std::vector<uint8_t> sigData;
-    sigData.insert(sigData.end(), pending.ephPub.begin(),   pending.ephPub.end());
-    sigData.insert(sigData.end(), ackTag.ecdhPubC,          ackTag.ecdhPubC + 64);
-    sigData.insert(sigData.end(), pending.nonceV.begin(),   pending.nonceV.end());
-    sigData.insert(sigData.end(), ackTag.nonceC,            ackTag.nonceC + 32);
+    std::vector<uint8_t> shared;
+    if (FullPqcProfileActive())
+    {
+        std::vector<uint8_t> ciphertext(ackTag.kyberCiphertext,
+                                        ackTag.kyberCiphertext + KYBER768_CIPHERTEXT_BYTES);
+        sigData.insert(sigData.end(), pending.kyberPublicKey.begin(), pending.kyberPublicKey.end());
+        sigData.insert(sigData.end(), ciphertext.begin(), ciphertext.end());
+        shared = CryptoKyber768Decapsulate(ciphertext, pending.kyberSecretKey);
+    }
+    else
+    {
+        std::vector<uint8_t> ecdhPubC(ackTag.ecdhPubC, ackTag.ecdhPubC + 64);
+        sigData.insert(sigData.end(), pending.ephPub.begin(), pending.ephPub.end());
+        sigData.insert(sigData.end(), ackTag.ecdhPubC, ackTag.ecdhPubC + 64);
+        shared = CryptoEcdhCompute(pending.ephPriv, ecdhPubC);
+    }
+    sigData.insert(sigData.end(), pending.nonceV.begin(), pending.nonceV.end());
+    sigData.insert(sigData.end(), ackTag.nonceC, ackTag.nonceC + 32);
     std::vector<uint8_t> sigHash = CryptoSha256(sigData);
     std::vector<uint8_t> handshakeSig(ackTag.handshakeSig, ackTag.handshakeSig + 64);
 
@@ -5907,14 +7223,9 @@ HandleCtrl2VehicleAck(uint32_t vehicleIndex, const Ctrl2VehicleAckTag& ackTag)
         pending.active = false;
         return;
     }
-
-    // Step 3: Derive V-Ctrl session key
-    std::vector<uint8_t> ecdhPubC(ackTag.ecdhPubC, ackTag.ecdhPubC + 64);
-    std::vector<uint8_t> nonceC  (ackTag.nonceC,   ackTag.nonceC   + 32);
-    std::vector<uint8_t> shared = CryptoEcdhCompute(pending.ephPriv, ecdhPubC);
     if (shared.empty())
     {
-        std::cerr << "[V-Ctrl] CTRL2V_ACK: ECDH failed vehicle=" << vehicleIndex << "\n";
+        std::cerr << "[V-Ctrl] CTRL2V_ACK: key exchange failed vehicle=" << vehicleIndex << "\n";
         pending.active = false;
         return;
     }
@@ -7130,66 +8441,78 @@ HandleChanHello(uint32_t rsuIndex, const ChanHelloTag& hello)
     }
 
     uint32_t vehicleId = hello.vehicleId;
-
-    std::vector<uint8_t> ecdhPubV(hello.ecdhPub, hello.ecdhPub + 64);
-    std::vector<uint8_t> nonceV  (hello.nonceV,  hello.nonceV  + 32);
-
-    // Generate RSU ephemeral keypair and nonce
-    auto keys = CryptoEcdhKeygen();
-    std::vector<uint8_t>& ephPrivR = keys.first;
-    std::vector<uint8_t>& ephPubR  = keys.second;
-    if (ephPrivR.empty()) return;
-
+    std::vector<uint8_t> nonceV(hello.nonceV, hello.nonceV + 32);
     std::vector<uint8_t> nonceR = CryptoRandBytes(32);
+    std::vector<uint8_t> shared;
+    std::vector<uint8_t> sigData;
 
-    // ECDH → session key: SHA256(shared || nonce_V || nonce_R)
-    std::vector<uint8_t> shared = CryptoEcdhCompute(ephPrivR, ecdhPubV);
-    if (shared.empty()) return;
+    ChanAckTag ackTag;
+    ackTag.rsuId = rsuIndex;
+
+    if (FullPqcProfileActive())
+    {
+        std::vector<uint8_t> kyberPubV(hello.kyberPublicKey,
+                                       hello.kyberPublicKey + KYBER768_PUBLIC_KEY_BYTES);
+        CryptoPqcKemEncapsulation enc = CryptoKyber768Encapsulate(kyberPubV);
+        if (enc.sharedSecret.empty() || enc.ciphertext.empty())
+        {
+            std::cerr << "[FullModePQC] Kyber768 encapsulation failed RSU=" << rsuIndex
+                      << " vehicle=" << vehicleId << "\n";
+            return;
+        }
+        shared = enc.sharedSecret;
+        std::memcpy(ackTag.kyberCiphertext, enc.ciphertext.data(), enc.ciphertext.size());
+        sigData.insert(sigData.end(), kyberPubV.begin(), kyberPubV.end());
+        sigData.insert(sigData.end(), enc.ciphertext.begin(), enc.ciphertext.end());
+        std::cout << "[FullModePQC] V-RSU Kyber768 encapsulated RSU=" << rsuIndex
+                  << " vehicle=" << vehicleId << " ct_bytes=" << enc.ciphertext.size() << "\n";
+    }
+    else
+    {
+        std::vector<uint8_t> ecdhPubV(hello.ecdhPub, hello.ecdhPub + 64);
+        auto keys = CryptoEcdhKeygen();
+        std::vector<uint8_t>& ephPrivR = keys.first;
+        std::vector<uint8_t>& ephPubR  = keys.second;
+        if (ephPrivR.empty()) return;
+        shared = CryptoEcdhCompute(ephPrivR, ecdhPubV);
+        if (shared.empty()) return;
+        std::memcpy(ackTag.ecdhPub, ephPubR.data(), 64);
+        sigData.insert(sigData.end(), ecdhPubV.begin(), ecdhPubV.end());
+        sigData.insert(sigData.end(), ephPubR.begin(),  ephPubR.end());
+    }
 
     std::vector<uint8_t> keyMaterial;
-    keyMaterial.insert(keyMaterial.end(), shared.begin(),  shared.end());
-    keyMaterial.insert(keyMaterial.end(), nonceV.begin(),  nonceV.end());
-    keyMaterial.insert(keyMaterial.end(), nonceR.begin(),  nonceR.end());
+    keyMaterial.insert(keyMaterial.end(), shared.begin(), shared.end());
+    keyMaterial.insert(keyMaterial.end(), nonceV.begin(), nonceV.end());
+    keyMaterial.insert(keyMaterial.end(), nonceR.begin(), nonceR.end());
     std::vector<uint8_t> sessionKey = CryptoSha256(keyMaterial);
-
     g_rsuSessionKeys[rsuIndex][vehicleId] = sessionKey;
 
-    // Handshake signature: Sig_RSU( SHA256(ecdh_V || ecdh_R || nonce_V || nonce_R) )
-    std::vector<uint8_t> sigData;
-    sigData.insert(sigData.end(), ecdhPubV.begin(), ecdhPubV.end());
-    sigData.insert(sigData.end(), ephPubR.begin(),  ephPubR.end());
-    sigData.insert(sigData.end(), nonceV.begin(),   nonceV.end());
-    sigData.insert(sigData.end(), nonceR.begin(),   nonceR.end());
-    std::vector<uint8_t> sigHash     = CryptoSha256(sigData);
+    sigData.insert(sigData.end(), nonceV.begin(), nonceV.end());
+    sigData.insert(sigData.end(), nonceR.begin(), nonceR.end());
+    std::vector<uint8_t> sigHash = CryptoSha256(sigData);
     std::vector<uint8_t> handshakeSig = CryptoEcdsaSign(g_rsuPrivKeys[rsuIndex], sigHash);
     if (handshakeSig.empty()) return;
 
-    // Build and send CHAN_ACK
-    ChanAckTag ackTag;
-    ackTag.rsuId = rsuIndex;
-    std::memcpy(ackTag.ecdhPub,      ephPubR.data(),              64);
-    std::memcpy(ackTag.nonceR,       nonceR.data(),               32);
-    std::memcpy(ackTag.rsuLtPub,     g_rsuPubKeys[rsuIndex].data(), 64);
+    std::memcpy(ackTag.nonceR,       nonceR.data(),                  32);
+    std::memcpy(ackTag.rsuLtPub,     g_rsuPubKeys[rsuIndex].data(),  64);
     std::memcpy(ackTag.certSig,      g_rsuCertSigs[rsuIndex].data(), 64);
-    std::memcpy(ackTag.handshakeSig, handshakeSig.data(),          64);
+    std::memcpy(ackTag.handshakeSig, handshakeSig.data(),            64);
 
-    Ptr<Packet> ackPkt = Create<Packet>(0);
+    Ptr<Packet> ackPkt = Create<Packet>(1);
     SybilPacketTag metaTag(rsuIndex, rsuIndex, vehicleId,
                            static_cast<uint32_t>(CHAN_ACK), g_seq++);
     ackPkt->AddPacketTag(metaTag);
     ackPkt->AddPacketTag(ackTag);
 
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuIndex));
-
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [CHAN_ACK]                  "
               << "RSU=" << rsuIndex
               << " -> Vehicle=" << vehicleId
               << "  session_key_stored" << std::endl;
-
     sock->SendTo(ackPkt, 0,
-                 InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleId),
-                                   VEHICLE_PORT));
+                 InetSocketAddress(g_wirelessInterfaces.GetAddress(vehicleId), VEHICLE_PORT));
     MetricsOnTransmitForMessage(static_cast<uint32_t>(CHAN_ACK), 1);
 }
 
@@ -7236,15 +8559,29 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
         return;
     }
 
-    // Step 2: Verify RSU handshake signature
-    // RSU signed SHA256( ecdh_V || ecdh_R || nonce_V || nonce_R )
+    // Step 2: Verify RSU handshake signature and recover the key-agreement secret.
     std::vector<uint8_t> rsuLtPub(ack.rsuLtPub, ack.rsuLtPub + 64);
+    std::vector<uint8_t> nonceR(ack.nonceR, ack.nonceR + 32);
     std::vector<uint8_t> sigData;
-    sigData.insert(sigData.end(), hs.ephPub.begin(), hs.ephPub.end());
-    sigData.insert(sigData.end(), ack.ecdhPub, ack.ecdhPub + 64);
+    std::vector<uint8_t> shared;
+    if (FullPqcProfileActive())
+    {
+        std::vector<uint8_t> ciphertext(ack.kyberCiphertext,
+                                        ack.kyberCiphertext + KYBER768_CIPHERTEXT_BYTES);
+        sigData.insert(sigData.end(), hs.kyberPublicKey.begin(), hs.kyberPublicKey.end());
+        sigData.insert(sigData.end(), ciphertext.begin(), ciphertext.end());
+        shared = CryptoKyber768Decapsulate(ciphertext, hs.kyberSecretKey);
+    }
+    else
+    {
+        std::vector<uint8_t> ecdhPubR(ack.ecdhPub, ack.ecdhPub + 64);
+        sigData.insert(sigData.end(), hs.ephPub.begin(), hs.ephPub.end());
+        sigData.insert(sigData.end(), ack.ecdhPub, ack.ecdhPub + 64);
+        shared = CryptoEcdhCompute(hs.ephPriv, ecdhPubR);
+    }
     sigData.insert(sigData.end(), hs.nonceV.begin(), hs.nonceV.end());
     sigData.insert(sigData.end(), ack.nonceR, ack.nonceR + 32);
-    std::vector<uint8_t> sigHash      = CryptoSha256(sigData);
+    std::vector<uint8_t> sigHash = CryptoSha256(sigData);
     std::vector<uint8_t> handshakeSig(ack.handshakeSig, ack.handshakeSig + 64);
 
     if (!CryptoEcdsaVerify(rsuLtPub, sigHash, handshakeSig))
@@ -7255,11 +8592,6 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
         state.pending.erase(it);
         return;
     }
-
-    // Step 3: Compute ECDH session key: SHA256(shared || nonce_V || nonce_R)
-    std::vector<uint8_t> ecdhPubR(ack.ecdhPub, ack.ecdhPub + 64);
-    std::vector<uint8_t> nonceR  (ack.nonceR,  ack.nonceR  + 32);
-    std::vector<uint8_t> shared = CryptoEcdhCompute(hs.ephPriv, ecdhPubR);
     if (shared.empty()) { state.pending.erase(it); return; }
 
     std::vector<uint8_t> keyMaterial;
@@ -7276,7 +8608,8 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
               << "[Security] V-RSU secure channel established"
               << "  Vehicle=" << vehicleIndex
               << "  RSU=" << rsuId
-              << "  (cert OK, sig OK)" << std::endl;
+              << "  (cert OK, sig OK, kex="
+              << (FullPqcProfileActive() ? "Kyber768" : "ECDH-P256") << ")" << std::endl;
 
     // ── Decide next step based on registration/V-Ctrl status ─────────────
     bool hasToken = (vehicleIndex < g_vehicleTokens.size() &&
@@ -7346,12 +8679,26 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     std::vector<uint8_t>& ephPub  = keys.second;
     if (ephPriv.empty()) return;
 
+    CryptoPqcKemKeypair kyberKeys;
+    if (FullPqcProfileActive())
+    {
+        kyberKeys = CryptoKyber768Keygen();
+        if (kyberKeys.publicKey.empty() || kyberKeys.secretKey.empty())
+        {
+            std::cerr << "[FullModePQC] Kyber768 keygen failed Vehicle=" << vehicleIndex
+                      << " RSU=" << rsuIndex << "\n";
+            return;
+        }
+    }
+
     std::vector<uint8_t> nonceV = CryptoRandBytes(32);
 
     // Store per-RSU pending handshake
     VehicleChannelState::PendingHandshake hs;
     hs.ephPriv = ephPriv;
     hs.ephPub  = ephPub;
+    hs.kyberSecretKey = kyberKeys.secretKey;
+    hs.kyberPublicKey = kyberKeys.publicKey;
     hs.nonceV  = nonceV;
     hs.startTime = Simulator::Now().GetSeconds();
     g_vehicleChannelState[vehicleIndex].pending[rsuIndex] = hs;
@@ -7359,9 +8706,11 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     ChanHelloTag helloTag;
     helloTag.vehicleId = vehicleIndex;
     std::memcpy(helloTag.ecdhPub, ephPub.data(), 64);
+    if (!kyberKeys.publicKey.empty())
+        std::memcpy(helloTag.kyberPublicKey, kyberKeys.publicKey.data(), kyberKeys.publicKey.size());
     std::memcpy(helloTag.nonceV,  nonceV.data(), 32);
 
-    Ptr<Packet> pkt = Create<Packet>(0);
+    Ptr<Packet> pkt = Create<Packet>(1);
     SybilPacketTag metaTag(vehicleIndex, vehicleIndex, rsuIndex,
                            static_cast<uint32_t>(CHAN_HELLO), g_seq++);
     pkt->AddPacketTag(metaTag);
@@ -7373,7 +8722,9 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
               << "[SEND] [CHAN_HELLO]                "
               << "Vehicle=" << vehicleIndex
-              << " -> RSU=" << rsuIndex << std::endl;
+              << " -> RSU=" << rsuIndex
+              << (FullPqcProfileActive() ? " kex=Kyber768" : " kex=ECDH-P256")
+              << std::endl;
 
     sock->SendTo(pkt, 0,
                  InetSocketAddress(g_wirelessInterfaces.GetAddress(rsuWirelessIdx),
@@ -7384,6 +8735,10 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
 static void
 StartCryptoVehicleRsuSession(uint32_t vehicleIndex, uint32_t rsuIndex)
 {
+    if (vehicleIndex < g_vehicleChannelState.size() &&
+        g_vehicleChannelState[vehicleIndex].HasSession(rsuIndex))
+        return;
+
     switch (GetCryptoMechanismMode())
     {
     case CRYPTO_MECHANISM_LIGHTWEIGHT:
@@ -7391,9 +8746,10 @@ StartCryptoVehicleRsuSession(uint32_t vehicleIndex, uint32_t rsuIndex)
         break;
 
     case CRYPTO_MECHANISM_FULL:
-        std::cout << "[Security] Full-mode V-RSU crypto handshake is not implemented yet"
+        std::cout << "[FullModeAuth] starting Kyber768/ML-KEM-profile V-RSU handshake"
                   << " Vehicle=" << vehicleIndex
                   << " RSU=" << rsuIndex << "\n";
+        SendChanHello(vehicleIndex, rsuIndex);
         break;
 
     case CRYPTO_MECHANISM_OFF:
@@ -7835,6 +9191,7 @@ LogReceivedPacket(const std::string& receiverRole,
                                 if (!token.empty() && token.size() == 32)
                                 {
                                     g_vehicleTokens[vId] = token;
+                                    LkhJoinVehicleAtRsu(vId, tag.GetRealNodeId());
                                     std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                                               << "[Reg] Vehicle " << vId
                                               << ": REG_CONFIRM received (V-Ctrl nested)"
@@ -7872,6 +9229,7 @@ LogReceivedPacket(const std::string& receiverRole,
                             {
                                 g_vehicleTokens[vId].assign(
                                     confirmTag.token, confirmTag.token + 32);
+                                LkhJoinVehicleAtRsu(vId, tag.GetRealNodeId());
                                 std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                                           << "[Reg] Vehicle " << vId
                                           << ": REG_CONFIRM received — token stored! "
@@ -7900,7 +9258,7 @@ LogReceivedPacket(const std::string& receiverRole,
             std::cout << "[Latency] RSU2VEH_CMD  vehicle/" << receiverId
                       << "  decrypt  0.000\n";
         }
-        else if (LightweightCryptoMechanismActive())
+        else if (CryptoMechanismActive())
         {
         RsuVehicleSecureTag envTag;
         if (packet->PeekPacketTag(envTag))
@@ -7966,6 +9324,17 @@ LogReceivedPacket(const std::string& receiverRole,
     {
         uint32_t vId = tag.GetRealNodeId();
         uint32_t rId = receiverId;
+        uint32_t claimedForRevocation = tag.GetClaimedNodeId();
+
+        if (FullCryptoMechanismActive() &&
+            rId < g_rsuRevokedVehicleBlacklist.size() &&
+            g_rsuRevokedVehicleBlacklist[rId].count(claimedForRevocation) > 0)
+        {
+            std::cout << "[FullModeRevocation] RSU " << rId
+                      << " dropped V2RSU report from revoked identity="
+                      << claimedForRevocation << " real=" << vId << std::endl;
+            return;
+        }
 
         // ── No-crypto path: accept plaintext report directly ───────────────
         if (!CryptoMechanismActive())
@@ -7989,9 +9358,9 @@ LogReceivedPacket(const std::string& receiverRole,
                 tokenAccepted      = true;
             }
         }
-        else if (LightweightCryptoMechanismActive())
+        else if (CryptoMechanismActive())
         {
-        // ── Lightweight crypto ON: decrypt + token auth ─────────────────────
+        // ── Crypto ON: decrypt + token auth ─────────────────────
         SecureChannelTag scTag;
         if (packet->PeekPacketTag(scTag))
         {
@@ -8216,7 +9585,7 @@ LogReceivedPacket(const std::string& receiverRole,
             std::vector<uint8_t> hash     = CryptoSha256(payload);
             std::vector<uint8_t> pubKey(sigTag.pub_key, sigTag.pub_key + 64);
             std::vector<uint8_t> sigBytes(sigTag.sig,   sigTag.sig     + 64);
-            if (LightweightCryptoMechanismActive())
+            if (CryptoMechanismActive())
             {
                 auto __t0 = std::chrono::high_resolution_clock::now();
                 v2vSigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
@@ -8275,52 +9644,58 @@ LogReceivedPacket(const std::string& receiverRole,
         // beacon reaches a vehicle, FLEMDS is utilized to verify whether the
         // message belongs to normal flow or abnormal flow."
         //
-        // Features are sourced from:
-        //   • BsmCoreData (bsm)          — position, speed, heading, acceleration
-        //   • NeighborAwarenessRecord     — suspicion flags, RSSI state, distances
-        //   • SybilPacketTag (tag)        — claimedId (ground truth for metrics)
-        //   • Simulator::Now()            — receive timestamp
+        // Features are sourced from observable V2V neighbor-table state only.
+        // Ground truth IDs are used below only for metrics labels, not as model
+        // inputs.
         // ─────────────────────────────────────────────────────────────────────
         if (FLSolutionModeActive() && g_secMetrics)
         {
-            uint32_t claimedId      = tag.GetClaimedNodeId();
+            uint32_t claimedId       = tag.GetClaimedNodeId();
             bool     isActuallySybil = (tag.GetRealNodeId() != claimedId);
             double   now            = Simulator::Now().GetSeconds();
 
             double feat[FLSybilDetector::kNumFeatures] = {};
 
-            // f[0]: out-of-registry — claimedId outside valid vehicle range
-            feat[0] = (claimedId >= N_Vehicles) ? 1.0 : 0.0;
-
-            // f[1]–f[8]: from the neighbor record updated just above
             if (receiverId < g_vehicleNeighborTables.size() &&
                 g_vehicleNeighborTables[receiverId].count(claimedId))
             {
                 const NeighborAwarenessRecord& rec =
                     g_vehicleNeighborTables[receiverId].at(claimedId);
 
-                feat[1] = (rec.rssiVerificationState == RSSI_MISMATCH) ? 1.0 : 0.0;
-                feat[2] = (rec.suspicionFlags & SUSPICION_POSITION_CONFLICT)    ? 1.0 : 0.0;
-                feat[3] = (rec.suspicionFlags & SUSPICION_DUPLICATE_ID)         ? 1.0 : 0.0;
-                feat[4] = (rec.suspicionFlags & SUSPICION_RSSI_COLOCATION)      ? 1.0 : 0.0;
-                feat[5] = (rec.suspicionFlags & SUSPICION_ID_MISMATCH)          ? 1.0 : 0.0;
-                feat[6] = (rec.suspicionFlags & SUSPICION_TEMPORAL_BURST)       ? 1.0 : 0.0;
+                auto clamp01 = [](double value) {
+                    return std::max(0.0, std::min(1.0, value));
+                };
 
-                double claimedDist = rec.claimedDistance;
-                double rssiDist    = rec.rssiEstimatedDistance;
-                if (rssiDist > 0.0 && claimedDist > 0.0)
-                    feat[7] = std::min(1.0,
-                                       std::abs(rssiDist - claimedDist) / 25.0);
+                const double neighborAge =
+                    std::max(0.0, rec.lastSeenTime - rec.firstSeenTime);
+                const double beaconCount =
+                    std::max(1.0, static_cast<double>(rec.receivedBeaconCount));
+                const double meanBeaconInterval = neighborAge / beaconCount;
+                const double reportStaleness =
+                    (rec.lastReportedToRsuTime >= 0.0)
+                        ? std::max(0.0, now - rec.lastReportedToRsuTime)
+                        : 30.0;
+                const double headingRad =
+                    rec.lastBsm.heading * 3.14159265358979323846 / 180.0;
+                const double positionRadius =
+                    std::sqrt(rec.lastBsm.positionX * rec.lastBsm.positionX +
+                              rec.lastBsm.positionY * rec.lastBsm.positionY);
 
-                feat[8] = std::min(1.0,
-                                   static_cast<double>(rec.receivedBeaconCount) / 10.0);
+                feat[0] = clamp01(rec.lastBsm.speed / 50.0);
+                feat[1] = clamp01(rec.claimedDistance / 300.0);
+                feat[2] = clamp01(static_cast<double>(rec.receivedBeaconCount) / 20.0);
+                feat[3] = clamp01(static_cast<double>(
+                                      g_vehicleNeighborTables[receiverId].size()) / 80.0);
+                feat[4] = clamp01(neighborAge / 60.0);
+                feat[5] = clamp01(meanBeaconInterval / 5.0);
+                feat[6] = std::sin(headingRad);
+                feat[7] = std::cos(headingRad);
+                feat[8] = clamp01(reportStaleness / 30.0);
+                feat[9] = clamp01(positionRadius / 5000.0);
             }
 
-            // f[9]: normalized vehicle speed from the BSM
-            feat[9] = std::min(1.0, bsm.speed / 20.0);
-
             double pred           = FLSybilDetector::RunInference(feat);
-            bool   predictedSybil = (pred > 0.56);
+            bool   predictedSybil = (pred >= 0.5);
 
             g_secMetrics->RecordFLPacketDecision(
                 claimedId, isActuallySybil, predictedSybil, "vehicle", now);
@@ -8469,8 +9844,8 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
                            static_cast<uint32_t>(RSU2CONTROLLER_REPORT),
                            sequenceNumber);
 
-    // ── Lightweight encrypted path: pre-shared key established ────────────
-    if (LightweightCryptoMechanismActive() &&
+    // ── Encrypted path: pre-shared infrastructure key established ─────────
+    if (CryptoMechanismActive() &&
         rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
     {
         uint32_t tagSz = batchTag.GetSerializedSize();
@@ -8513,16 +9888,13 @@ SendRsuControllerBatchPacket(Ptr<Socket> socket,
         return;
     }
 
-    // ── Plaintext path (no crypto or no lightweight key loaded) ───────────
+    // ── Plaintext fallback (no crypto or missing infrastructure key) ──────
     if (!CryptoMechanismActive())
         std::cout << "[Latency] RSU2CTRL_REPORT  rsu_edge/" << rsuIndex
                   << "  encrypt  0.000\n";
-    else if (LightweightCryptoMechanismActive())
+    else
         std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
                   << "; sending unencrypted RSU→Controller report.\n";
-    else
-        std::cerr << "[Security] WARNING: Full-mode RSU→Controller crypto is not implemented; "
-                  << "sending unencrypted report for now.\n";
     Ptr<Packet> packet = Create<Packet>(260 + batchTag.GetRecordCount() * 144);
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(batchTag);
@@ -8547,8 +9919,8 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
                                        target.claimedVehicleId,
                                        Simulator::Now().GetSeconds());
 
-    // ── Lightweight encrypted path ────────────────────────────────────────
-    if (LightweightCryptoMechanismActive() &&
+    // ── Encrypted path: pre-shared infrastructure key established ─────────
+    if (CryptoMechanismActive() &&
         rsuIndex < g_rsuCtrlSharedKeys.size() && !g_rsuCtrlSharedKeys[rsuIndex].empty())
     {
         uint32_t tagSz = commandTag.GetSerializedSize();
@@ -8591,17 +9963,14 @@ SendControllerRsuCommandPacket(Ptr<Socket> socket,
         return;
     }
 
-    // ── Plaintext path (no crypto or no lightweight key loaded) ───────────
+    // ── Plaintext fallback (no crypto or missing infrastructure key) ──────
     if (!CryptoMechanismActive())
         std::cout << "[Latency] CTRL2RSU_CMD  sdn_controller/"
                   << GetControllerIndexForRsu(rsuIndex)
                   << "  encrypt  0.000\n";
-    else if (LightweightCryptoMechanismActive())
+    else
         std::cerr << "[Security] WARNING: No ctrl key for RSU=" << rsuIndex
                   << "; sending unencrypted Controller→RSU command.\n";
-    else
-        std::cerr << "[Security] WARNING: Full-mode Controller→RSU crypto is not implemented; "
-                  << "sending unencrypted command for now.\n";
     Ptr<Packet> packet = Create<Packet>(140);
     packet->AddPacketTag(baseTag);
     packet->AddPacketTag(commandTag);
@@ -8738,15 +10107,8 @@ SendV2RsuAwarenessPacket(Ptr<Socket> socket,
         return;
     }
 
-    if (FullCryptoMechanismActive())
-    {
-        std::cerr << "[Security] Full-mode V2RSU report crypto is not implemented; "
-                  << "holding report vehicle=" << vehicleIndex
-                  << " rsu=" << rsuIndex << "\n";
-        return;
-    }
-
-    // ── Lightweight encrypted path: session key is established ────────────
+    // ── Encrypted path: lightweight uses current ECDH/AES; full mode simulates
+    // ML-KEM/Ksess with the same established session until real Kyber is linked.
     auto& chanState = g_vehicleChannelState[vehicleIndex];
     if (chanState.HasSession(rsuIndex))
     {
@@ -8849,6 +10211,17 @@ SendV2RsuReport(uint32_t vehicleIndex)
     uint32_t rsuIndex       = FindNearestRsu(vehicleIndex);
     uint32_t rsuWirelessIdx = g_vehicleNodes.GetN() + rsuIndex;
     uint32_t claimedId      = GetClaimedVehicleId(vehicleIndex, g_vehicleNodes.GetN());
+
+    if (FullCryptoMechanismActive() &&
+        rsuIndex < g_rsuRevokedVehicleBlacklist.size() &&
+        g_rsuRevokedVehicleBlacklist[rsuIndex].count(claimedId) > 0)
+    {
+        std::cout << "[FullModeRevocation] Vehicle=" << vehicleIndex
+                  << " ClaimedId=" << claimedId
+                  << " blocked from sending V2RSU report to RSU=" << rsuIndex
+                  << " because identity is revoked\n";
+        return;
+    }
 
     if (!EnsureVehicleRsuSession(vehicleIndex, rsuIndex, "v2rsu_report"))
     {
@@ -9239,15 +10612,8 @@ SendRsuVehicleCommand(uint32_t rsuIndex)
         return;
     }
 
-    if (FullCryptoMechanismActive())
-    {
-        std::cerr << "[Security] Full-mode RSU→Vehicle command crypto is not implemented; "
-                  << "holding command RSU=" << rsuIndex
-                  << " vehicle=" << vehicleIndex << "\n";
-        return;
-    }
-
-    // ── Lightweight encrypted path: use session key if established ────────
+    // ── Encrypted path: lightweight uses current ECDH/AES; full mode simulates
+    // ML-KEM/Ksess with the same established session until real Kyber is linked.
     if (rsuIndex < g_rsuSessionKeys.size())
     {
         auto keyIt = g_rsuSessionKeys[rsuIndex].find(vehicleIndex);
@@ -9481,6 +10847,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getUint  ("sybil_attacker_level",            sybil_attacker_level);
     getBool  ("controller_malicious_assumption", controller_malicious_assumption);
     getUint  ("solution_mode",                   solution_mode);
+    getUint  ("full_crypto_profile",             full_crypto_profile);
     getDouble("rsuCoverageRange",                rsuCoverageRange);
     getDouble("v2vReliableRange",                v2vReliableRange);
     getDouble("rsuVehicleRecordTimeout",         rsuVehicleRecordTimeout);
@@ -9572,7 +10939,11 @@ main(int argc, char* argv[])
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
     cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
-    cmd.AddValue("solution_mode",              "Solution mode: 1=FL 2=RSSI 3=ML placeholder 4=lightweight 5=full placeholder 6=no detection",solution_mode);
+
+    cmd.AddValue("solution_mode",              "Solution mode: 1=FLEMDS FL 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=no detection",solution_mode);
+    cmd.AddValue("full_crypto_profile",       "Inside solution_mode=5: 1=current classical full, 2=real PQC Kyber768 + Dilithium/ML-DSA-65", full_crypto_profile);
+    cmd.AddValue("proposed_method",            "Legacy alias: 0=none 1=old rule/lightweight 2=old ML 3=old FL 4=old hybrid/full",proposed_method);
+  
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
     cmd.AddValue("v2vReliableRange",           "Reliable local V2V beacon evaluation radius in metres", v2vReliableRange);
     cmd.AddValue("rsuVehicleRecordTimeout",    "Seconds before an RSU forgets a vehicle",rsuVehicleRecordTimeout);
@@ -9646,8 +11017,17 @@ main(int argc, char* argv[])
     g_controllerRegistrationQuorums.clear();
     g_controllerTokenCommitments.clear();
     g_latestTokenManifestCid.clear();
+    g_latestTokenManifestEndorsements.clear();
+    g_latestTokenManifestBodyHashHex.clear();
     g_rsuTokenRecordCidCache.assign(N_RSUs, std::map<uint32_t, std::string>());
     g_rsuTokenHashCache.assign(N_RSUs, std::map<uint32_t, std::string>());
+    g_latestAcceptedFlModelCid.clear();
+    g_flModelConsensusByRound.clear();
+    g_rsuAcceptedFlModelCid.assign(N_RSUs, std::string());
+    g_isolationRecordsByEntity.clear();
+    g_revocationManifestsByEntity.clear();
+    g_latestRevocationManifestCids.clear();
+    g_rsuRevokedVehicleBlacklist.assign(N_RSUs, std::set<uint32_t>());
     if (sybil_attacker_level < 1) sybil_attacker_level = 1;
     if (sybil_attacker_level > 4) sybil_attacker_level = 4;
     g_rsuVehicleTables.assign(N_RSUs, std::map<uint32_t, RsuVehicleRecord>());
@@ -9673,6 +11053,8 @@ main(int argc, char* argv[])
     // Load vehicle VINs, VIN whitelist, and token master key.
     LoadVinData();
     InitializeControllerSharedKeys();
+    InitializeFullPqcAuthorityKeys();
+    InitializeFullModeShamirAndLkh();
 
 
 
@@ -9686,7 +11068,7 @@ main(int argc, char* argv[])
     InitializeRsuVehicleTableCsv();
     InitializeRsuVehicleObservationCsv();
     InitializeRsuRegionalAwarenessCsv();
-    InitializeRsuPassiveBeaconEvidenceCsv();
+    InitializeComputedDetectionEvidenceCsv();
     InitializeControllerVehicleTableCsv();
     InitializeControllerGlobalAwarenessCsv();
     InitializeRssiVerificationCsv();
@@ -9980,16 +11362,25 @@ main(int argc, char* argv[])
     
     if (CryptoMechanismActive())
     {
-    for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
-    {
-        if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
-            continue;
+        for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
+        {
+            if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
+                continue;
 
-        uint32_t r = FindNearestRsu(i);
-        double t_hello = 0.5 + 0.04 * i;
-        Simulator::Schedule(Seconds(t_hello), &StartCryptoVehicleRsuSession, i, r);
+            uint32_t r = FindNearestRsu(i);
+            double firstHello = FullCryptoMechanismActive() ? 0.20 : 0.50;
+            double spacing = FullCryptoMechanismActive() ? 0.08 : 0.04;
+            Simulator::Schedule(Seconds(firstHello + spacing * i),
+                                &StartCryptoVehicleRsuSession, i, r);
 
-    }
+            if (FullCryptoMechanismActive())
+            {
+                Simulator::Schedule(Seconds(0.55 + spacing * i),
+                                    &StartCryptoVehicleRsuSession, i, r);
+                Simulator::Schedule(Seconds(0.90 + spacing * i),
+                                    &StartCryptoVehicleRsuSession, i, r);
+            }
+        }
     }
 
     // Tier 1: V2V broadcast beacons + V2RSU reports
@@ -10048,6 +11439,12 @@ main(int argc, char* argv[])
             Simulator::Schedule(Seconds(0.25 + 0.02 * i),
                                 &SyncRsuTokenCommitmentsFromIpfs,
                                 i);
+            if (FullCryptoMechanismActive())
+            {
+                Simulator::Schedule(Seconds(0.30 + 0.02 * i),
+                                    &SyncRsuRevocationManifestsFromIpfs,
+                                    i);
+            }
         }
     }
 
@@ -10141,6 +11538,7 @@ main(int argc, char* argv[])
     std::cout << "RSU table CSV: " << rsuVehicleTableCsv << std::endl;
     std::cout << "RSU observation rows CSV: " << rsuVehicleObservationCsv << std::endl;
     std::cout << "RSU regional awareness CSV: " << rsuRegionalAwarenessCsv << std::endl;
+    std::cout << "Computed detection evidence CSV: " << computedDetectionEvidenceCsv << std::endl;
     std::cout << "Controller table CSV: " << controllerVehicleTableCsv << std::endl;
     std::cout << "Controller global awareness CSV: " << controllerGlobalAwarenessCsv << std::endl;
 

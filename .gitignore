@@ -33,6 +33,9 @@
 !sybil-attack/notebooks/**
 .ipynb_checkpoints/
 !sybil-attack/mobility_routing_test_report.md
+!sybil-attack/fl/
+!sybil-attack/fl/scripts/
+!sybil-attack/fl/scripts/**
 
 # Keep runtime CSVs loaded directly by the simulation.
 !sybil-attack/inputs/*.csv
@@ -93,6 +96,6 @@ __pycache__/
 *.swo
 .DS_Store
 Thumbs.db
-*:Zone.Identifier
 
 !rssi_mcc_sweep.py
+*.Zone.Identifier

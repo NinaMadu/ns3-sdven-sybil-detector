@@ -31,6 +31,10 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 
+#ifdef HAVE_LIBOQS
+#include <oqs/oqs.h>
+#endif
+
 #include <utility>
 
 #include <cstdint>
@@ -368,6 +372,176 @@ CryptoAesGcmDecrypt(const std::vector<uint8_t>& key,
     EVP_CIPHER_CTX_free(ctx);
     if (!ok) return {};
     return plaintext;
+}
+
+
+// ---------------------------------------------------------------------------
+// Open Quantum Safe wrappers used by full-mode PQC profile.
+// Kyber768 is the KEM used for ML-KEM-style session establishment.
+// ML-DSA-65 is the standardized name for Dilithium level-3 signatures.
+// ---------------------------------------------------------------------------
+
+struct CryptoPqcKemKeypair
+{
+    std::vector<uint8_t> publicKey;
+    std::vector<uint8_t> secretKey;
+};
+
+struct CryptoPqcKemEncapsulation
+{
+    std::vector<uint8_t> ciphertext;
+    std::vector<uint8_t> sharedSecret;
+};
+
+struct CryptoPqcSignatureKeypair
+{
+    std::vector<uint8_t> publicKey;
+    std::vector<uint8_t> secretKey;
+};
+
+inline bool
+CryptoPqcAvailable()
+{
+#ifdef HAVE_LIBOQS
+    return true;
+#else
+    return false;
+#endif
+}
+
+inline CryptoPqcKemKeypair
+CryptoKyber768Keygen()
+{
+    CryptoPqcKemKeypair out;
+#ifdef HAVE_LIBOQS
+    OQS_KEM* kem = OQS_KEM_new(OQS_KEM_alg_kyber_768);
+    if (!kem) return out;
+    out.publicKey.resize(kem->length_public_key);
+    out.secretKey.resize(kem->length_secret_key);
+    if (OQS_KEM_keypair(kem, out.publicKey.data(), out.secretKey.data()) != OQS_SUCCESS)
+    {
+        out.publicKey.clear();
+        out.secretKey.clear();
+    }
+    OQS_KEM_free(kem);
+#endif
+    return out;
+}
+
+inline CryptoPqcKemEncapsulation
+CryptoKyber768Encapsulate(const std::vector<uint8_t>& publicKey)
+{
+    CryptoPqcKemEncapsulation out;
+#ifdef HAVE_LIBOQS
+    OQS_KEM* kem = OQS_KEM_new(OQS_KEM_alg_kyber_768);
+    if (!kem) return out;
+    if (publicKey.size() != kem->length_public_key)
+    {
+        OQS_KEM_free(kem);
+        return out;
+    }
+    out.ciphertext.resize(kem->length_ciphertext);
+    out.sharedSecret.resize(kem->length_shared_secret);
+    if (OQS_KEM_encaps(kem, out.ciphertext.data(), out.sharedSecret.data(), publicKey.data()) != OQS_SUCCESS)
+    {
+        out.ciphertext.clear();
+        out.sharedSecret.clear();
+    }
+    OQS_KEM_free(kem);
+#endif
+    return out;
+}
+
+inline std::vector<uint8_t>
+CryptoKyber768Decapsulate(const std::vector<uint8_t>& ciphertext,
+                          const std::vector<uint8_t>& secretKey)
+{
+    std::vector<uint8_t> sharedSecret;
+#ifdef HAVE_LIBOQS
+    OQS_KEM* kem = OQS_KEM_new(OQS_KEM_alg_kyber_768);
+    if (!kem) return sharedSecret;
+    if (ciphertext.size() != kem->length_ciphertext ||
+        secretKey.size() != kem->length_secret_key)
+    {
+        OQS_KEM_free(kem);
+        return sharedSecret;
+    }
+    sharedSecret.resize(kem->length_shared_secret);
+    if (OQS_KEM_decaps(kem, sharedSecret.data(), ciphertext.data(), secretKey.data()) != OQS_SUCCESS)
+        sharedSecret.clear();
+    OQS_KEM_free(kem);
+#endif
+    return sharedSecret;
+}
+
+inline CryptoPqcSignatureKeypair
+CryptoDilithiumMlDsa65Keygen()
+{
+    CryptoPqcSignatureKeypair out;
+#ifdef HAVE_LIBOQS
+    OQS_SIG* sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+    if (!sig) return out;
+    out.publicKey.resize(sig->length_public_key);
+    out.secretKey.resize(sig->length_secret_key);
+    if (OQS_SIG_keypair(sig, out.publicKey.data(), out.secretKey.data()) != OQS_SUCCESS)
+    {
+        out.publicKey.clear();
+        out.secretKey.clear();
+    }
+    OQS_SIG_free(sig);
+#endif
+    return out;
+}
+
+inline std::vector<uint8_t>
+CryptoDilithiumMlDsa65Sign(const std::vector<uint8_t>& secretKey,
+                           const std::vector<uint8_t>& message)
+{
+    std::vector<uint8_t> signature;
+#ifdef HAVE_LIBOQS
+    OQS_SIG* sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+    if (!sig) return signature;
+    if (secretKey.size() != sig->length_secret_key)
+    {
+        OQS_SIG_free(sig);
+        return signature;
+    }
+    signature.resize(sig->length_signature);
+    size_t signatureLen = 0;
+    if (OQS_SIG_sign(sig, signature.data(), &signatureLen,
+                     message.data(), message.size(), secretKey.data()) != OQS_SUCCESS)
+    {
+        signature.clear();
+    }
+    else
+    {
+        signature.resize(signatureLen);
+    }
+    OQS_SIG_free(sig);
+#endif
+    return signature;
+}
+
+inline bool
+CryptoDilithiumMlDsa65Verify(const std::vector<uint8_t>& publicKey,
+                             const std::vector<uint8_t>& message,
+                             const std::vector<uint8_t>& signature)
+{
+#ifdef HAVE_LIBOQS
+    OQS_SIG* sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_65);
+    if (!sig) return false;
+    bool ok = publicKey.size() == sig->length_public_key &&
+              signature.size() <= sig->length_signature &&
+              OQS_SIG_verify(sig, message.data(), message.size(),
+                             signature.data(), signature.size(), publicKey.data()) == OQS_SUCCESS;
+    OQS_SIG_free(sig);
+    return ok;
+#else
+    (void)publicKey;
+    (void)message;
+    (void)signature;
+    return false;
+#endif
 }
 
 #pragma GCC diagnostic pop
