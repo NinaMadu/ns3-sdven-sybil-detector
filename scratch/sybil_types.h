@@ -1416,7 +1416,9 @@ enum SybilAttackType
     ATTACK_INSIDER_INDIRECT                = 4,  ///< Fake IDs injected via a relay node
     ATTACK_MALICIOUS_RSU                   = 5,  ///< Compromised RSU fabricates vehicle reports
     ATTACK_MALICIOUS_SDN_CONTROLLER        = 6,  ///< Compromised controller manipulates commands
-    ATTACK_SEQUENTIAL_1234                 = 7   ///< Run attacks 1→2→3→4 back-to-back, one per time phase (ML dataset mode)
+    ATTACK_SEQUENTIAL_1234                 = 7,  ///< Run attacks 1→2→3→4 back-to-back, one per time phase (ML dataset mode)
+    ATTACK_ZONE_CONCURRENT                 = 8,  ///< Multiple attack variants concurrent in geographic zones (FL federation dataset)
+    ATTACK_SEQUENTIAL_ALL6                 = 9   ///< Run attacks 1→2→3→4→5→6 back-to-back, full 7-class dataset
 };
 
 // ---------------------------------------------------------------------------
