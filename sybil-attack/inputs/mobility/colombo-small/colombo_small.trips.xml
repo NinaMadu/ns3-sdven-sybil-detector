@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- generated on 2026-05-17 12:36:47.792971 by randomTrips.py UNKNOWN
+  options: -n colombo_small.net.xml -o colombo_small.trips.xml -r colombo_small.rou.xml -b 0 -e 60 -p 2
+-->
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <trip id="0" depart="0.00" from="24775231#2" to="-1206019218"/>
+    <trip id="1" depart="2.00" from="-390001790#6" to="-391272225#1"/>
+    <trip id="2" depart="4.00" from="389274955#8" to="356689197#0"/>
+    <trip id="3" depart="6.00" from="50159548#2" to="-233499011#6"/>
+    <trip id="4" depart="8.00" from="-8111662#1" to="-143399474#0"/>
+    <trip id="5" depart="10.00" from="-389274955#13" to="1492931272"/>
+    <trip id="6" depart="12.00" from="-143399474#3" to="-390001790#2"/>
+    <trip id="7" depart="14.00" from="356689196" to="232605038"/>
+    <trip id="8" depart="16.00" from="-389274955#13" to="233499011#3"/>
+    <trip id="9" depart="18.00" from="393272862" to="-1095856774#0"/>
+    <trip id="10" depart="20.00" from="393272861" to="356689199#2"/>
+    <trip id="11" depart="22.00" from="-48891133" to="-389274955#2"/>
+    <trip id="12" depart="24.00" from="557373233" to="-557370434"/>
+    <trip id="13" depart="26.00" from="-233499011#15" to="-233598704#0"/>
+    <trip id="14" depart="28.00" from="47014121#0" to="233499614"/>
+    <trip id="15" depart="30.00" from="393272862" to="389274955#10"/>
+    <trip id="16" depart="32.00" from="143399474#0" to="747178294"/>
+    <trip id="17" depart="34.00" from="-590259484" to="232726895"/>
+    <trip id="18" depart="36.00" from="467592551#3" to="233589890"/>
+    <trip id="19" depart="38.00" from="48677467#0" to="233499011#15"/>
+    <trip id="20" depart="40.00" from="389274955#1" to="-173112630"/>
+    <trip id="21" depart="42.00" from="-389274955#2" to="-503485093"/>
+    <trip id="22" depart="44.00" from="-233499011#1" to="-391272225#4"/>
+    <trip id="23" depart="46.00" from="-233499011#2" to="-487441123"/>
+    <trip id="24" depart="48.00" from="24745878#0" to="-8111662#1"/>
+    <trip id="25" depart="50.00" from="-557373230" to="-390001790#6"/>
+    <trip id="26" depart="52.00" from="-390001790#4" to="590259485"/>
+    <trip id="27" depart="54.00" from="356689196" to="233589300"/>
+    <trip id="28" depart="56.00" from="-24745880" to="389274955#10"/>
+    <trip id="29" depart="58.00" from="-233598704#0" to="1095856769"/>
+</routes>

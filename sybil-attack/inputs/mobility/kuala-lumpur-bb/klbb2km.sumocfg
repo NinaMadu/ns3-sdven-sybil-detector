@@ -1,0 +1,18 @@
+<configuration>
+  <input>
+    <net-file value="klbb2km.net.xml"/>
+    <route-files value="klbb2km.rou.xml"/>
+    <additional-files value="klbb2km_vtypes.add.xml,klbb2km_rsus_poi.add.xml,klbb2km_keepalive.add.xml"/>
+  </input>
+  <time>
+    <begin value="0"/>
+    <end value="300"/>
+    <step-length value="0.1"/>
+  </time>
+  <processing>
+    <time-to-teleport value="60"/>
+  </processing>
+  <gui_only>
+    <delay value="100"/>
+  </gui_only>
+</configuration>

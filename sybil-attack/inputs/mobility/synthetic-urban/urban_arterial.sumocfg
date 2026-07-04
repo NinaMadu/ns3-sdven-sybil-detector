@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<configuration><input><net-file value="urban_arterial.net.xml" /><route-files value="urban_arterial.rou.xml" /></input><time><begin value="0" /><end value="12.0" /></time><output><fcd-output value="sumo_fcd.xml" /><fcd-output.geo value="false" /><step-length value="0.5" /></output></configuration>

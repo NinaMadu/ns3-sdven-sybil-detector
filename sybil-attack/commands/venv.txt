@@ -1,0 +1,89 @@
+# =============================================================================
+# Virtual Environment Commands
+# Working directory: ~/FYP/ns-allinone-3.35/ns-3.35
+# Venv location   : .venv/   (Python 3.10)
+# =============================================================================
+
+# ── Activate / Deactivate ─────────────────────────────────────────────────────
+
+# Activate
+source .venv/bin/activate
+
+# Deactivate (run inside the venv)
+deactivate
+
+
+# ── Install / Sync Packages ───────────────────────────────────────────────────
+
+# Install all packages from requirements.txt
+pip install -r requirements.txt
+
+# Install notebook + data science packages (first time setup)
+pip install jupyter notebook pandas numpy matplotlib seaborn scipy
+
+# Install a single new package
+pip install <package-name>
+
+# Upgrade a package
+pip install --upgrade <package-name>
+
+
+# ── Update requirements.txt ───────────────────────────────────────────────────
+
+# Overwrite requirements.txt with all currently installed packages
+pip freeze > requirements.txt
+
+# Append only newly installed packages (manual — compare before/after)
+pip freeze > requirements_new.txt
+diff requirements.txt requirements_new.txt
+
+
+# ── Jupyter Notebook ──────────────────────────────────────────────────────────
+
+# Start Jupyter Notebook (opens in browser, notebooks at sybil-attack/notebooks/)
+jupyter notebook --notebook-dir=sybil-attack/notebooks
+
+# Start Jupyter Lab (modern UI)
+jupyter lab --notebook-dir=sybil-attack/notebooks
+
+# Start on a specific port (useful if default 8888 is taken)
+jupyter notebook --notebook-dir=sybil-attack/notebooks --port=8889
+
+# Start without opening browser (WSL / headless)
+jupyter notebook --notebook-dir=sybil-attack/notebooks --no-browser
+
+# List running Jupyter servers
+jupyter notebook list
+
+# Stop a specific Jupyter server (replace port)
+jupyter notebook stop 8888
+
+
+# ── Restart Jupyter Kernel (from inside notebook) ────────────────────────────
+# Kernel menu → Restart Kernel              (clears all variables, keeps outputs)
+# Kernel menu → Restart Kernel & Run All    (fresh run of entire notebook)
+# Kernel menu → Interrupt Kernel            (stop a long-running cell)
+
+
+# ── Quit Jupyter ─────────────────────────────────────────────────────────────
+# In the terminal where jupyter is running:
+Ctrl + C        # then confirm with y
+
+# Or from the notebook browser UI:
+# File → Shut Down
+
+
+# ── Register venv as a Jupyter kernel (run once) ─────────────────────────────
+pip install ipykernel
+python -m ipykernel install --user --name=sybil-venv --display-name "Python (sybil-venv)"
+
+# After this, select "Python (sybil-venv)" from the kernel picker in the notebook.
+
+
+# ── Quick Reference ───────────────────────────────────────────────────────────
+# Full startup sequence from scratch:
+#   cd ~/FYP/ns-allinone-3.35/ns-3.35
+#   source .venv/bin/activate
+#   pip install jupyter notebook pandas numpy matplotlib seaborn scipy
+#   pip freeze > requirements.txt
+#   jupyter notebook --notebook-dir=sybil-attack/notebooks --no-browser

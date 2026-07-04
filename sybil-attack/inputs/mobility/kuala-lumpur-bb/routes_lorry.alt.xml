@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-06-12 15:13:29 by Eclipse SUMO duarouter Version 1.12.0
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
+
+    <input>
+        <net-file value="/root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml"/>
+        <additional-files value="/root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_vtypes.add.xml"/>
+        <route-files value="/root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_lorry.xml"/>
+    </input>
+
+    <output>
+        <output-file value="/root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/routes_lorry.xml"/>
+        <alternatives-output value="/root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/routes_lorry.alt.xml"/>
+    </output>
+
+    <report>
+        <no-warnings value="true"/>
+        <ignore-errors value="true"/>
+    </report>
+
+</configuration>
+-->
+
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <vType id="lorry" length="7.50" maxSpeed="11.11" vClass="truck" guiShape="truck" width="2.40" accel="1.0" decel="3.5" sigma="0.3"/>
+    <vehicle id="1" type="lorry" depart="60.00">
+        <routeDistribution last="0">
+            <route cost="116.19" probability="1.00000000" edges="755081029 772537515#2 1300412145 436312122#0 772537516 1113253996#0 605458573#0 605458573#0-AddedOffRampEdge 135510594#0 1179663429 252085185#0 252085185#4 772007905 1179663428 1333615673#0 625563911#4"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="2" type="lorry" depart="120.00">
+        <routeDistribution last="0">
+            <route cost="101.22" probability="1.00000000" edges="772267429#1 1195532992 771989744#0 771728989 771997963 616849240#0 1179663426 1179663404 278000391#0 252085334#0 252085334#1 252085334#1-AddedOffRampEdge 770414060 1187560044 -1188814177 1187560043 754779354#0 -754779354#0"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="3" type="lorry" depart="180.00">
+        <routeDistribution last="0">
+            <route cost="251.96" probability="1.00000000" edges="163080912#0 -163080912#1 -163080910#3 740625861#1 740625861#1-AddedOffRampEdge 1030098086 1178715616 758645515#0-AddedOnRampEdge 758645515#0 772514940#0 740625860 772514937#0 772514937#0-AddedOffRampEdge 1494760254 170059723-AddedOnRampEdge 170059723 1179663427#0 1179663404 278000391#0 252085334#0 252085334#1 252085334#1-AddedOffRampEdge 770414060 1187560044 1187560045#0 770414059 1218447623#0 4585482#0 4585482#2 4585482#4 771696236#0 -848894232#1 604766993#0 604546193 -1290815719 -1307631404#1"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="4" type="lorry" depart="240.00">
+        <routeDistribution last="0">
+            <route cost="127.67" probability="1.00000000" edges="1167928176 1167928175 772463865 772463864 772463863#0 1108917995#0 318470207#0 -1346302472#5 -1346302472#1 28271278#0 138210740#0 698411996#2 772270861 772227065 403470387 403470388 773809451 135508897 318470203 318470203-AddedOffRampEdge"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="5" type="lorry" depart="300.00">
+        <routeDistribution last="0">
+            <route cost="97.95" probability="1.00000000" edges="604535881 1383033130 848894231 604546198 606928398#0 606928397#0 4579536#0 4579536#5 698411583#0 772270865#1 698411996#2 772270861 772270860 1180372752#0 318470205 805998056 403470389#0"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="6" type="lorry" depart="360.00">
+        <routeDistribution last="0">
+            <route cost="153.99" probability="1.00000000" edges="1174598084 1175797444 170059723-AddedOnRampEdge 170059723 1179663427#0 1179663404 278000391#0 252085334#0 28271273#0 -1346302472#1 28271278#0 138210740#0 698411996#2 772270863 1132678911 1132678912#2 772231795#0 472093471"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="7" type="lorry" depart="420.00">
+        <routeDistribution last="0">
+            <route cost="138.13" probability="1.00000000" edges="771989745 1349496891#1 771728989 771997963 616849240#0 1179663426 1179663404 278000391#0 252085334#0 252085334#1 252085334#1-AddedOffRampEdge 770414060 1187560044 1187560045#0 770414059 1218447623#0 4585482#0 4585482#2 4585482#4 1157823048#2 1157823048#6 -1157823048#8"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="8" type="lorry" depart="480.00">
+        <routeDistribution last="0">
+            <route cost="175.25" probability="1.00000000" edges="771743389#0 772217965 1224033669 772224336 773809451 135508897 318470203 318470203-AddedOffRampEdge 403472568 740625858#0 1178715616 758645515#0-AddedOnRampEdge 758645515#0 772514940#0 740625860 772514937#0 772514937#0-AddedOffRampEdge 1116067654 1116067654-AddedOffRampEdge 169211072#0 169211072#1 169211072#3 169211072#4 1494760253#0 772525377 824070041 740625861#0"/>
+        </routeDistribution>
+    </vehicle>
+    <vehicle id="9" type="lorry" depart="540.00">
+        <routeDistribution last="0">
+            <route cost="114.05" probability="1.00000000" edges="1346302472#2 -1346302472#5 -1304089134#1 252085334#1 252085334#1-AddedOffRampEdge 770414060 1187560044 -1188814177 1187560046#0 1179663414#1 252085683#0 772537515#2 1300412145 436312122#0 772537516 1113253996#0"/>
+        </routeDistribution>
+    </vehicle>
+</routes>

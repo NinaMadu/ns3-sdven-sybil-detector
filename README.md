@@ -1,163 +1,227 @@
-# NS-3 SDVEN Sybil Detector
+# NS-3 SDVEN Sybil Attack Simulation
 
-This repository contains selected project files for an ns-3.35 SDVEN Sybil attack simulation. It does not contain the full ns-3 simulator source tree.
+This branch is the clean attack-implementation base for the ns-3.35 SDVEN
+Sybil simulation.
 
-The main simulation files are:
+The repository should track only the simulation source, scenario configs,
+security/input generators, and input data needed to reproduce runs. Generated
+outputs and result artifacts must stay untracked.
 
-- `scratch/Sybil-Developing.cc`
-- `scratch/Sybil-Developing-Improved.cc`
-- `sybil-attack/`
+## Requirement
 
-## What The Simulation Does
-
-The improved simulation creates a small SDVEN-style network:
-
-```text
-Vehicles <-> RSUs <-> SDN Controller
-```
-
-It sends tagged UDP packets for:
-
-- vehicle-to-vehicle beacons
-- vehicle-to-RSU reports
-- RSU-to-controller reports
-- controller-to-RSU commands
-- RSU-to-vehicle commands
-
-The simulation writes communication logs and NetAnim output under `sybil-attack/outputs/`.
-
-## Requirements
-
-Each team member must already have ns-3.35 installed and working.
-
-Example ns-3 path:
-
-```bash
-~/FYP/ns-allinone-3.35/ns-3.35
-```
-
-Build ns-3 first if needed:
-
-```bash
-cd ~/FYP/ns-allinone-3.35/ns-3.35
-./waf build
-```
-
-## Recommended Setup
-
-Do not clone this repo directly into an existing `ns-3.35` folder. Clone it somewhere separate, then copy the project files into ns-3.
-
-```bash
-cd ~/FYP
-git clone https://github.com/NinaMadu/ns3-sdven-sybil-detector.git
-cd ns3-sdven-sybil-detector
-```
-
-Copy files into your ns-3.35 folder:
-
-```bash
-cp scratch/Sybil-Developing.cc ~/FYP/ns-allinone-3.35/ns-3.35/scratch/
-cp scratch/Sybil-Developing-Improved.cc ~/FYP/ns-allinone-3.35/ns-3.35/scratch/
-cp -r sybil-attack ~/FYP/ns-allinone-3.35/ns-3.35/
-```
-
-Adjust the destination path if your ns-3.35 folder is somewhere else.
-
-## Run The Simulation
-
-From the ns-3.35 root:
-
-```bash
-cd ~/FYP/ns-allinone-3.35/ns-3.35
-./waf --run "scratch/Sybil-Developing-Improved"
-```
-
-Minimal packet movement test:
-
-```bash
-./waf --run "scratch/Sybil-Developing-Improved --routing_test=0 --N_Vehicles=2 --N_RSUs=1 --simTime=6"
-```
-
-Larger test:
-
-```bash
-./waf --run "scratch/Sybil-Developing-Improved --routing_test=0 --N_Vehicles=20 --N_RSUs=4 --simTime=20"
-```
-
-## Output Files
-
-The simulation writes outputs such as:
+This repository is the project overlay for an existing ns-3.35 installation; it
+does not track the full ns-3 source tree. Each team member should place these
+files in the ns-3.35 root where `./waf` is available, for example:
 
 ```text
-sybil-attack/outputs/communication_log.csv
-sybil-attack/outputs/sybil-developing-netanim.xml
+ns-allinone-3.35/ns-3.35/
+  scratch/
+  sybil-attack/
+  waf
 ```
 
-Open the XML file with NetAnim:
+## Project Layout
 
-```bash
-cd ~/FYP/ns-allinone-3.35/netanim-3.108
-./NetAnim
-```
+```text
+scratch/
+  Sybil-Developing-Improved.cc   Main ns-3 simulation entry point
+  sybil_attacks.h                Sybil attack scenarios and scheduling
+  sybil_crypto.h                 Security helpers
+  sybil_metrics.h                Evaluation metrics and CSV writers
+  sybil_types.h                  Shared packet/data structures
 
-Then choose the XML trace file from `ns-3.35/sybil-attack/outputs/`.
-
-## Updating From GitHub
-
-To get the latest project files:
-
-```bash
-cd ~/FYP/ns3-sdven-sybil-detector
-git pull origin main
-```
-
-Then copy the files into ns-3 again:
-
-```bash
-cp scratch/Sybil-Developing.cc ~/FYP/ns-allinone-3.35/ns-3.35/scratch/
-cp scratch/Sybil-Developing-Improved.cc ~/FYP/ns-allinone-3.35/ns-3.35/scratch/
-cp -r sybil-attack ~/FYP/ns-allinone-3.35/ns-3.35/
-```
-
-## Committing Changes
-
-After editing files inside ns-3.35, copy the changed project files back into this cloned repo:
-
-```bash
-cp ~/FYP/ns-allinone-3.35/ns-3.35/scratch/Sybil-Developing.cc ~/FYP/ns3-sdven-sybil-detector/scratch/
-cp ~/FYP/ns-allinone-3.35/ns-3.35/scratch/Sybil-Developing-Improved.cc ~/FYP/ns3-sdven-sybil-detector/scratch/
-cp -r ~/FYP/ns-allinone-3.35/ns-3.35/sybil-attack ~/FYP/ns3-sdven-sybil-detector/
-```
-
-Check what changed:
-
-```bash
-cd ~/FYP/ns3-sdven-sybil-detector
-git status
-```
-
-Stage only wanted files:
-
-```bash
-git add README.md
-git add scratch/Sybil-Developing.cc
-git add scratch/Sybil-Developing-Improved.cc
-git add sybil-attack
-```
-
-Commit and push:
-
-```bash
-git commit -m "Describe the change"
-git push origin main
-```
-
-Before starting new work, always pull first:
-
-```bash
-git pull origin main
+sybil-attack/
+  configs/                       Scenario configuration files
+  inputs/                        Tracked runtime inputs
+    *.csv                        Security keys, VINs, token inputs
+    mobility/
+      colombo-small/             Colombo OSM/SUMO network, routes, FCD, ns-2 trace
+      synthetic-urban/           Synthetic SUMO network, routes, FCD, ns-2 trace
+  security/                      Python scripts that generate input keys/VINs
+  outputs/                       Generated run outputs, ignored by Git
 ```
 
 ## Git Tracking Rules
 
-This repo intentionally tracks only the selected Sybil project files. It should not track the full ns-3.35 source tree, build outputs, temporary files, or Windows `Zone.Identifier` metadata files.
+Track:
+
+- `README.md`
+- `.gitignore`
+- `scratch/Sybil-Developing-Improved.cc`
+- `scratch/sybil_*.h`
+- `sybil-attack/configs/**`
+- `sybil-attack/inputs/*.csv`
+- `sybil-attack/inputs/mobility/**`
+- `sybil-attack/security/**`
+
+Do not track:
+
+- `sybil-attack/outputs/**`
+- evaluation run folders
+- visualizations
+- NetAnim XML outputs
+- logs, plots, PCAPs, temporary files, and build/cache artifacts
+
+## Build
+
+From the ns-3.35 root:
+
+```bash
+./waf build
+```
+
+## Run
+
+Quick smoke test:
+
+```bash
+./waf --run "Sybil-Developing-Improved --config=sybil-attack/configs/quick_test.cfg"
+```
+
+No-detection attack baseline:
+
+```bash
+./waf --run "Sybil-Developing-Improved --config=sybil-attack/configs/no_detection.cfg"
+```
+
+Baseline1 FL placeholder scenario:
+
+```bash
+./waf --run "Sybil-Developing-Improved --config=sybil-attack/configs/sybil_fl_detection.cfg"
+```
+
+Manual command example:
+
+```bash
+./waf --run "Sybil-Developing-Improved --routing_test=false --N_Vehicles=10 --N_RSUs=2 --simTime=60 --sybil_attack_enabled=true --sybil_attack_type=2 --sybil_attack_percentage=40 --solution_mode=4"
+```
+
+Solution/detection mode uses `solution_mode`:
+
+```text
+1 = Baseline1 FL Detection placeholder
+2 = Baseline2 RSSI Detection placeholder
+3 = Baseline3 ML Detection placeholder
+4 = Lightweight Mode
+5 = Full Mode placeholder
+6 = No Detection
+```
+
+Only modes 4 and 6 are implemented at this stage. Placeholder modes are
+selectable and labelled in metrics, but they intentionally keep detection logic
+disabled so their behavior is not mixed with the lightweight solution.
+
+Mobility mode is selected with `mobility_mode`:
+
+```text
+1 = test network constant-velocity mobility
+2 = programmed bounded-road mobility
+3 = SUMO synthetic urban trace
+4 = SUMO Colombo-small trace
+5 = reserved third SUMO/ns-2 trace placeholder
+```
+
+Examples:
+
+```bash
+./waf --run "Sybil-Developing-Improved --config=sybil-attack/configs/baseline.cfg --mobility_mode=2"
+./waf --run "Sybil-Developing-Improved --routing_test=false --mobility_mode=3 --N_Vehicles=12 --N_RSUs=3 --simTime=12"
+./waf --run "Sybil-Developing-Improved --routing_test=false --mobility_mode=4 --N_Vehicles=10 --N_RSUs=5 --simTime=60"
+./waf --run "Sybil-Developing-Improved --mobility_mode=5 --mobilityMode5TraceFile=sybil-attack/inputs/mobility/<scenario>/<trace>.tcl"
+```
+
+Mode 2 is the current controlled baseline mobility: vehicles move along a
+bounded multi-lane road with configurable road length, lanes, spacing, and
+speed range. Modes 3-5 replay SUMO-generated ns-2 mobility traces through
+ns-3's `Ns2MobilityHelper`; mode 4 also loads Colombo RSU positions from
+`colombo_small_rsus_300m.csv` by default. Mode 5 is intentionally a placeholder
+until the third SUMO scenario is generated.
+
+Each SUMO mode has independent config keys so scenarios can be maintained
+without changing the C++ logic:
+
+```text
+mobilityMode3Name
+mobilityMode3TraceFile
+mobilityMode3RsuPositionFile
+
+mobilityMode4Name
+mobilityMode4TraceFile
+mobilityMode4RsuPositionFile
+
+mobilityMode5Name
+mobilityMode5TraceFile
+mobilityMode5RsuPositionFile
+```
+
+For one-off experiments, `mobilityTraceFile` and `mobilityRsuPositionFile` can
+override the selected SUMO mode without editing the scenario defaults.
+
+## Inputs
+
+Runtime inputs live in `sybil-attack/inputs/` and should be committed when they
+are needed to reproduce a simulation.
+
+The security/key inputs currently stay directly under `sybil-attack/inputs/`
+because the C++ simulation loads those exact paths:
+
+```text
+sybil-attack/inputs/vehicle_keys.csv
+sybil-attack/inputs/rsu_keys.csv
+sybil-attack/inputs/ca_keys.csv
+sybil-attack/inputs/controller_keys.csv
+sybil-attack/inputs/vehicle_vins.csv
+sybil-attack/inputs/valid_vins.csv
+sybil-attack/inputs/token_master_key.csv
+```
+
+Mobility and SUMO inputs are grouped by scenario:
+
+```text
+sybil-attack/inputs/mobility/<scenario-name>/
+  <scenario>.net.xml              SUMO network
+  <scenario>.rou.xml              route definitions
+  <scenario>_fcd.xml              SUMO floating-car trace
+  <scenario>_mobility.tcl         ns-2 mobility trace for ns-3
+  <scenario>_rsus.csv             optional RSU placement input
+
+sybil-attack/inputs/mobility/colombo-small/
+  colombo_small_bbox.osm.xml      OSM extract used to build the network
+  colombo_small.netccfg           SUMO netconvert config
+  colombo_small.net.xml           SUMO network
+  colombo_small.trips.xml         Trip definitions
+  colombo_small.rou.xml           Route definitions
+  colombo_small.rou.alt.xml       Alternate route output
+  colombo_small_fcd.xml           SUMO floating-car trace
+  colombo_small_mobility.tcl      ns-2 mobility trace for ns-3
+  colombo_small_rsus_300m.csv     RSU placement input
+
+sybil-attack/inputs/mobility/synthetic-urban/
+  urban_arterial.nod.xml          SUMO nodes
+  urban_arterial.edg.xml          SUMO edges
+  urban_arterial.net.xml          SUMO network
+  urban_arterial.rou.xml          Route definitions
+  urban_arterial.sumocfg          SUMO run config
+  sumo_fcd.xml                    SUMO floating-car trace
+  sumo_mobility.tcl               ns-2 mobility trace for ns-3
+```
+
+The simulation can generate missing key/VIN inputs through:
+
+```bash
+python3 sybil-attack/security/generate_ca_rsu_keys.py --rsus 2 --out-dir sybil-attack/inputs
+python3 sybil-attack/security/generate_vehicle_keys.py --vehicles 10 --out sybil-attack/inputs/vehicle_keys.csv
+python3 sybil-attack/security/generate_vehicle_vins.py --vehicles 10 --out-dir sybil-attack/inputs
+```
+
+## Outputs
+
+Run outputs are written under `sybil-attack/outputs/`, for example:
+
+```text
+sybil-attack/outputs/communication_log.csv
+sybil-attack/outputs/metrics_summary.csv
+sybil-attack/outputs/sybil-developing-netanim.xml
+```
+
+These files are generated artifacts and are intentionally ignored by Git.

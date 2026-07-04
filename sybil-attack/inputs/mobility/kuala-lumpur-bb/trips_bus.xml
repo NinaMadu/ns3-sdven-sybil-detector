@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- generated on 2026-06-12 15:13:25.832728 by randomTrips.py UNKNOWN
+  options: -n /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb.net.xml -o /root/FYP/ns-allinone-3.35/ns-3.35/sybil-attack/inputs/mobility/kuala-lumpur-bb/trips_bus.xml <doubleminus>begin 0 <doubleminus>end 600 <doubleminus>period 60.00 <doubleminus>fringe-factor 5 <doubleminus>min-distance 150 <doubleminus>vclass bus <doubleminus>seed 42 <doubleminus>trip-attributes type="bus"
+-->
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <trip id="0" depart="0.00" from="507104058#0" to="-1307631404#1" type="bus"/>
+    <trip id="1" depart="60.00" from="755081029" to="625563911#4" type="bus"/>
+    <trip id="2" depart="120.00" from="772267429#1" to="-754779354#0" type="bus"/>
+    <trip id="3" depart="180.00" from="163080912#0" to="-1307631404#1" type="bus"/>
+    <trip id="4" depart="240.00" from="1167928176" to="318470203-AddedOffRampEdge" type="bus"/>
+    <trip id="5" depart="300.00" from="604535881" to="403470389#0" type="bus"/>
+    <trip id="6" depart="360.00" from="1174598084" to="472093471" type="bus"/>
+    <trip id="7" depart="420.00" from="771989745" to="-1157823048#8" type="bus"/>
+    <trip id="8" depart="480.00" from="771743389#0" to="740625861#0" type="bus"/>
+    <trip id="9" depart="540.00" from="1346302472#2" to="1113253996#0" type="bus"/>
+</routes>
