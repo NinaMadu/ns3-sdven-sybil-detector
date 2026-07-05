@@ -99,3 +99,4 @@ Thumbs.db
 
 !rssi_mcc_sweep.py
 *.Zone.Identifier
+*Zone.Identifier

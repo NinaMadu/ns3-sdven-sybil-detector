@@ -69,8 +69,6 @@ extern double   v2vReliableRange;
 // =============================================================================
 
 static std::string metricsPdrCsv        = "sybil-attack/outputs/metrics_M1_PDR.csv";
-static std::string metricsPdrUnicastCsv   = "sybil-attack/outputs/metrics_M1_1_unicast_PDR.csv";
-static std::string metricsPdrBroadcastCsv = "sybil-attack/outputs/metrics_M1_2_broadcast_PDR.csv";
 static std::string metricsLatencyCsv    = "sybil-attack/outputs/metrics_M2_Latency.csv";
 static std::string metricsAttractionCsv = "sybil-attack/outputs/metrics_M3_PacketAttraction.csv";
 static std::string metricsCongestionCsv = "sybil-attack/outputs/metrics_M4_Congestion.csv";
@@ -80,15 +78,9 @@ static std::string metricsTierSummaryCsv = "sybil-attack/outputs/metrics_tier_su
 // M1–M4  Cumulative counters
 // =============================================================================
 
-// M1 – PDR (overall = unicast + broadcast)
+// M1 – PDR
 static uint64_t g_totalTransmitted = 0;
 static uint64_t g_totalDelivered   = 0;
-// M1.1 – unicast PDR (1 intended receiver per send)
-static uint64_t g_unicastTransmitted = 0;
-static uint64_t g_unicastDelivered   = 0;
-// M1.2 – broadcast PDR (intended receivers = vehicles within v2vReliableRange)
-static uint64_t g_broadcastExpected  = 0;
-static uint64_t g_broadcastDelivered = 0;
 
 // M2 – Latency
 static double   g_totalDelay  = 0.0;
@@ -110,10 +102,6 @@ static uint64_t g_legitimatePackets   = 0;
 static double   g_nextMetricWindow    = 1.0;
 static uint64_t g_windowTransmitted   = 0;
 static uint64_t g_windowDelivered     = 0;
-static uint64_t g_windowUnicastTx     = 0;
-static uint64_t g_windowUnicastRx     = 0;
-static uint64_t g_windowBcastExp      = 0;
-static uint64_t g_windowBcastRx       = 0;
 static double   g_windowDelaySum      = 0.0;
 static uint64_t g_windowDelayCount    = 0;
 static double   g_windowIntendedDelaySum = 0.0;
@@ -1244,20 +1232,10 @@ static Ptr<SecurityEvaluationMetrics> g_secMetrics;
 // M1 aligned with SDVEN/VANET local awareness instead of assuming every vehicle
 // in the whole simulation is an intended receiver.
 static inline void
-MetricsOnTransmit(uint32_t expectedDeliveries = 1, bool isBroadcast = false)
+MetricsOnTransmit(uint32_t expectedDeliveries = 1)
 {
     g_totalTransmitted += expectedDeliveries;
     g_windowTransmitted += expectedDeliveries;
-    if (isBroadcast)
-    {
-        g_broadcastExpected += expectedDeliveries;
-        g_windowBcastExp    += expectedDeliveries;
-    }
-    else
-    {
-        g_unicastTransmitted += expectedDeliveries;
-        g_windowUnicastTx    += expectedDeliveries;
-    }
 }
 
 static inline uint32_t
@@ -1287,10 +1265,9 @@ MetricTierIndexForMessage(uint32_t messageType)
 }
 
 static inline void
-MetricsOnTransmitForMessage(uint32_t messageType, uint32_t expectedDeliveries = 1,
-                           bool isBroadcast = false)
+MetricsOnTransmitForMessage(uint32_t messageType, uint32_t expectedDeliveries = 1)
 {
-    MetricsOnTransmit(expectedDeliveries, isBroadcast);
+    MetricsOnTransmit(expectedDeliveries);
     uint32_t tierIndex = MetricTierIndexForMessage(messageType);
     if (tierIndex < g_tierMetrics.size())
     {
@@ -1304,24 +1281,13 @@ MetricsOnTransmitForMessage(uint32_t messageType, uint32_t expectedDeliveries = 
 //               overhearing a beacon not addressed to them); those receptions
 //               still contribute to M2/M3/M4 but must NOT inflate M1's numerator.
 static inline void
-MetricsOnReceive(bool isSybil, double delay, bool countForPDR = true,
-                 bool isBroadcast = false)
+MetricsOnReceive(bool isSybil, double delay, bool countForPDR = true)
 {
     // M1 — only credit intended deliveries
     if (countForPDR)
     {
         g_totalDelivered++;
         g_windowDelivered++;
-        if (isBroadcast)
-        {
-            g_broadcastDelivered++;
-            g_windowBcastRx++;
-        }
-        else
-        {
-            g_unicastDelivered++;
-            g_windowUnicastRx++;
-        }
     }
 
     // M2 — latency across all tagged receives (RSU overhears included)
@@ -1391,18 +1357,6 @@ InitializeMetricsCsvFiles()
             << "cumulative_transmitted,cumulative_delivered,cumulative_PDR,"
             << "sybil_attack_enabled,sybil_percentage\n";
     }
-    {   // M1.1 unicast PDR
-        std::ofstream out(metricsPdrUnicastCsv.c_str(), std::ios::out);
-        out << "sim_time_s,window_transmitted,window_delivered,window_PDR,"
-            << "cumulative_transmitted,cumulative_delivered,cumulative_PDR,"
-            << "sybil_attack_enabled,sybil_percentage\n";
-    }
-    {   // M1.2 broadcast PDR (denominator = intended receivers within v2vReliableRange)
-        std::ofstream out(metricsPdrBroadcastCsv.c_str(), std::ios::out);
-        out << "sim_time_s,window_expected,window_delivered,window_PDR,"
-            << "cumulative_expected,cumulative_delivered,cumulative_PDR,"
-            << "sybil_attack_enabled,sybil_percentage\n";
-    }
     {
         std::ofstream out(metricsLatencyCsv.c_str(), std::ios::out);
         out << "sim_time_s,window_avg_latency_ms,window_packet_count,"
@@ -1456,30 +1410,6 @@ WriteMetricsRow(double windowEnd)
         out << windowEnd << "," << g_windowTransmitted << "," << g_windowDelivered << ","
             << windowPDR << "," << g_totalTransmitted << "," << g_totalDelivered << ","
             << cumPDR << "," << attackFlag << "," << pct << "\n";
-    }
-
-    // M1.1 — unicast PDR (1 intended receiver per send → bounded [0,1])
-    double winUniPDR = (g_windowUnicastTx > 0)
-                           ? static_cast<double>(g_windowUnicastRx) / g_windowUnicastTx : 0.0;
-    double cumUniPDR = (g_unicastTransmitted > 0)
-                           ? static_cast<double>(g_unicastDelivered) / g_unicastTransmitted : 0.0;
-    {
-        std::ofstream out(metricsPdrUnicastCsv.c_str(), std::ios::app);
-        out << windowEnd << "," << g_windowUnicastTx << "," << g_windowUnicastRx << ","
-            << winUniPDR << "," << g_unicastTransmitted << "," << g_unicastDelivered << ","
-            << cumUniPDR << "," << attackFlag << "," << pct << "\n";
-    }
-
-    // M1.2 — broadcast PDR (denominator = in-range intended receivers → bounded [0,1])
-    double winBcPDR = (g_windowBcastExp > 0)
-                          ? static_cast<double>(g_windowBcastRx) / g_windowBcastExp : 0.0;
-    double cumBcPDR = (g_broadcastExpected > 0)
-                          ? static_cast<double>(g_broadcastDelivered) / g_broadcastExpected : 0.0;
-    {
-        std::ofstream out(metricsPdrBroadcastCsv.c_str(), std::ios::app);
-        out << windowEnd << "," << g_windowBcastExp << "," << g_windowBcastRx << ","
-            << winBcPDR << "," << g_broadcastExpected << "," << g_broadcastDelivered << ","
-            << cumBcPDR << "," << attackFlag << "," << pct << "\n";
     }
 
     // M2
@@ -1567,10 +1497,6 @@ WriteMetricsRow(double windowEnd)
     // Reset per-window counters
     g_windowTransmitted   = 0;
     g_windowDelivered     = 0;
-    g_windowUnicastTx     = 0;
-    g_windowUnicastRx     = 0;
-    g_windowBcastExp      = 0;
-    g_windowBcastRx       = 0;
     g_windowDelaySum      = 0.0;
     g_windowDelayCount    = 0;
     g_windowIntendedDelaySum = 0.0;

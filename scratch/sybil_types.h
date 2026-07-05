@@ -1599,9 +1599,11 @@ BuildBsmCoreData(uint32_t realVehicleId, uint32_t temporaryId, uint32_t messageC
             bsm.positionZ = pos.z;
         }
 
-        if (mob)
+        Ptr<ConstantVelocityMobilityModel> cv =
+            g_vehicleNodes.Get(realVehicleId)->GetObject<ConstantVelocityMobilityModel>();
+        if (cv)
         {
-            Vector vel = mob->GetVelocity();
+            Vector vel = cv->GetVelocity();
             bsm.speed = std::sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
             if (bsm.speed > 0.0)
             {
@@ -1703,6 +1705,5 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
             }
         }
     }
-    bool isBroadcastTx = (tx->destinationId == 0xFFFFFFFF);
-    MetricsOnTransmitForMessage(tx->messageType, expectedDeliveries, isBroadcastTx);
+    MetricsOnTransmitForMessage(tx->messageType, expectedDeliveries);
 }
