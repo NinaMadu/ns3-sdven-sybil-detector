@@ -150,7 +150,6 @@ std::ofstream g_csvVehicleNeighbor;
 std::ofstream g_csvRsuVehicleTable;
 std::ofstream g_csvRsuObservation;
 std::ofstream g_csvRsuRegional;
-std::ofstream g_csvRsuPassive;
 std::ofstream g_csvControllerVehicle;
 std::ofstream g_csvControllerGlobal;
 std::ofstream g_csvRssiVerif;
@@ -3099,12 +3098,6 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
                 }
 
                 BsmCoreData bsm = bsmTag.GetBsm();
-                RecordRsuPassiveBeaconEvidence(rsuIndex,
-                                               tag,
-                                               bsm,
-                                               sigValid,
-                                               tag.GetSequenceNumber(),
-                                               signalNoise.signal);
 
                 // Log RSU-level RSSI to rssi_verification_log so the RSSI
                 // Analyzer dataset contains RSU observations (not just V2V).
@@ -4181,7 +4174,6 @@ OpenPersistentCsvHandles()
     g_csvRsuVehicleTable.open(rsuVehicleTableCsv.c_str(),         std::ios::app);
     g_csvRsuObservation.open (rsuVehicleObservationCsv.c_str(),   std::ios::app);
     g_csvRsuRegional.open    (rsuRegionalAwarenessCsv.c_str(),    std::ios::app);
-    g_csvRsuPassive.open     (rsuPassiveBeaconEvidenceCsv.c_str(),std::ios::app);
     g_csvControllerVehicle.open(controllerVehicleTableCsv.c_str(),std::ios::app);
     g_csvControllerGlobal.open(controllerGlobalAwarenessCsv.c_str(),std::ios::app);
     g_csvRssiVerif.open      (rssiVerificationCsv.c_str(),        std::ios::app);
@@ -4224,7 +4216,6 @@ LogComputedDetectionEvidenceEvent(const std::string& event,
 {
 
     if (sweepMode) return;
-    auto& out = g_csvRsuPassive;
     std::ofstream out(computedDetectionEvidenceCsv.c_str(), std::ios::app);
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
