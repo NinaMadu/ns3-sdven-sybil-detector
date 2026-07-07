@@ -31,6 +31,10 @@
 #include "sybil_types.h"
 
 #include <algorithm>
+#include <fstream>
+#include <limits>
+#include <random>
+#include <sstream>
 #include <vector>
 
 // Additional simulation parameters needed by attack control.
@@ -83,6 +87,137 @@ ActiveAttackTypeAt(double t)
 }
 
 // ===========================================================================
+// Dataset Generation v2 — Mode 8 (Zone-Concurrent) and Mode 9 (Seq-All-6)
+// Block A: struct, globals, and early helpers (needed before DeclareAttackers)
+// ===========================================================================
+
+// Per-zone attack configuration for ATTACK_ZONE_CONCURRENT.
+struct ZoneProfile
+{
+    uint32_t zoneId     = 0;
+    uint32_t attackType = 0;   ///< 1-6; 0 = clean zone
+    uint32_t attackPct  = 50;  ///< percentage of eligible nodes that are attackers
+    uint32_t fanoutMin  = 2;
+    uint32_t fanoutMax  = 10;
+};
+
+// --- New per-node state vectors (sized to N_Vehicles/N_RSUs in DeclareAttackers) ---
+static std::vector<uint32_t> g_vehicleAttackType;  ///< per-vehicle attack variant (mode 8)
+static std::vector<uint32_t> g_vehicleFanout;      ///< per-vehicle sybil fanout count
+static std::vector<uint32_t> g_rsuFanout;          ///< per-RSU sybil fanout count
+static std::vector<uint32_t> g_vehicleHomeZone;    ///< zone index at spawn (set after mobility)
+
+// --- Zone profiles (parsed from --zoneProfiles CSV) ---
+static std::vector<ZoneProfile> g_zoneProfiles;
+
+// --- Dataset-mode control strings (set by main() after cmd.Parse) ---
+static std::string g_datasetMode;         ///< "sequential_all6" | "zone_concurrent" | ""
+static std::string g_intensitySchedule;   ///< "fixed" | "stepped"
+static std::string g_scenarioId;          ///< labelling for run_meta.json
+static std::string g_runId;               ///< per-run unique identifier
+static uint32_t    g_runSeed         = 42u;
+static uint32_t    g_fanoutMin       = 2u;
+static uint32_t    g_fanoutMax       = 10u;
+static uint32_t    g_fanoutFixed     = 0u;   ///< if > 0, overrides fanoutMin/Max
+static uint32_t    g_intensitySubwindows = 5u;
+static std::vector<uint32_t> g_intensityLadder;  ///< stepped percentages, e.g. {20,40,60,80,100}
+
+// --- Mode-9 Sequential-All-6 phase constants ---
+static const uint32_t kSeq6AttackTypes[6] = {1u, 2u, 3u, 4u, 5u, 6u};
+static const uint32_t kSeq6NumPhases      = 6u;
+static const double   kSeq6PhaseGapSec    = 3.0;
+static double         g_seq6PhaseDuration = 0.0;  ///< per-phase length; set in main()
+
+// Extern declaration so ZoneOfPosition (Block B) can use g_rsuControllerAssignment
+// which is DEFINED in Sybil-Developing-Improved.cc.
+extern std::vector<uint32_t> g_rsuControllerAssignment;
+
+// ---------------------------------------------------------------------------
+// DrawFanout: seeded draw from [minF, maxF].
+// Defined in Block A so DeclareAttackers can call it for mode-9 fanout init.
+// ---------------------------------------------------------------------------
+inline uint32_t
+DrawFanout(uint32_t minF, uint32_t maxF, uint32_t seed)
+{
+    if (minF >= maxF) return minF;
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<uint32_t> dist(minF, maxF);
+    return dist(rng);
+}
+
+// ---------------------------------------------------------------------------
+// ParseIntensityLadder: parse "20,40,60,80,100" → vector<uint32_t>.
+// ---------------------------------------------------------------------------
+inline std::vector<uint32_t>
+ParseIntensityLadder(const std::string& s)
+{
+    std::vector<uint32_t> ladder;
+    std::istringstream ss(s);
+    std::string tok;
+    while (std::getline(ss, tok, ','))
+        if (!tok.empty())
+        {
+            try { ladder.push_back(static_cast<uint32_t>(std::stoul(tok))); } catch (...) {}
+        }
+    return ladder;
+}
+
+// ---------------------------------------------------------------------------
+// ParseZoneProfiles: load zone_profiles.csv into g_zoneProfiles.
+// Expected header: zone_id,attack_type,attack_pct[,fanout_min,fanout_max]
+// ---------------------------------------------------------------------------
+inline void
+ParseZoneProfiles(const std::string& path)
+{
+    g_zoneProfiles.clear();
+    std::ifstream f(path.c_str());
+    if (!f.is_open())
+    {
+        std::cerr << "[dataset] ERROR: cannot open zone_profiles: " << path << "\n";
+        return;
+    }
+    std::string line;
+    std::getline(f, line);  // skip header
+    while (std::getline(f, line))
+    {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string tok;
+        ZoneProfile zp;
+        zp.fanoutMin = g_fanoutMin;
+        zp.fanoutMax = g_fanoutMax;
+        int col = 0;
+        while (std::getline(ss, tok, ','))
+        {
+            if (tok.empty()) { ++col; continue; }
+            try {
+                switch (col)
+                {
+                case 0: zp.zoneId     = static_cast<uint32_t>(std::stoul(tok)); break;
+                case 1: zp.attackType = static_cast<uint32_t>(std::stoul(tok)); break;
+                case 2: zp.attackPct  = static_cast<uint32_t>(std::stoul(tok)); break;
+                case 3: zp.fanoutMin  = static_cast<uint32_t>(std::stoul(tok)); break;
+                case 4: zp.fanoutMax  = static_cast<uint32_t>(std::stoul(tok)); break;
+                }
+            } catch (...) {}
+            ++col;
+        }
+        if (col >= 3) g_zoneProfiles.push_back(zp);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GetZoneProfile: pointer to ZoneProfile for zoneId, or nullptr.
+// ---------------------------------------------------------------------------
+inline const ZoneProfile*
+GetZoneProfile(uint32_t zoneId)
+{
+    for (const auto& zp : g_zoneProfiles)
+        if (zp.zoneId == zoneId) return &zp;
+    return nullptr;
+}
+
+// ===========================================================================
 // Query helpers — used by ColorAndLabelNodes and the normal traffic callbacks
 // ===========================================================================
 
@@ -116,6 +251,8 @@ AttackTypeToString(SybilAttackType t)
     case ATTACK_MALICIOUS_RSU:                   return "Malicious RSU";
     case ATTACK_MALICIOUS_SDN_CONTROLLER:        return "Malicious SDN Controller";
     case ATTACK_SEQUENTIAL_1234:                 return "Sequential 1->2->3->4 (dataset mode)";
+    case ATTACK_ZONE_CONCURRENT:                 return "Zone-Concurrent (FL federation dataset)";
+    case ATTACK_SEQUENTIAL_ALL6:                 return "Sequential 1->2->3->4->5->6 (full 7-class dataset)";
     default:                                     return "None";
     }
 }
@@ -152,6 +289,19 @@ GetClaimedVehicleId(uint32_t realVehicleId, uint32_t nVehicles)
     case ATTACK_MALICIOUS_SDN_CONTROLLER:
         return realVehicleId;
 
+    case ATTACK_ZONE_CONCURRENT:
+        // Outsider-zone attackers use fabricated ID; all others use real ID.
+        // Outsider vehicles are skipped in the main traffic loop so this path
+        // is only reached for non-outsider zone types — they return realVehicleId.
+        if (realVehicleId < g_vehicleAttackType.size() &&
+            g_vehicleAttackType[realVehicleId] == 1u)
+            return nVehicles + realVehicleId;
+        return realVehicleId;
+
+    case ATTACK_SEQUENTIAL_ALL6:
+        // Outsider-phase attackers are skipped in main loop; all other phases use real ID.
+        return realVehicleId;
+
     default:
         return realVehicleId;
     }
@@ -172,10 +322,10 @@ DeclareAttackStates()
     }
 
     // Bug 5 fix: reject out-of-range attack type before the cast.
-    if (sybil_attack_type > 7)
+    if (sybil_attack_type > 9)
     {
         std::cerr << "[sybil_attacks] ERROR: sybil_attack_type=" << sybil_attack_type
-                  << " is out of range [0,7] — disabling attack.\n";
+                  << " is out of range [0,9] — disabling attack.\n";
         g_activeAttackType = ATTACK_NONE;
         return;
     }
@@ -208,7 +358,8 @@ DeclareAttackers()
                            g_activeAttackType == ATTACK_INSIDER_DIRECT_SIMULTANEOUS     ||
                            g_activeAttackType == ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS ||
                            g_activeAttackType == ATTACK_INSIDER_INDIRECT                ||
-                           g_activeAttackType == ATTACK_SEQUENTIAL_1234);
+                           g_activeAttackType == ATTACK_SEQUENTIAL_1234                 ||
+                           g_activeAttackType == ATTACK_SEQUENTIAL_ALL6);
     if (vehiclesAttack)
     {
         uint32_t nAttackers = N_Vehicles * sybil_attack_percentage / 100u;
@@ -249,6 +400,37 @@ DeclareAttackers()
     // not percentage-based.  sybil_attack_percentage does not gate this.
     if (g_activeAttackType == ATTACK_MALICIOUS_SDN_CONTROLLER || controller_malicious_assumption)
         g_controllerIsMalicious = true;
+
+    // ── Mode 9: Sequential-All-6 — also mark RSUs and controller for phases 5-6 ──
+    if (g_activeAttackType == ATTACK_SEQUENTIAL_ALL6)
+    {
+        g_vehicleFanout.assign(N_Vehicles, 0u);
+        g_rsuFanout.assign(N_RSUs, 0u);
+        uint32_t fMin = (g_fanoutFixed > 0u) ? g_fanoutFixed : g_fanoutMin;
+        uint32_t fMax = (g_fanoutFixed > 0u) ? g_fanoutFixed : g_fanoutMax;
+        if (fMax < fMin) fMax = fMin;
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
+            if (g_vehicleIsAttacker[i])
+                g_vehicleFanout[i] = DrawFanout(fMin, fMax, g_runSeed + i * 17u);
+        // Ensure at least 1 malicious RSU for phase-5 data
+        uint32_t nMalRsu = N_RSUs * sybil_attack_percentage / 100u;
+        if (nMalRsu == 0u && N_RSUs > 0u) nMalRsu = 1u;
+        for (uint32_t i = 0u; i < nMalRsu && i < N_RSUs; ++i)
+            g_rsuIsMalicious[i] = true;
+        for (uint32_t r = 0u; r < N_RSUs; ++r)
+            if (g_rsuIsMalicious[r])
+                g_rsuFanout[r] = DrawFanout(fMin, fMax, g_runSeed + r * 19u + 1000u);
+        g_controllerIsMalicious = true;  // needed for phase 6
+    }
+
+    // ── Mode 8: Zone-Concurrent — per-zone selection deferred to DeclareAttackersMode8()
+    //    which must be called from main() AFTER InstallSelectedMobility().
+    if (g_activeAttackType == ATTACK_ZONE_CONCURRENT)
+    {
+        g_vehicleAttackType.assign(N_Vehicles, 0u);
+        g_vehicleFanout.assign(N_Vehicles, 0u);
+        g_rsuFanout.assign(N_RSUs, 0u);
+    }
 }
 
 // ===========================================================================
@@ -1255,6 +1437,394 @@ ScheduleIndirectWindow(double startT, double endT, double beaconInterval)
                                     &RelayForwardSybilBeacon, i, relayEpoch);
 }
 
+// ===========================================================================
+// Dataset Generation v2 — Block B: helpers that need RSU positions.
+// All functions here are defined BEFORE ScheduleAttackTraffic so they can
+// be called from it and from Sybil-Developing-Improved.cc post-mobility.
+// ===========================================================================
+
+// Returns the attack-type number (1-6) active at simulation time t for mode 9.
+inline uint32_t
+ActiveAttackTypeAt6(double t)
+{
+    if (g_seq6PhaseDuration <= 0.0) return 0u;
+    uint32_t p = static_cast<uint32_t>(t / g_seq6PhaseDuration);
+    if (p >= kSeq6NumPhases) p = kSeq6NumPhases - 1u;
+    return kSeq6AttackTypes[p];
+}
+
+// ZoneOfPosition: nearest-RSU → controller-zone index.
+// Requires RSU MobilityModels and g_rsuControllerAssignment to be populated.
+inline uint32_t
+ZoneOfPosition(double x, double y)
+{
+    if (g_rsuNodes.GetN() == 0) return 0u;
+    double   minDist    = std::numeric_limits<double>::max();
+    uint32_t nearestRsu = 0u;
+    for (uint32_t j = 0u; j < g_rsuNodes.GetN(); ++j)
+    {
+        Ptr<MobilityModel> mob = g_rsuNodes.Get(j)->GetObject<MobilityModel>();
+        if (!mob) continue;
+        Vector rp = mob->GetPosition();
+        double dx = rp.x - x, dy = rp.y - y;
+        double d  = std::sqrt(dx * dx + dy * dy);
+        if (d < minDist) { minDist = d; nearestRsu = j; }
+    }
+    if (nearestRsu < g_rsuControllerAssignment.size())
+        return g_rsuControllerAssignment[nearestRsu];
+    return 0u;
+}
+
+// ZoneOfVehicle: vehicle i's home zone (frozen at spawn by InitVehicleHomeZones).
+inline uint32_t
+ZoneOfVehicle(uint32_t vehicleIndex)
+{
+    return (vehicleIndex < g_vehicleHomeZone.size()) ? g_vehicleHomeZone[vehicleIndex] : 0u;
+}
+
+// InitVehicleHomeZones: populate g_vehicleHomeZone from spawn positions.
+// Call from main() AFTER InstallSelectedMobility().
+inline void
+InitVehicleHomeZones()
+{
+    g_vehicleHomeZone.assign(N_Vehicles, 0u);
+    for (uint32_t i = 0u; i < N_Vehicles && i < g_vehicleNodes.GetN(); ++i)
+    {
+        Ptr<MobilityModel> mob = g_vehicleNodes.Get(i)->GetObject<MobilityModel>();
+        if (!mob) { g_vehicleHomeZone[i] = 0u; continue; }
+        Vector pos = mob->GetPosition();
+        g_vehicleHomeZone[i] = ZoneOfPosition(pos.x, pos.y);
+    }
+}
+
+// GetActiveAttackPct: instantaneous attacker-% for a vehicle at time t.
+inline uint32_t
+GetActiveAttackPct(uint32_t vehicleIndex, double t)
+{
+    if (g_activeAttackType == ATTACK_ZONE_CONCURRENT)
+    {
+        const ZoneProfile* zp = GetZoneProfile(ZoneOfVehicle(vehicleIndex));
+        return zp ? zp->attackPct : 0u;
+    }
+    if (g_activeAttackType == ATTACK_SEQUENTIAL_ALL6 &&
+        g_intensitySchedule == "stepped" &&
+        !g_intensityLadder.empty() && g_seq6PhaseDuration > 0.0)
+    {
+        uint32_t phase   = static_cast<uint32_t>(t / g_seq6PhaseDuration);
+        if (phase >= kSeq6NumPhases) phase = kSeq6NumPhases - 1u;
+        double   phaseT  = t - static_cast<double>(phase) * g_seq6PhaseDuration;
+        double   swDur   = (g_intensitySubwindows > 0u)
+                           ? g_seq6PhaseDuration / static_cast<double>(g_intensitySubwindows)
+                           : g_seq6PhaseDuration;
+        uint32_t sw      = (swDur > 0.0) ? static_cast<uint32_t>(phaseT / swDur) : 0u;
+        if (sw >= g_intensitySubwindows) sw = g_intensitySubwindows - 1u;
+        return (sw < g_intensityLadder.size()) ? g_intensityLadder[sw]
+                                               : g_intensityLadder.back();
+    }
+    return sybil_attack_percentage;
+}
+
+// GetRowAttackType: per-row ground-truth attack-type label.
+inline uint32_t
+GetRowAttackType(uint32_t realNodeId, double t)
+{
+    if (g_activeAttackType == ATTACK_ZONE_CONCURRENT)
+    {
+        if (realNodeId < g_vehicleAttackType.size())
+            return g_vehicleAttackType[realNodeId];
+        return 0u;
+    }
+    if (g_activeAttackType == ATTACK_SEQUENTIAL_ALL6)
+        return ActiveAttackTypeAt6(t);
+    return ActiveAttackTypeAt(t);
+}
+
+// GetVehicleFanoutForLog: per-attacker fanout count for the sybil_fanout column.
+inline uint32_t
+GetVehicleFanoutForLog(uint32_t realNodeId)
+{
+    if (realNodeId < g_vehicleFanout.size())
+        return g_vehicleFanout[realNodeId];
+    return 0u;
+}
+
+// ---------------------------------------------------------------------------
+// DeclareAttackersMode8: zone-concurrent per-zone attacker selection.
+// Called from main() AFTER InstallSelectedMobility() + InitVehicleHomeZones().
+// ---------------------------------------------------------------------------
+inline void
+DeclareAttackersMode8()
+{
+    if (g_activeAttackType != ATTACK_ZONE_CONCURRENT) return;
+    g_vehicleIsAttacker.assign(N_Vehicles, false);
+    g_vehicleAttackType.assign(N_Vehicles, 0u);
+    g_vehicleFanout.assign(N_Vehicles, 0u);
+    g_rsuIsMalicious.assign(N_RSUs, false);
+    g_rsuFanout.assign(N_RSUs, 0u);
+    g_controllerIsMalicious = false;
+
+    for (const ZoneProfile& zp : g_zoneProfiles)
+    {
+        if (zp.attackType == 0u) continue;
+        uint32_t fMin = (g_fanoutFixed > 0u) ? g_fanoutFixed : zp.fanoutMin;
+        uint32_t fMax = (g_fanoutFixed > 0u) ? g_fanoutFixed : zp.fanoutMax;
+        if (fMin < 1u) fMin = 1u;
+        if (fMax < fMin) fMax = fMin;
+
+        if (zp.attackType >= 1u && zp.attackType <= 4u)
+        {
+            // Rank vehicles in this zone by deterministic hash, select top attackPct%.
+            std::vector<std::pair<uint32_t, uint32_t>> ranked;
+            for (uint32_t i = 0u; i < N_Vehicles; ++i)
+                if (ZoneOfVehicle(i) == zp.zoneId)
+                    ranked.push_back({(i * 37u + 11u + zp.zoneId * 7u) % 100u, i});
+            std::sort(ranked.begin(), ranked.end());
+            uint32_t nAtk = static_cast<uint32_t>(ranked.size() * zp.attackPct / 100u);
+            for (uint32_t k = 0u; k < nAtk && k < static_cast<uint32_t>(ranked.size()); ++k)
+            {
+                uint32_t vi = ranked[k].second;
+                g_vehicleIsAttacker[vi]  = true;
+                g_vehicleAttackType[vi]  = zp.attackType;
+                g_vehicleFanout[vi]      = DrawFanout(fMin, fMax,
+                                                      g_runSeed + vi * 17u + zp.zoneId * 3u);
+            }
+        }
+        else if (zp.attackType == 5u)
+        {
+            for (uint32_t r = 0u; r < N_RSUs; ++r)
+                if (r < g_rsuControllerAssignment.size() &&
+                    g_rsuControllerAssignment[r] == zp.zoneId)
+                {
+                    g_rsuIsMalicious[r] = true;
+                    g_rsuFanout[r]      = DrawFanout(fMin, fMax,
+                                                     g_runSeed + r * 19u + zp.zoneId * 5u);
+                }
+        }
+        else if (zp.attackType == 6u)
+        {
+            g_controllerIsMalicious = true;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SchedulePhaseWindowFanout: schedule one attack-type phase for mode 9.
+// Iterates all marked attackers; if activeSet != nullptr only those in the
+// set fire (stepped-intensity sub-window support).
+// ---------------------------------------------------------------------------
+inline void
+SchedulePhaseWindowFanout(uint32_t atype, double startT, double endT, double beaconInterval,
+                           const std::vector<bool>* activeSet)
+{
+    switch (atype)
+    {
+    case 1u:
+        for (double t = startT; t < endT - 0.5; t += beaconInterval)
+            for (uint32_t i = 0u; i < N_Vehicles; ++i)
+            {
+                if (!g_vehicleIsAttacker[i]) continue;
+                if (activeSet && i < activeSet->size() && !(*activeSet)[i]) continue;
+                uint32_t budget = (i < g_vehicleFanout.size() && g_vehicleFanout[i] > 0u)
+                                  ? std::min(g_vehicleFanout[i], N_SYBIL_OUTSIDER_NEIGHBORS_MAX)
+                                  : OutsiderNeighborBudget();
+                Simulator::Schedule(
+                    Seconds(t + 0.05 * static_cast<double>(i) + 0.30),
+                    &OutsiderSendSybilReport, i);
+                for (uint32_t slot = 0u; slot < budget; ++slot)
+                    Simulator::Schedule(
+                        Seconds(t + 0.05 * static_cast<double>(i) + 0.35
+                                + 0.05 * static_cast<double>(slot)),
+                        &OutsiderBroadcastSybilBeacon, i, slot);
+            }
+        break;
+
+    case 2u:
+        for (double t = startT; t < endT - 0.5; t += beaconInterval)
+            for (uint32_t i = 0u; i < N_Vehicles; ++i)
+            {
+                if (!g_vehicleIsAttacker[i]) continue;
+                if (activeSet && i < activeSet->size() && !(*activeSet)[i]) continue;
+                uint32_t budget = (i < g_vehicleFanout.size() && g_vehicleFanout[i] > 0u)
+                                  ? std::min(g_vehicleFanout[i], N_SYBIL_SIMULTANEOUS_MAX)
+                                  : SimultaneousSybilBudget();
+                uint32_t cycle  = static_cast<uint32_t>(
+                    std::max(0.0, (t - startT) / beaconInterval));
+                for (uint32_t slot = 0u; slot < budget; ++slot)
+                    Simulator::Schedule(
+                        Seconds(t + 0.05 * static_cast<double>(i) +
+                                SimultaneousSlotOffset(slot, cycle, i)),
+                        &BroadcastSimultaneousSybilBeacon, i, slot, cycle);
+            }
+        break;
+
+    case 3u:
+    {
+        const double dwellSpan =
+            static_cast<double>(N_NON_SIM_BEACONS_PER_DWELL) * beaconInterval;
+        for (uint32_t i = 0u; i < N_Vehicles; ++i)
+        {
+            if (!g_vehicleIsAttacker[i]) continue;
+            if (activeSet && i < activeSet->size() && !(*activeSet)[i]) continue;
+            uint32_t budget = (i < g_vehicleFanout.size() && g_vehicleFanout[i] > 0u)
+                              ? std::min(g_vehicleFanout[i], N_SYBIL_NON_SIMULTANEOUS_MAX)
+                              : NonSimultaneousSybilBudget();
+            uint32_t identityIndex = 0u;
+            double   cursor = startT + 0.05 * static_cast<double>(i);
+            while (cursor < endT - 1.5)
+            {
+                for (uint32_t s = 0u; s < budget && cursor < endT - 1.5; ++s)
+                {
+                    for (uint32_t b = 0u; b < N_NON_SIM_BEACONS_PER_DWELL; ++b)
+                    {
+                        double txTime = cursor + static_cast<double>(b) * beaconInterval;
+                        if (txTime >= endT - 0.5) break;
+                        Simulator::Schedule(Seconds(txTime),
+                                            &BroadcastNonSimultaneousSybilBeacon,
+                                            i, identityIndex, b, beaconInterval);
+                    }
+                    cursor += dwellSpan + NON_SIM_INTER_ID_GAP_SEC;
+                    ++identityIndex;
+                }
+                cursor += NON_SIM_CYCLE_QUIET_SEC;
+            }
+        }
+        break;
+    }
+
+    case 4u:
+    {
+        uint32_t relayEpoch = 0u;
+        for (double t = startT; t < endT - 0.5; t += beaconInterval, ++relayEpoch)
+            for (uint32_t i = 0u; i < N_Vehicles; ++i)
+            {
+                if (!g_vehicleIsAttacker[i]) continue;
+                if (activeSet && i < activeSet->size() && !(*activeSet)[i]) continue;
+                Simulator::Schedule(
+                    Seconds(t + 0.05 * static_cast<double>(i) + 0.25),
+                    &RelayForwardSybilBeacon, i, relayEpoch);
+            }
+        break;
+    }
+
+    default: break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ScheduleZoneConcurrentAttackTraffic: Mode 8 — schedule each attacker for
+// its zone-assigned variant concurrently over the full simulation window.
+// Control-plane (types 5/6) flow through existing report callbacks.
+// ---------------------------------------------------------------------------
+inline void
+ScheduleZoneConcurrentAttackTraffic(double simTime, double beaconInterval,
+                                     double rsuReportInterval)
+{
+    const double startT = g_attackOnsetTime;
+    const double endT   = simTime;
+
+    for (uint32_t i = 0u; i < N_Vehicles; ++i)
+    {
+        if (!g_vehicleIsAttacker[i]) continue;
+        uint32_t vtype = (i < g_vehicleAttackType.size()) ? g_vehicleAttackType[i] : 0u;
+        if (vtype == 0u) continue;
+
+        switch (vtype)
+        {
+        case 1u:  // Outsider
+            for (double t = startT; t < endT - 0.5; t += beaconInterval)
+            {
+                uint32_t budget = (i < g_vehicleFanout.size() && g_vehicleFanout[i] > 0u)
+                                  ? std::min(g_vehicleFanout[i], N_SYBIL_OUTSIDER_NEIGHBORS_MAX)
+                                  : OutsiderNeighborBudget();
+                Simulator::Schedule(
+                    Seconds(t + 0.05 * static_cast<double>(i) + 0.30),
+                    &OutsiderSendSybilReport, i);
+                for (uint32_t slot = 0u; slot < budget; ++slot)
+                    Simulator::Schedule(
+                        Seconds(t + 0.05 * static_cast<double>(i) + 0.35
+                                + 0.05 * static_cast<double>(slot)),
+                        &OutsiderBroadcastSybilBeacon, i, slot);
+            }
+            break;
+
+        case 2u:  // Simultaneous
+            for (double t = startT; t < endT - 0.5; t += beaconInterval)
+            {
+                uint32_t budget = (i < g_vehicleFanout.size() && g_vehicleFanout[i] > 0u)
+                                  ? std::min(g_vehicleFanout[i], N_SYBIL_SIMULTANEOUS_MAX)
+                                  : SimultaneousSybilBudget();
+                uint32_t cycle  = static_cast<uint32_t>(
+                    std::max(0.0, (t - startT) / beaconInterval));
+                for (uint32_t slot = 0u; slot < budget; ++slot)
+                    Simulator::Schedule(
+                        Seconds(t + 0.05 * static_cast<double>(i) +
+                                SimultaneousSlotOffset(slot, cycle, i)),
+                        &BroadcastSimultaneousSybilBeacon, i, slot, cycle);
+            }
+            break;
+
+        case 3u:  // Non-Simultaneous
+        {
+            const double dwellSpan =
+                static_cast<double>(N_NON_SIM_BEACONS_PER_DWELL) * beaconInterval;
+            uint32_t budget = (i < g_vehicleFanout.size() && g_vehicleFanout[i] > 0u)
+                              ? std::min(g_vehicleFanout[i], N_SYBIL_NON_SIMULTANEOUS_MAX)
+                              : NonSimultaneousSybilBudget();
+            uint32_t identityIndex = 0u;
+            double   cursor = startT + 0.05 * static_cast<double>(i);
+            while (cursor < endT - 1.5)
+            {
+                for (uint32_t s = 0u; s < budget && cursor < endT - 1.5; ++s)
+                {
+                    for (uint32_t b = 0u; b < N_NON_SIM_BEACONS_PER_DWELL; ++b)
+                    {
+                        double txTime = cursor + static_cast<double>(b) * beaconInterval;
+                        if (txTime >= endT - 0.5) break;
+                        Simulator::Schedule(Seconds(txTime),
+                                            &BroadcastNonSimultaneousSybilBeacon,
+                                            i, identityIndex, b, beaconInterval);
+                    }
+                    cursor += dwellSpan + NON_SIM_INTER_ID_GAP_SEC;
+                    ++identityIndex;
+                }
+                cursor += NON_SIM_CYCLE_QUIET_SEC;
+            }
+            break;
+        }
+
+        case 4u:  // Indirect
+        {
+            uint32_t relayEpoch = 0u;
+            for (double t = startT; t < endT - 0.5; t += beaconInterval, ++relayEpoch)
+                Simulator::Schedule(
+                    Seconds(t + 0.05 * static_cast<double>(i) + 0.25),
+                    &RelayForwardSybilBeacon, i, relayEpoch);
+            break;
+        }
+
+        default: break;
+        }
+    }
+
+    // Type 6 concurrent: controller injection fires via existing report callbacks,
+    // supplemented with explicit scheduling for zones that have a controller attack.
+    if (g_controllerIsMalicious)
+        for (double t = 2.0; t < simTime - 1.0; t += rsuReportInterval)
+            for (uint32_t j = 0u; j < N_RSUs; ++j)
+                Simulator::Schedule(Seconds(t + 0.5 + 0.1 * static_cast<double>(j)),
+                                    &MaliciousControllerInjectPhantoms, j);
+}
+
+// ScheduleMaliciousControllerWindow: explicit phase-6 scheduling for mode 9.
+inline void
+ScheduleMaliciousControllerWindow(double startT, double endT, double rsuReportInterval)
+{
+    for (double t = std::max(startT, 2.0); t < endT - 1.0; t += rsuReportInterval)
+        for (uint32_t j = 0u; j < N_RSUs; ++j)
+            Simulator::Schedule(Seconds(t + 0.5 + 0.1 * static_cast<double>(j)),
+                                &MaliciousControllerInjectPhantoms, j);
+}
+
 inline void
 ScheduleAttackTraffic(double simTime, double beaconInterval, double rsuReportInterval)
 {
@@ -1288,6 +1858,84 @@ ScheduleAttackTraffic(double simTime, double beaconInterval, double rsuReportInt
             default: break;
             }
         }
+        return;
+    }
+
+    // ── Mode 9: Sequential-All-6 ─────────────────────────────────────────────
+    if (g_activeAttackType == ATTACK_SEQUENTIAL_ALL6)
+    {
+        const double D   = g_seq6PhaseDuration;
+        const double gap = kSeq6PhaseGapSec;
+        if (D <= 0.0)
+        {
+            std::cerr << "[sybil_attacks] ERROR: ATTACK_SEQUENTIAL_ALL6 but "
+                         "g_seq6PhaseDuration=0 — no attack scheduled.\n";
+            return;
+        }
+        bool stepped = (g_intensitySchedule == "stepped" && !g_intensityLadder.empty());
+
+        // Rank all attackers once for stepped-intensity sub-window selection.
+        std::vector<std::pair<uint32_t, uint32_t>> ranked;
+        if (stepped)
+        {
+            ranked.reserve(N_Vehicles);
+            for (uint32_t i = 0u; i < N_Vehicles; ++i)
+                ranked.push_back({(i * 37u + 11u) % 100u, i});
+            std::sort(ranked.begin(), ranked.end());
+        }
+
+        for (uint32_t p = 0u; p < kSeq6NumPhases; ++p)
+        {
+            double phaseBase  = static_cast<double>(p) * D;
+            double phaseStart = std::max(phaseBase, g_attackOnsetTime);
+            double phaseEnd   = static_cast<double>(p + 1u) * D - gap;
+            uint32_t atype    = kSeq6AttackTypes[p];
+
+            if (atype == 5u)
+            {
+                // Phase 5 (Malicious RSU): injection happens through
+                // the existing SendRsuControllerReport callback, gated
+                // by the seq6 window check in Sybil-Developing-Improved.cc.
+                continue;
+            }
+            if (atype == 6u)
+            {
+                ScheduleMaliciousControllerWindow(phaseStart, phaseEnd, rsuReportInterval);
+                continue;
+            }
+
+            if (!stepped)
+            {
+                SchedulePhaseWindowFanout(atype, phaseStart, phaseEnd, beaconInterval, nullptr);
+            }
+            else
+            {
+                double phaseDur = phaseEnd - phaseStart;
+                if (phaseDur <= 0.0) continue;
+                double swDur = phaseDur / static_cast<double>(g_intensitySubwindows);
+                for (uint32_t k = 0u; k < g_intensitySubwindows; ++k)
+                {
+                    double swStart = phaseStart + static_cast<double>(k) * swDur;
+                    double swEnd   = phaseStart + static_cast<double>(k + 1u) * swDur;
+                    uint32_t pct   = (k < g_intensityLadder.size())
+                                     ? g_intensityLadder[k]
+                                     : g_intensityLadder.back();
+                    uint32_t nAtk  = N_Vehicles * pct / 100u;
+                    std::vector<bool> activeSet(N_Vehicles, false);
+                    for (uint32_t r = 0u;
+                         r < nAtk && r < static_cast<uint32_t>(ranked.size()); ++r)
+                        activeSet[ranked[r].second] = true;
+                    SchedulePhaseWindowFanout(atype, swStart, swEnd, beaconInterval, &activeSet);
+                }
+            }
+        }
+        return;
+    }
+
+    // ── Mode 8: Zone-Concurrent ───────────────────────────────────────────────
+    if (g_activeAttackType == ATTACK_ZONE_CONCURRENT)
+    {
+        ScheduleZoneConcurrentAttackTraffic(simTime, beaconInterval, rsuReportInterval);
         return;
     }
 

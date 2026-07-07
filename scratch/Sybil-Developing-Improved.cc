@@ -140,8 +140,10 @@ std::string rsuRegionalAwarenessCsv = "sybil-attack/outputs/rsu_regional_awarene
 std::string computedDetectionEvidenceCsv = "sybil-attack/outputs/computed_detection_evidence_log.csv";
 std::string controllerVehicleTableCsv = "sybil-attack/outputs/controller_vehicle_table_log.csv";
 std::string controllerGlobalAwarenessCsv = "sybil-attack/outputs/controller_global_awareness_log.csv";
-std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
-std::string rssiVerificationCsv = "sybil-attack/outputs/rssi_verification_log.csv";
+std::string animFile             = "sybil-attack/outputs/sybil-developing-netanim.xml";
+std::string rssiVerificationCsv  = "sybil-attack/outputs/rssi_verification_log.csv";
+std::string rsuApprovalLogCsv    = "sybil-attack/outputs/rsu_approval_log.csv";
+std::string controllerLogCsv     = "sybil-attack/outputs/controller_log.csv";
 
 // Persistent CSV file handles — opened once after headers are written, closed at program exit.
 // Eliminates per-row open/write/close syscall overhead (hundreds of thousands of operations).
@@ -4112,6 +4114,22 @@ LoadVinData()
 }
 
 static void
+InitializeRsuApprovalLogCsv()
+{
+    std::ofstream out(rsuApprovalLogCsv.c_str(), std::ios::out);
+    out << "run_id,sim_time,rsu_id,zone_id,approved_claimed_id,"
+           "rssi_corroborated,is_malicious_rsu\n";
+}
+
+static void
+InitializeControllerLogCsv()
+{
+    std::ofstream out(controllerLogCsv.c_str(), std::ios::out);
+    out << "run_id,sim_time,controller_id,zone_id,"
+           "fraudulent_registrations,model_param_norm,is_malicious_ctrl\n";
+}
+
+static void
 InitializeCommunicationCsv()
 {
     std::ofstream out(communicationCsv.c_str(), std::ios::out);
@@ -4121,7 +4139,12 @@ InitializeCommunicationCsv()
         << "bsm_speed,bsm_heading,v2rsu_report_type,v2rsu_window_start,v2rsu_window_end,"
         << "v2rsu_neighbor_count,v2rsu_suspicious_count,"
         << "rsu2sdn_claimed_vehicle_id,rsu2sdn_observer_count,rsu2sdn_report_count,"
-        << "rsu2sdn_trust_score,rsu2sdn_suspicion_flags,status,attack_type\n";
+        << "rsu2sdn_trust_score,rsu2sdn_suspicion_flags,status,attack_type";
+    if (!g_datasetMode.empty())
+        out << ",run_id,seed,scenario_id,observing_zone,tx_home_zone,"
+               "observer_obu_id,observing_rsu_id,is_attacker,attack_type_label,"
+               "active_attack_pct,sybil_fanout";
+    out << "\n";
 }
 
 static void
@@ -9772,7 +9795,42 @@ LogReceivedPacket(const std::string& receiverRole,
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.trustScore       : 0.0) << ","
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.suspicionFlags   : 0u) << ","
         << (hasTag ? "received_tagged" : "received_untagged") << ","
-        << ActiveAttackTypeAt(Simulator::Now().GetSeconds()) << "\n";
+        << ActiveAttackTypeAt(Simulator::Now().GetSeconds());
+    if (!g_datasetMode.empty())
+    {
+        double   now    = Simulator::Now().GetSeconds();
+        uint32_t realId = hasTag ? tag.GetRealNodeId() : 0u;
+        uint32_t obsZone = 0u, obzObu = 0u, obsRsu = 0u;
+        if (receiverRole == "vehicle")
+        {
+            obzObu  = receiverId;
+            obsZone = ZoneOfVehicle(receiverId);
+        }
+        else if (receiverRole == "rsu_edge")
+        {
+            obsRsu  = receiverId;
+            obsZone = (receiverId < g_rsuControllerAssignment.size())
+                      ? g_rsuControllerAssignment[receiverId] : 0u;
+        }
+        uint32_t txHomeZone = ZoneOfVehicle(realId);
+        uint32_t isAtk      = (hasTag &&
+                               tag.GetRealNodeId() != tag.GetClaimedNodeId()) ? 1u : 0u;
+        uint32_t rowAtkType = GetRowAttackType(realId, now);
+        uint32_t rowAtkPct  = GetActiveAttackPct(realId, now);
+        uint32_t rowFanout  = GetVehicleFanoutForLog(realId);
+        out << "," << g_runId
+            << "," << g_runSeed
+            << "," << g_scenarioId
+            << "," << obsZone
+            << "," << txHomeZone
+            << "," << obzObu
+            << "," << obsRsu
+            << "," << isAtk
+            << "," << rowAtkType
+            << "," << rowAtkPct
+            << "," << rowFanout;
+    }
+    out << "\n";
 
     // M1 PDR accounting.
     //   Unicast (non-beacon): one intended receiver -> always credited (M1.1).
@@ -10311,13 +10369,36 @@ SendRsuControllerReport(uint32_t rsuIndex)
     // Type 5: malicious RSU upserts fabricated Sybil records into its own regional
     // awareness table before reporting.  The controller receives and stores them as
     // legitimate vehicles, propagating the Sybil IDs upward.
+    // For mode 9, RSUs are marked malicious for the whole run but injection must
+    // only fire during phase 5 (attack-type 5 window).
+    bool seq6RsuGate = (g_activeAttackType != ATTACK_SEQUENTIAL_ALL6) ||
+                       (ActiveAttackTypeAt6(Simulator::Now().GetSeconds()) == 5u);
     bool maliciousRsuInjection =
         sybil_attack_enabled &&
         IsRsuMalicious(rsuIndex) &&
-        rsuIndex < g_rsuRegionalAwarenessTables.size();
+        rsuIndex < g_rsuRegionalAwarenessTables.size() &&
+        seq6RsuGate;
     if (maliciousRsuInjection)
     {
         InjectSybilRecordsIntoRsuTable(rsuIndex, g_rsuRegionalAwarenessTables[rsuIndex]);
+
+        // Dataset-mode: log each injected phantom to rsu_approval_log.csv.
+        if (!g_datasetMode.empty())
+        {
+            double   now    = Simulator::Now().GetSeconds();
+            uint32_t zoneId = GetControllerIndexForRsu(rsuIndex);
+            std::ofstream af(rsuApprovalLogCsv.c_str(), std::ios::app);
+            for (uint32_t k = 0u; k < RsuSybilBudget(); ++k)
+            {
+                uint32_t sybilId = N_Vehicles + 100u + rsuIndex * N_SYBIL_RSU_MAX + k;
+                int rssiCorr = 0;
+                auto it = g_rsuRegionalAwarenessTables[rsuIndex].find(sybilId);
+                if (it != g_rsuRegionalAwarenessTables[rsuIndex].end())
+                    rssiCorr = (it->second.rssiVerifiedCount > 0u) ? 1 : 0;
+                af << g_runId << "," << now << "," << rsuIndex << "," << zoneId << ","
+                   << sybilId << "," << rssiCorr << ",1\n";
+            }
+        }
 
         for (uint32_t k = 0; k < RsuSybilBudget(); ++k)
         {
@@ -10481,8 +10562,21 @@ SendControllerRsuCommand(uint32_t rsuIndex)
     // Type 6: malicious controller injects Sybil records into its global table.
     // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections
     // when N_RSUs > 1).  Records then flow back to RSUs via controller commands.
-    if (sybil_attack_enabled && rsuIndex == 0)
+    // For mode 9, only fire during phase 6 (attack-type 6 window).
+    bool seq6CtrlGate = (g_activeAttackType != ATTACK_SEQUENTIAL_ALL6) ||
+                        (ActiveAttackTypeAt6(Simulator::Now().GetSeconds()) == 6u);
+    if (sybil_attack_enabled && rsuIndex == 0 && seq6CtrlGate)
+    {
         InjectSybilRecordsIntoControllerTable(g_controllerGlobalAwarenessTable);
+        if (!g_datasetMode.empty() && g_controllerIsMalicious)
+        {
+            double   now       = Simulator::Now().GetSeconds();
+            uint32_t nPhantoms = SdnSybilBudget();
+            std::ofstream cf(controllerLogCsv.c_str(), std::ios::app);
+            cf << g_runId << "," << now << ",0,0,"
+               << nPhantoms << "," << static_cast<double>(nPhantoms) << ",1\n";
+        }
+    }
 
     ControllerVehicleRecord target;
     bool hasTarget = SelectControllerTargetForRsu(rsuIndex, target);
@@ -10959,7 +11053,11 @@ main(int argc, char* argv[])
         }
     }
 
-    std::string configFile = "";  // consumed above; listed here so --help shows it
+    std::string configFile          = "";  // consumed above; listed here so --help shows it
+    // Dataset generation v2 — local parse strings (parsed after cmd.Parse)
+    std::string g_intensityLadderStr;
+    std::string g_sybilFanoutRangeStr;
+    std::string g_zoneProfilesPath;
     CommandLine cmd;
     cmd.AddValue("SecEnabled",                 "Enable crypto, registration & token auth (false = plain network)", g_secEnabled);
     cmd.AddValue("config",                     "Path to .cfg scenario file (key=value)",  configFile);
@@ -11030,9 +11128,20 @@ main(int argc, char* argv[])
     cmd.AddValue("rssiWindowSec",      "Rolling observation window (s) [default 2.0]",      rssiWindowSec);
     cmd.AddValue("rssiMinSamples",     "Min samples per RSU before including in detection [default 8]", rssiMinSamples);
     cmd.AddValue("rssiStreak",         "Consecutive windows to confirm Sybil [default 2]",  rssiStreakRequired);
-    cmd.AddValue("sweepMode",          "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
-    cmd.AddValue("quietMode",          "Suppress all console output; CSV writes are unaffected", quietMode);
-    cmd.AddValue("outputDir",          "Base directory for per-run CSV logs (must exist) [default sybil-attack/outputs]", outputDir);
+    cmd.AddValue("sweepMode",           "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
+    cmd.AddValue("quietMode",           "Suppress all console output; CSV writes are unaffected", quietMode);
+    cmd.AddValue("outputDir",           "Base directory for per-run CSV logs (must exist) [default sybil-attack/outputs]", outputDir);
+    // Dataset generation v2
+    cmd.AddValue("datasetMode",         "Dataset mode: sequential_all6 | zone_concurrent (leave empty for legacy behaviour)", g_datasetMode);
+    cmd.AddValue("intensitySchedule",   "Mode-9 intensity schedule: fixed | stepped [default fixed]", g_intensitySchedule);
+    cmd.AddValue("intensityLadder",     "Stepped-intensity pct ladder e.g. 20,40,60,80,100 [default 20,40,60,80,100]", g_intensityLadderStr);
+    cmd.AddValue("intensitySubwindows", "Sub-windows per phase for stepped intensity [default 5]", g_intensitySubwindows);
+    cmd.AddValue("sybilFanoutRange",    "Sybil fanout range min,max e.g. 2,20 [default 2,10]", g_sybilFanoutRangeStr);
+    cmd.AddValue("sybilIdsPerAttacker", "Fixed Sybil fanout per attacker (overrides sybilFanoutRange) [default 0=use range]", g_fanoutFixed);
+    cmd.AddValue("zoneProfiles",        "Path to zone_profiles.csv (required for zone_concurrent mode)", g_zoneProfilesPath);
+    cmd.AddValue("seed",                "Seed for reproducible attacker selection and fanout draws [default 42]", g_runSeed);
+    cmd.AddValue("runId",               "Run identifier stamped in dataset CSV columns (default: auto)", g_runId);
+    cmd.AddValue("scenarioId",          "Scenario label for run_meta.json (default: auto)", g_scenarioId);
     cmd.Parse(argc, argv);
 
     // Redirect every per-run CSV log under --outputDir so a parallel sweep can
@@ -11051,7 +11160,56 @@ main(int argc, char* argv[])
         rssiVerificationCsv          = outputDir + "/rssi_verification_log.csv";
         // animFile (NetAnim XML, ~30 MB/run) is intentionally NOT redirected —
         // dataset run folders hold communication/table CSV logs only.
+        rsuApprovalLogCsv = outputDir + "/rsu_approval_log.csv";
+        controllerLogCsv  = outputDir + "/controller_log.csv";
     }
+
+    // ── Dataset generation v2: post-parse processing ────────────────────────
+    // Parse --sybilFanoutRange "min,max"
+    if (!g_sybilFanoutRangeStr.empty())
+    {
+        auto pos = g_sybilFanoutRangeStr.find(',');
+        if (pos != std::string::npos)
+        {
+            try {
+                g_fanoutMin = static_cast<uint32_t>(
+                    std::stoul(g_sybilFanoutRangeStr.substr(0, pos)));
+                g_fanoutMax = static_cast<uint32_t>(
+                    std::stoul(g_sybilFanoutRangeStr.substr(pos + 1u)));
+            } catch (...) {}
+        }
+    }
+    if (g_fanoutMax < g_fanoutMin) g_fanoutMax = g_fanoutMin;
+    g_fanoutMin = std::max(1u, std::min(20u, g_fanoutMin));
+    g_fanoutMax = std::max(g_fanoutMin, std::min(20u, g_fanoutMax));
+    if (g_fanoutFixed > 0u) g_fanoutFixed = std::min(20u, g_fanoutFixed);
+
+    // Parse --intensityLadder
+    if (!g_intensityLadderStr.empty())
+        g_intensityLadder = ParseIntensityLadder(g_intensityLadderStr);
+    if (g_intensityLadder.empty())
+        g_intensityLadder = {20u, 40u, 60u, 80u, 100u};
+
+    // Bidirectional sync: --datasetMode ↔ sybil_attack_type
+    if (!g_datasetMode.empty() && sybil_attack_enabled)
+    {
+        if      (g_datasetMode == "sequential_all6" && sybil_attack_type != 9u)
+            sybil_attack_type = 9u;
+        else if (g_datasetMode == "zone_concurrent"  && sybil_attack_type != 8u)
+            sybil_attack_type = 8u;
+    }
+    if (g_datasetMode.empty())
+    {
+        if      (sybil_attack_type == 9u) g_datasetMode = "sequential_all6";
+        else if (sybil_attack_type == 8u) g_datasetMode = "zone_concurrent";
+    }
+
+    // Auto-fill scenario_id and run_id if not provided
+    if (g_scenarioId.empty())
+        g_scenarioId = g_datasetMode.empty() ? "baseline" : g_datasetMode;
+    if (g_runId.empty())
+        g_runId = g_scenarioId + "_s" + std::to_string(g_runSeed);
+
     if (proposed_method != kNoLegacyProposedMethod)
         solution_mode = MapLegacyProposedMethod(proposed_method);
     ConfigureSolutionMode();
@@ -11132,6 +11290,35 @@ main(int argc, char* argv[])
                   << simTime << "s total run.\n";
     }
 
+    // Sequential-all-6 dataset mode (type 9): same logic, but 6 phases.
+    if (sybil_attack_enabled && sybil_attack_type == 9)
+    {
+        // Zone-profiles CSV must be present for mode 8, not mode 9.
+        g_seq6PhaseDuration = simTime;
+        simTime             = simTime * static_cast<double>(kSeq6NumPhases);
+        std::cout << "[sybil_attacks] Sequential-all-6 mode: " << kSeq6NumPhases
+                  << " phases x " << g_seq6PhaseDuration << "s = "
+                  << simTime << "s total run.\n";
+    }
+
+    // Zone-concurrent mode (type 8): parse zone profiles before DeclareAttackers.
+    if (sybil_attack_enabled && sybil_attack_type == 8)
+    {
+        if (g_zoneProfilesPath.empty())
+        {
+            std::cerr << "[dataset] ERROR: --datasetMode=zone_concurrent requires "
+                         "--zoneProfiles=<path>\n";
+            return 1;
+        }
+        ParseZoneProfiles(g_zoneProfilesPath);
+        if (g_zoneProfiles.empty())
+        {
+            std::cerr << "[dataset] ERROR: zone_profiles CSV empty or invalid: "
+                      << g_zoneProfilesPath << "\n";
+            return 1;
+        }
+    }
+
     // Resolve attack type and populate per-node attacker flags.
     // Must run after routing_test / N_RSUs adjustments.
     DeclareAttackStates();
@@ -11157,6 +11344,47 @@ main(int argc, char* argv[])
             if (IsSybilVehicle(i)) af << i << "\n";
     }
 
+    // Sequential-all-6 mode (type 9): emit phase/attacker metadata.
+    if (sybil_attack_enabled && sybil_attack_type == 9)
+    {
+        std::ofstream pf((outputDir + "/attack_phases_seq6.csv").c_str());
+        pf << "phase,attack_type,start_time,end_time\n";
+        for (uint32_t p = 0u; p < kSeq6NumPhases; ++p)
+        {
+            double s = std::max(static_cast<double>(p) * g_seq6PhaseDuration,
+                                g_attackOnsetTime);
+            double e = static_cast<double>(p + 1u) * g_seq6PhaseDuration - kSeq6PhaseGapSec;
+            pf << p << "," << kSeq6AttackTypes[p] << "," << s << "," << e << "\n";
+        }
+        std::ofstream af((outputDir + "/sybil_attackers_seq6.csv").c_str());
+        af << "attacker_node_id\n";
+        for (uint32_t i = 0u; i < N_Vehicles; ++i)
+            if (IsSybilVehicle(i)) af << i << "\n";
+    }
+
+    // Write run_meta.json for any dataset mode.
+    if (!g_datasetMode.empty())
+    {
+        double perPhase = (sybil_attack_type == 9u) ? g_seq6PhaseDuration :
+                          (sybil_attack_type == 7u) ? g_seqPhaseDuration  : simTime;
+        std::ofstream mf((outputDir + "/run_meta.json").c_str());
+        mf << "{\n"
+           << "  \"mode\": \""          << g_datasetMode        << "\",\n"
+           << "  \"seed\": "            << g_runSeed             << ",\n"
+           << "  \"run_id\": \""        << g_runId               << "\",\n"
+           << "  \"scenario_id\": \""   << g_scenarioId          << "\",\n"
+           << "  \"sim_time_per_phase\":" << perPhase             << ",\n"
+           << "  \"total_sim_time\": "  << simTime               << ",\n"
+           << "  \"intensity_schedule\":\"" << g_intensitySchedule << "\",\n"
+           << "  \"fanout_min\": "      << g_fanoutMin            << ",\n"
+           << "  \"fanout_max\": "      << g_fanoutMax            << ",\n"
+           << "  \"sybil_attack_percentage\":" << sybil_attack_percentage << ",\n"
+           << "  \"N_Vehicles\": "      << N_Vehicles             << ",\n"
+           << "  \"N_RSUs\": "          << N_RSUs                 << ",\n"
+           << "  \"N_Controllers\": "   << N_Controllers          << "\n"
+           << "}\n";
+    }
+
     InitializeCommunicationCsv();
     InitializeVehicleNeighborTableCsv();
     InitializeRsuVehicleTableCsv();
@@ -11166,6 +11394,11 @@ main(int argc, char* argv[])
     InitializeControllerVehicleTableCsv();
     InitializeControllerGlobalAwarenessCsv();
     InitializeRssiVerificationCsv();
+    if (!g_datasetMode.empty())
+    {
+        InitializeRsuApprovalLogCsv();
+        InitializeControllerLogCsv();
+    }
     OpenPersistentCsvHandles();
     InitializeMetricsCsvFiles();
 
@@ -11193,6 +11426,26 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
 
     InstallSelectedMobility();
+
+    // Zone-based dataset modes: freeze vehicle home zones from spawn positions
+    // (requires RSU mobility to be installed first, so must be AFTER InstallSelectedMobility).
+    if (!g_datasetMode.empty())
+        InitVehicleHomeZones();
+
+    // Zone-concurrent mode: per-zone attacker selection needs zone assignments.
+    if (g_activeAttackType == ATTACK_ZONE_CONCURRENT)
+    {
+        DeclareAttackersMode8();
+        std::ofstream af((outputDir + "/sybil_attackers_mode8.csv").c_str());
+        af << "attacker_node_id,attack_type,zone_id,fanout\n";
+        for (uint32_t i = 0u; i < N_Vehicles; ++i)
+            if (IsSybilVehicle(i))
+                af << i << ","
+                   << (i < g_vehicleAttackType.size() ? g_vehicleAttackType[i] : 0u) << ","
+                   << ZoneOfVehicle(i) << ","
+                   << (i < g_vehicleFanout.size() ? g_vehicleFanout[i] : 0u) << "\n";
+    }
+
     InitializeRssiSolution();
 
     // -----------------------------------------------------------------------
@@ -11492,6 +11745,12 @@ main(int argc, char* argv[])
                 continue;
             if (g_activeAttackType == ATTACK_SEQUENTIAL_1234 && IsSybilVehicle(i) &&
                 ActiveAttackTypeAt(t) == 1u)
+                continue;
+            if (g_activeAttackType == ATTACK_ZONE_CONCURRENT && IsSybilVehicle(i) &&
+                i < g_vehicleAttackType.size() && g_vehicleAttackType[i] == 1u)
+                continue;
+            if (g_activeAttackType == ATTACK_SEQUENTIAL_ALL6 && IsSybilVehicle(i) &&
+                ActiveAttackTypeAt6(t) == 1u)
                 continue;
 
             Ptr<Socket> vehicleSocket = CreateSenderSocket(g_vehicleNodes.Get(i));
