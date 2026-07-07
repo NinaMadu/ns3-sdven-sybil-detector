@@ -4750,8 +4750,17 @@ AutoConfigureSumoMode()
     // Only auto-set simTime when the user left it at the 12 s default.
     // If the user passed an explicit --simTime value, honour it so that
     // short test runs (e.g. --simTime=60) work with the full-length traces.
+    //
+    // Dataset sequential modes (type 7 = seq-1234, type 9 = seq-all-6) are
+    // exempt: for those, --simTime is the PER-PHASE length, not the total run
+    // length, and the real total is computed later (phase count x --simTime).
+    // This function runs BEFORE that multiplication, so without this guard a
+    // small, deliberate per-phase value like --simTime=6 (<=12) gets silently
+    // rewritten to the trace's ~300s length here, which the later phase-count
+    // multiply then blows up to ~1800s total -- a run nobody asked for.
     const double kDefaultSimTime = 12.0;
-    if (traceMaxTime > 0.0 && simTime <= kDefaultSimTime)
+    bool isSequentialDatasetMode = (sybil_attack_type == 7u || sybil_attack_type == 9u);
+    if (traceMaxTime > 0.0 && simTime <= kDefaultSimTime && !isSequentialDatasetMode)
     {
         std::cout << "[Mobility] sumoAutoConfig: simTime " << simTime
                   << " -> " << traceMaxTime
@@ -10370,9 +10379,14 @@ SendRsuControllerReport(uint32_t rsuIndex)
     // awareness table before reporting.  The controller receives and stores them as
     // legitimate vehicles, propagating the Sybil IDs upward.
     // For mode 9, RSUs are marked malicious for the whole run but injection must
-    // only fire during phase 5 (attack-type 5 window).
+    // only fire during phase 5 (attack-type 5 window), and — under stepped
+    // intensity — only for the subset of malicious RSUs active in the current
+    // sub-window (IsMaliciousRsuActiveNow), giving phase 5 the same real
+    // intensity ramp phases 1-4 already have via SchedulePhaseWindowFanout.
+    double now = Simulator::Now().GetSeconds();
     bool seq6RsuGate = (g_activeAttackType != ATTACK_SEQUENTIAL_ALL6) ||
-                       (ActiveAttackTypeAt6(Simulator::Now().GetSeconds()) == 5u);
+                       (ActiveAttackTypeAt6(now) == 5u &&
+                        IsMaliciousRsuActiveNow(rsuIndex, now));
     bool maliciousRsuInjection =
         sybil_attack_enabled &&
         IsRsuMalicious(rsuIndex) &&

@@ -112,6 +112,7 @@ run_mode1() {
 
     ( cd "$SIM_DIR" && "${MEMWRAP[@]}" "$SIM_BIN" \
         --mobility_mode=${MOBILITY_MODE} \
+        --routing_test=false \
         --sybil_attack_enabled=true \
         --datasetMode=sequential_all6 \
         --sybil_attack_percentage=${ATK_PCT} \
@@ -156,6 +157,7 @@ run_mode2() {
 
     ( cd "$SIM_DIR" && "${MEMWRAP[@]}" "$SIM_BIN" \
         --mobility_mode=${MOBILITY_MODE} \
+        --routing_test=false \
         --sybil_attack_enabled=true \
         --datasetMode=zone_concurrent \
         --simTime=${SIM_TIME} \

@@ -1524,6 +1524,27 @@ GetActiveAttackPct(uint32_t vehicleIndex, double t)
     return sybil_attack_percentage;
 }
 
+// IsMaliciousRsuActiveNow: mode-9 phase-5 stepped-intensity gate for RSU-level
+// injection. Mirrors SchedulePhaseWindowFanout's vehicle-level activeSet, but
+// evaluated at call time in SendRsuControllerReport (RSU injection fires from
+// a periodic report callback, not a pre-scheduled Simulator::Schedule burst
+// like the vehicle attacks, so there's no upfront activeSet to build).
+// Malicious RSUs are the first nMalRsu indices (see DeclareAttackers), so
+// gating on plain index order here keeps the same nesting property: the
+// active set at any sub-window is always a prefix of the malicious-RSU set.
+inline bool
+IsMaliciousRsuActiveNow(uint32_t rsuIndex, double t)
+{
+    if (g_activeAttackType != ATTACK_SEQUENTIAL_ALL6 ||
+        g_intensitySchedule != "stepped" || g_intensityLadder.empty())
+    {
+        return true;  // no stepped schedule active -- always on, as before
+    }
+    uint32_t pct     = GetActiveAttackPct(0u, t);
+    uint32_t nActive = N_RSUs * pct / 100u;
+    return rsuIndex < nActive;
+}
+
 // GetRowAttackType: per-row ground-truth attack-type label.
 inline uint32_t
 GetRowAttackType(uint32_t realNodeId, double t)
