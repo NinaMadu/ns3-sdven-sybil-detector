@@ -11154,7 +11154,7 @@ main(int argc, char* argv[])
         rsuVehicleTableCsv           = outputDir + "/rsu_vehicle_table_log.csv";
         rsuVehicleObservationCsv     = outputDir + "/rsu_vehicle_observation_rows_log.csv";
         rsuRegionalAwarenessCsv      = outputDir + "/rsu_regional_awareness_log.csv";
-        rsuPassiveBeaconEvidenceCsv  = outputDir + "/rsu_passive_beacon_evidence_log.csv";
+        computedDetectionEvidenceCsv = outputDir + "/computed_detection_evidence_log.csv";
         controllerVehicleTableCsv    = outputDir + "/controller_vehicle_table_log.csv";
         controllerGlobalAwarenessCsv = outputDir + "/controller_global_awareness_log.csv";
         rssiVerificationCsv          = outputDir + "/rssi_verification_log.csv";
@@ -11211,7 +11211,20 @@ main(int argc, char* argv[])
         g_runId = g_scenarioId + "_s" + std::to_string(g_runSeed);
 
     if (proposed_method != kNoLegacyProposedMethod)
-        solution_mode = MapLegacyProposedMethod(proposed_method);
+    {
+        // Legacy alias, restored alongside the mode-8/9 dataset cherry-pick: some
+        // sweep scripts (e.g. collect_sybil_metrics.py) still pass --proposed_method
+        // instead of --solution_mode.
+        switch (proposed_method)
+        {
+        case 0:  solution_mode = MODE_NO_DETECTION; break;
+        case 1:  solution_mode = MODE_LIGHTWEIGHT;  break;
+        case 2:  solution_mode = MODE_BASELINE_ML;  break;
+        case 3:  solution_mode = MODE_BASELINE_FL;  break;
+        case 4:  solution_mode = MODE_FULL;         break;
+        default: solution_mode = proposed_method;   break;
+        }
+    }
     ConfigureSolutionMode();
 
     static std::ofstream devNull("/dev/null");
