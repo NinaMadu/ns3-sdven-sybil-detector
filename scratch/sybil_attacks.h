@@ -51,6 +51,37 @@ static std::vector<bool>  g_rsuIsMalicious;       ///< true ↔ RSU is compromis
 static bool               g_controllerIsMalicious = false;
 static SybilAttackType    g_activeAttackType      = ATTACK_NONE;
 
+// ---------------------------------------------------------------------------
+// Sequential multi-attack mode (sybil_attack_type = 7), used for ML/DL dataset
+// generation.  Attacks 1→2→3→4 run back-to-back inside ONE simulation, each for
+// one phase of g_seqPhaseDuration seconds (the per-phase value the user passes
+// as --simTime).  A short quiet gap at the end of each phase keeps the RSSI
+// detector window from mixing two attacks across a boundary.  Because every
+// phase shares the SAME legitimate vehicle population, the resulting single
+// communication_log needs no cross-run merge — so legitimate node IDs are never
+// duplicated.  Total run length = g_seqPhaseDuration * g_seqNumPhases.
+static const uint32_t g_seqAttackTypes[4] = {1, 2, 3, 4};  ///< attack run per phase, in order
+static const uint32_t g_seqNumPhases      = 4;             ///< number of phases
+static const double   g_seqPhaseGapSec    = 3.0;           ///< quiet seconds at end of each phase
+static double         g_seqPhaseDuration  = 0.0;           ///< per-phase length; set in main()
+
+// Returns the attack-type number (1-6) in effect at simulation time t.
+// Sequential mode maps t to its phase's attack type (1..4); every other mode
+// returns its single static attack type for all t.  Used both to phase the
+// Outsider beacon-skip and to stamp the attack_type column in the CSV logs.
+inline uint32_t
+ActiveAttackTypeAt(double t)
+{
+    if (g_activeAttackType == ATTACK_SEQUENTIAL_1234)
+    {
+        if (g_seqPhaseDuration <= 0.0) return 0u;
+        uint32_t p = static_cast<uint32_t>(t / g_seqPhaseDuration);
+        if (p >= g_seqNumPhases) p = g_seqNumPhases - 1u;
+        return g_seqAttackTypes[p];
+    }
+    return static_cast<uint32_t>(g_activeAttackType);
+}
+
 // ===========================================================================
 // Query helpers — used by ColorAndLabelNodes and the normal traffic callbacks
 // ===========================================================================
@@ -84,6 +115,7 @@ AttackTypeToString(SybilAttackType t)
     case ATTACK_INSIDER_INDIRECT:                return "Insider Indirect";
     case ATTACK_MALICIOUS_RSU:                   return "Malicious RSU";
     case ATTACK_MALICIOUS_SDN_CONTROLLER:        return "Malicious SDN Controller";
+    case ATTACK_SEQUENTIAL_1234:                 return "Sequential 1->2->3->4 (dataset mode)";
     default:                                     return "None";
     }
 }
@@ -140,10 +172,10 @@ DeclareAttackStates()
     }
 
     // Bug 5 fix: reject out-of-range attack type before the cast.
-    if (sybil_attack_type > 6)
+    if (sybil_attack_type > 7)
     {
         std::cerr << "[sybil_attacks] ERROR: sybil_attack_type=" << sybil_attack_type
-                  << " is out of range [0,6] — disabling attack.\n";
+                  << " is out of range [0,7] — disabling attack.\n";
         g_activeAttackType = ATTACK_NONE;
         return;
     }
@@ -175,7 +207,8 @@ DeclareAttackers()
     bool vehiclesAttack = (g_activeAttackType == ATTACK_OUTSIDER                        ||
                            g_activeAttackType == ATTACK_INSIDER_DIRECT_SIMULTANEOUS     ||
                            g_activeAttackType == ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS ||
-                           g_activeAttackType == ATTACK_INSIDER_INDIRECT);
+                           g_activeAttackType == ATTACK_INSIDER_INDIRECT                ||
+                           g_activeAttackType == ATTACK_SEQUENTIAL_1234);
     if (vehiclesAttack)
     {
         uint32_t nAttackers = N_Vehicles * sybil_attack_percentage / 100u;
@@ -251,16 +284,18 @@ static const double   SIMULTANEOUS_SLOT_OFFSETS[N_SYBIL_SIMULTANEOUS_MAX] =
     0.002, 0.006, 0.011, 0.017
 };
 
-// Type 3 emits multiple fake identities sequentially, not simultaneously.  The
-// intentionally uneven inter-arrival pattern gives the detector a measurable
-// var(IAT) signature while preserving a realistic "rotate, then go quiet" cycle.
-static const uint32_t N_SYBIL_NON_SIMULTANEOUS_MAX = 5;
-static const double   NON_SIM_BURST_PERIOD     = 3.0;
-static const double   NON_SIM_CYCLE_SKEW_STEP  = 0.030;
-static const double   NON_SIM_BURST_OFFSETS[N_SYBIL_NON_SIMULTANEOUS_MAX] =
-{
-    0.00, 0.12, 0.55, 1.25, 1.85
-};
+// Type 3 (Insider Direct Non-Simultaneous): the attacker holds ONE fabricated
+// pseudonym at a time for a dwell window of N_NON_SIM_BEACONS_PER_DWELL beacons
+// (emitted at the normal beacon cadence along a continuous trajectory), then
+// retires it and activates the next.  Only one identity is ever live at a given
+// instant — this is the property that distinguishes Type 3 from the
+// simultaneous Type 2.  NonSimultaneousSybilBudget() identities are rotated per
+// cycle, after which the attacker idles for NON_SIM_CYCLE_QUIET_SEC, mimicking a
+// realistic "rotate a batch of pseudonyms, then go quiet" pattern.
+static const uint32_t N_SYBIL_NON_SIMULTANEOUS_MAX = 5;   // identity-budget ceiling per cycle
+static const uint32_t N_NON_SIM_BEACONS_PER_DWELL  = 5;   // beacons emitted under each identity
+static const double   NON_SIM_INTER_ID_GAP_SEC     = 0.5; // quiet gap between retire and next activate
+static const double   NON_SIM_CYCLE_QUIET_SEC      = 2.0; // longer idle after a full rotation batch
 
 // Sybil ID budgets per infrastructure attacker (Types 5 & 6).
 // Type 5 uses up to 5 IDs per malicious RSU so 10-RSU sweeps produce a visible
@@ -410,7 +445,7 @@ IndirectRelaySybilId(uint32_t attackerIndex, uint32_t relayEpoch)
 // Sybil ID namespace per attack type (no collisions):
 //   Type 1 outsider     :  N_Vehicles + 200 + attacker * N_SYBIL_OUTSIDER_NEIGHBORS_MAX + k
 //   Type 2 direct-sim   :  N_Vehicles + 20 + attacker * 10 + k
-//   Type 3 direct-non   :  N_Vehicles + 300 + attacker * 100 + cycle * N_SYBIL_NON_SIMULTANEOUS_MAX + k
+//   Type 3 direct-non   :  N_Vehicles + 300 + attacker * 100000 + identityIndex
 //   Type 4 indirect     :  N_Vehicles + 400 + attacker
 //   Type 5 rsu          :  N_Vehicles + 100 + rsuIndex * N_SYBIL_RSU_MAX + k
 //   Type 6 sdn          :  N_Vehicles + 150 + k
@@ -913,43 +948,50 @@ LegacyType2ReportInjection(uint32_t vehicleIndex, V2RsuAwarenessReportTag& repor
 // ---------------------------------------------------------------------------
 // BroadcastNonSimultaneousSybilBeacon  (Type 3 — Insider Direct Non-Sim.)
 //
-// One insider emits different Sybil identities over a short burst window.  The
-// fake BSM positions stay in the same small spatial region around the attacker,
-// but the transmissions are separated in time.  Neighbour vehicles learn these
-// as separate first-seen IDs and later report them to the RSU.
+// Standard non-simultaneous Sybil behaviour: the insider activates ONE
+// fabricated pseudonym and keeps it alive for a short dwell window, emitting
+// several BSMs (beaconIdx = 0,1,2,…) along a CONTINUOUS local trajectory before
+// retiring it and switching to the next identity.  Persisting each identity for
+// multiple beacons gives every phantom a realistic, kinematically-consistent
+// track instead of the previous single one-shot appearance, while still keeping
+// only one Sybil identity live at any instant (vs. the simultaneous Type 2).
+//
+//   identityIndex — monotonic per-attacker identity counter (never reused).
+//   beaconIdx     — beacon position within this identity's dwell window.
 // ---------------------------------------------------------------------------
+
+// Per-identity spawn offset (keeps each phantom in the attacker's local region)
+// plus a small constant drift velocity (m/s) so the claimed BSM positions trace
+// a continuous short path over the dwell instead of sitting at one fixed point.
+static const double kNonSimSpawnOffX[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +6.0, +7.0, +5.5, +6.5, -6.0 };
+static const double kNonSimSpawnOffY[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +3.0, +4.5, +7.0, +2.5, +8.0 };
+static const double kNonSimDriftVX [N_SYBIL_NON_SIMULTANEOUS_MAX]  = { +0.8, +0.5, +0.6, +0.4, -0.7 };
+static const double kNonSimDriftVY [N_SYBIL_NON_SIMULTANEOUS_MAX]  = { +0.4, +0.6, -0.3, +0.5, +0.5 };
+
 static void
 BroadcastNonSimultaneousSybilBeacon(uint32_t vehicleIndex,
-                                    uint32_t burstCycle,
-                                    uint32_t burstSlot)
+                                    uint32_t identityIndex,
+                                    uint32_t beaconIdx,
+                                    double   beaconInterval)
 {
     if (!g_vehicleIsAttacker[vehicleIndex]) return;
-    if (burstSlot >= NonSimultaneousSybilBudget()) return;
     if (Simulator::Now().GetSeconds() < g_attackOnsetTime) return;
 
     Vector pos = g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>()->GetPosition();
 
-    uint32_t sybilId = N_Vehicles + 300u +
-                       vehicleIndex * 100u +
-                       burstCycle * N_SYBIL_NON_SIMULTANEOUS_MAX +
-                       burstSlot;
+    // Unique, never-reused Sybil ID per (attacker, identity).  Only one attack
+    // type is active per run, so a per-attacker block keeps Type-3 IDs distinct.
+    uint32_t sybilId = N_Vehicles + 300u + vehicleIndex * 100000u + identityIndex;
 
-    // Keep every rotated identity in the same spatial cell while giving the
-    // burst a plausible local drift across cycles.  This preserves the Type-3
-    // "new IDs in one region" evidence while avoiding static repeated offsets.
-    // Reduced from {8,12,6,10,-7}: after ClaimedOffsetScale(1.2) the 12m and
-    // 10m slots produced >8.56m effective mismatch → always TP.  New values
-    // keep all slots in the partial-detection zone (~6-8m after scaling) so
-    // the TP→FN transition is driven by f[8] beacon-count accumulation.
-    static const double kBaseOffX[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +6.0, +7.0, +5.5, +6.5, -6.0 };
-    static const double kBaseOffY[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +3.0, +4.5, +7.0, +2.5, +8.0 };
-    static const double kSlotDriftX[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +0.8, +0.5, +0.6, +0.4, -0.2 };
-    static const double kSlotDriftY[N_SYBIL_NON_SIMULTANEOUS_MAX] = { +0.1, +0.2, -0.1, +0.3, +0.5 };
-    double cycleDrift = static_cast<double>(burstCycle % 4u);
-    double offX = kBaseOffX[burstSlot] * ClaimedOffsetScale() +
-                  kSlotDriftX[burstSlot] * MobilityDriftScale() * cycleDrift;
-    double offY = kBaseOffY[burstSlot] * ClaimedOffsetScale() +
-                  kSlotDriftY[burstSlot] * MobilityDriftScale() * cycleDrift;
+    // Continuous trajectory: spawn offset + drift × elapsed dwell time.  The
+    // attacker's own motion is captured by re-sampling pos every beacon, so the
+    // phantom follows a believable local path alongside the attacker.
+    uint32_t slot         = identityIndex % N_SYBIL_NON_SIMULTANEOUS_MAX;
+    double   dwellElapsed = static_cast<double>(beaconIdx) * beaconInterval;
+    double   offX = kNonSimSpawnOffX[slot] * ClaimedOffsetScale() +
+                    kNonSimDriftVX[slot]   * MobilityDriftScale() * dwellElapsed;
+    double   offY = kNonSimSpawnOffY[slot] * ClaimedOffsetScale() +
+                    kNonSimDriftVY[slot]   * MobilityDriftScale() * dwellElapsed;
 
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     sock->SetAllowBroadcast(true);
@@ -968,8 +1010,8 @@ BroadcastNonSimultaneousSybilBeacon(uint32_t vehicleIndex,
               << "[SEND] [NON_SIM_SYBIL_BEACON]   "
               << "Vehicle=" << vehicleIndex
               << " ClaimedId=" << sybilId
-              << " BurstCycle=" << burstCycle
-              << " Slot=" << burstSlot
+              << " Identity=" << identityIndex
+              << " Beacon=" << beaconIdx
               << " ClaimedOffset=(" << offX << "," << offY << ")"
               << " -> Broadcast" << std::endl;
 
@@ -1127,10 +1169,127 @@ MaliciousControllerInjectPhantoms(uint32_t rsuIndex)
 //   legitimate ones on the wireless channel.
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// Windowed schedulers — schedule ONE attack's traffic confined to the time
+// window [startT, endT).  These mirror the per-type cases of the switch below,
+// but with the time bounds passed in so the sequential mode (type 7) can run
+// each attack inside its own phase.  The single-attack switch cases are left
+// exactly as they were; these are additive and used only by case 7.
+// ---------------------------------------------------------------------------
+inline void
+ScheduleOutsiderWindow(double startT, double endT, double beaconInterval)
+{
+    for (double t = startT; t < endT - 0.5; t += beaconInterval)
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
+            if (g_vehicleIsAttacker[i])
+            {
+                Simulator::Schedule(
+                    Seconds(t + 0.05 * static_cast<double>(i) + 0.30),
+                    &OutsiderSendSybilReport, i);
+                for (uint32_t slot = 0; slot < N_SYBIL_OUTSIDER_NEIGHBORS_MAX; ++slot)
+                    Simulator::Schedule(
+                        Seconds(t + 0.05 * static_cast<double>(i) + 0.35
+                                  + 0.05 * static_cast<double>(slot)),
+                        &OutsiderBroadcastSybilBeacon, i, slot);
+            }
+}
+
+inline void
+ScheduleSimultaneousWindow(double startT, double endT, double beaconInterval)
+{
+    for (double t = startT; t < endT - 0.5; t += beaconInterval)
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
+        {
+            if (!g_vehicleIsAttacker[i]) continue;
+            for (uint32_t slot = 0; slot < SimultaneousSybilBudget(); ++slot)
+            {
+                uint32_t cycle = static_cast<uint32_t>(
+                    std::max(0.0, (t - startT) / beaconInterval));
+                Simulator::Schedule(
+                    Seconds(t + 0.05 * static_cast<double>(i) +
+                            SimultaneousSlotOffset(slot, cycle, i)),
+                    &BroadcastSimultaneousSybilBeacon, i, slot, cycle);
+            }
+        }
+}
+
+inline void
+ScheduleNonSimultaneousWindow(double startT, double endT, double beaconInterval)
+{
+    const double dwellSpan =
+        static_cast<double>(N_NON_SIM_BEACONS_PER_DWELL) * beaconInterval;
+    for (uint32_t i = 0; i < N_Vehicles; ++i)
+    {
+        if (!g_vehicleIsAttacker[i]) continue;
+        uint32_t identityIndex = 0;
+        double   cursor = startT + 0.05 * static_cast<double>(i);
+        while (cursor < endT - 1.5)
+        {
+            uint32_t batch = NonSimultaneousSybilBudget();
+            for (uint32_t s = 0; s < batch && cursor < endT - 1.5; ++s)
+            {
+                for (uint32_t b = 0; b < N_NON_SIM_BEACONS_PER_DWELL; ++b)
+                {
+                    double txTime = cursor + static_cast<double>(b) * beaconInterval;
+                    if (txTime >= endT - 0.5) break;
+                    Simulator::Schedule(Seconds(txTime),
+                                        &BroadcastNonSimultaneousSybilBeacon,
+                                        i, identityIndex, b, beaconInterval);
+                }
+                cursor += dwellSpan + NON_SIM_INTER_ID_GAP_SEC;
+                ++identityIndex;
+            }
+            cursor += NON_SIM_CYCLE_QUIET_SEC;
+        }
+    }
+}
+
+inline void
+ScheduleIndirectWindow(double startT, double endT, double beaconInterval)
+{
+    uint32_t relayEpoch = 0;
+    for (double t = startT; t < endT - 0.5; t += beaconInterval, ++relayEpoch)
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
+            if (g_vehicleIsAttacker[i])
+                Simulator::Schedule(Seconds(t + 0.05 * static_cast<double>(i) + 0.25),
+                                    &RelayForwardSybilBeacon, i, relayEpoch);
+}
+
 inline void
 ScheduleAttackTraffic(double simTime, double beaconInterval, double rsuReportInterval)
 {
     if (g_activeAttackType == ATTACK_NONE) return;
+
+    // Sequential dataset mode: run attacks 1→2→3→4, each inside its own phase
+    // window, all in this single simulation.  One legitimate population → no
+    // cross-run merge → no duplicated legitimate IDs.
+    if (g_activeAttackType == ATTACK_SEQUENTIAL_1234)
+    {
+        const double D   = g_seqPhaseDuration;   // per-phase length (set in main)
+        const double gap = g_seqPhaseGapSec;     // quiet tail of each phase
+        if (D <= 0.0)
+        {
+            std::cerr << "[sybil_attacks] ERROR: sequential mode but g_seqPhaseDuration=0 "
+                         "— no attack scheduled.\n";
+            return;
+        }
+        for (uint32_t p = 0; p < g_seqNumPhases; ++p)
+        {
+            double phaseStart = static_cast<double>(p) * D;
+            double phaseEnd   = static_cast<double>(p + 1) * D - gap;
+            // Phase 0 must respect the global attack onset warm-up.
+            if (phaseStart < g_attackOnsetTime) phaseStart = g_attackOnsetTime;
+            switch (g_seqAttackTypes[p])
+            {
+            case 1: ScheduleOutsiderWindow(phaseStart, phaseEnd, beaconInterval);        break;
+            case 2: ScheduleSimultaneousWindow(phaseStart, phaseEnd, beaconInterval);    break;
+            case 3: ScheduleNonSimultaneousWindow(phaseStart, phaseEnd, beaconInterval); break;
+            case 4: ScheduleIndirectWindow(phaseStart, phaseEnd, beaconInterval);        break;
+            default: break;
+            }
+        }
+        return;
+    }
 
     switch (g_activeAttackType)
     {
@@ -1190,29 +1349,42 @@ ScheduleAttackTraffic(double simTime, double beaconInterval, double rsuReportInt
 
     // -----------------------------------------------------------------------
     // Type 3 (Insider Direct Non-Simultaneous):
-    // Emit a short sequence of different fake IDs from the same physical region.
-    // The IDs are not simultaneous; their uneven spacing is the IAT signature.
+    // Activate one fabricated identity at a time, hold it for a dwell window of
+    // N_NON_SIM_BEACONS_PER_DWELL beacons along a continuous trajectory, retire
+    // it, then activate the next.  After a batch of NonSimultaneousSybilBudget()
+    // identities the attacker idles for NON_SIM_CYCLE_QUIET_SEC.  Only one Sybil
+    // identity is ever live at once — the defining non-simultaneous property.
     // -----------------------------------------------------------------------
     case ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS:
     {
-        uint32_t cycle = 0;
-        for (double t = g_attackOnsetTime; t < simTime - 1.5; t += NON_SIM_BURST_PERIOD, ++cycle)
+        const double dwellSpan =
+            static_cast<double>(N_NON_SIM_BEACONS_PER_DWELL) * beaconInterval;
+
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
         {
-            for (uint32_t i = 0; i < N_Vehicles; ++i)
+            if (!g_vehicleIsAttacker[i]) continue;
+
+            uint32_t identityIndex = 0;
+            double   cursor = g_attackOnsetTime + 0.05 * static_cast<double>(i);
+
+            while (cursor < simTime - 1.5)
             {
-                if (!g_vehicleIsAttacker[i]) continue;
-                for (uint32_t slot = 0; slot < NonSimultaneousSybilBudget(); ++slot)
+                uint32_t batch = NonSimultaneousSybilBudget();
+                for (uint32_t s = 0; s < batch && cursor < simTime - 1.5; ++s)
                 {
-                    Simulator::Schedule(
-                        Seconds(t + 0.05 * static_cast<double>(i) +
-                                NON_SIM_BURST_OFFSETS[slot] +
-                                NON_SIM_CYCLE_SKEW_STEP *
-                                    static_cast<double>((cycle + i) % 3u)),
-                        &BroadcastNonSimultaneousSybilBeacon,
-                        i,
-                        cycle,
-                        slot);
+                    // One identity dwell: several beacons at the normal cadence.
+                    for (uint32_t b = 0; b < N_NON_SIM_BEACONS_PER_DWELL; ++b)
+                    {
+                        double txTime = cursor + static_cast<double>(b) * beaconInterval;
+                        if (txTime >= simTime - 0.5) break;
+                        Simulator::Schedule(Seconds(txTime),
+                                            &BroadcastNonSimultaneousSybilBeacon,
+                                            i, identityIndex, b, beaconInterval);
+                    }
+                    cursor += dwellSpan + NON_SIM_INTER_ID_GAP_SEC; // retire + gap
+                    ++identityIndex;
                 }
+                cursor += NON_SIM_CYCLE_QUIET_SEC;                  // idle after batch
             }
         }
         break;

@@ -154,6 +154,12 @@ std::ofstream g_csvControllerVehicle;
 std::ofstream g_csvControllerGlobal;
 std::ofstream g_csvRssiVerif;
 
+// Base directory for all per-run CSV logs. Overridable with --outputDir so a
+// parallel sweep can keep each run's logs in its own folder (e.g. one per
+// attack_type/percentage) instead of clobbering the shared default files.
+// The directory must already exist (the simulator does not create it).
+std::string outputDir = "sybil-attack/outputs";
+
 // ---------------------------------------------------------------------------
 // Global containers (NOT static — extern'd in sybil_types.h so attack
 // scenario functions in sybil_attacks.h can reach them at callback fire time).
@@ -4115,7 +4121,7 @@ InitializeCommunicationCsv()
         << "bsm_speed,bsm_heading,v2rsu_report_type,v2rsu_window_start,v2rsu_window_end,"
         << "v2rsu_neighbor_count,v2rsu_suspicious_count,"
         << "rsu2sdn_claimed_vehicle_id,rsu2sdn_observer_count,rsu2sdn_report_count,"
-        << "rsu2sdn_trust_score,rsu2sdn_suspicion_flags,status\n";
+        << "rsu2sdn_trust_score,rsu2sdn_suspicion_flags,status,attack_type\n";
 }
 
 static void
@@ -9765,7 +9771,8 @@ LogReceivedPacket(const std::string& receiverRole,
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.rsuReportCount   : 0u) << ","
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.trustScore       : 0.0) << ","
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.suspicionFlags   : 0u) << ","
-        << (hasTag ? "received_tagged" : "received_untagged") << "\n";
+        << (hasTag ? "received_tagged" : "received_untagged") << ","
+        << ActiveAttackTypeAt(Simulator::Now().GetSeconds()) << "\n";
 
     // M1 PDR accounting.
     //   Unicast (non-beacon): one intended receiver -> always credited (M1.1).
@@ -10968,7 +10975,7 @@ main(int argc, char* argv[])
     cmd.AddValue("beaconJitterMax",            "Maximum random V2V beacon timing jitter in seconds", beaconJitterMax);
     cmd.AddValue("rsuReportInterval",          "RSU→Controller report period",           rsuReportInterval);
     cmd.AddValue("sybil_attack_enabled",       "Enable Sybil attack behavior",           sybil_attack_enabled);
-    cmd.AddValue("sybil_attack_type",          "Attack variant 0-6 (see sybil_attacks.h)",sybil_attack_type);
+    cmd.AddValue("sybil_attack_type",          "Attack variant 0-6, or 7=sequential 1->2->3->4 dataset mode (see sybil_attacks.h)",sybil_attack_type);
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
     cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
@@ -11025,7 +11032,28 @@ main(int argc, char* argv[])
     cmd.AddValue("rssiStreak",         "Consecutive windows to confirm Sybil [default 2]",  rssiStreakRequired);
     cmd.AddValue("sweepMode",          "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
     cmd.AddValue("quietMode",          "Suppress all console output; CSV writes are unaffected", quietMode);
+    cmd.AddValue("outputDir",          "Base directory for per-run CSV logs (must exist) [default sybil-attack/outputs]", outputDir);
     cmd.Parse(argc, argv);
+
+    // Redirect every per-run CSV log under --outputDir so a parallel sweep can
+    // keep each run's communication log in its own folder. The directory must
+    // already exist; the caller (sweep script) is responsible for creating it.
+    if (!outputDir.empty())
+    {
+        communicationCsv             = outputDir + "/communication_log.csv";
+        vehicleNeighborTableCsv      = outputDir + "/vehicle_neighbor_table_log.csv";
+        rsuVehicleTableCsv           = outputDir + "/rsu_vehicle_table_log.csv";
+        rsuVehicleObservationCsv     = outputDir + "/rsu_vehicle_observation_rows_log.csv";
+        rsuRegionalAwarenessCsv      = outputDir + "/rsu_regional_awareness_log.csv";
+        rsuPassiveBeaconEvidenceCsv  = outputDir + "/rsu_passive_beacon_evidence_log.csv";
+        controllerVehicleTableCsv    = outputDir + "/controller_vehicle_table_log.csv";
+        controllerGlobalAwarenessCsv = outputDir + "/controller_global_awareness_log.csv";
+        rssiVerificationCsv          = outputDir + "/rssi_verification_log.csv";
+        // animFile (NetAnim XML, ~30 MB/run) is intentionally NOT redirected —
+        // dataset run folders hold communication/table CSV logs only.
+    }
+    if (proposed_method != kNoLegacyProposedMethod)
+        solution_mode = MapLegacyProposedMethod(proposed_method);
     ConfigureSolutionMode();
 
     static std::ofstream devNull("/dev/null");
@@ -11091,10 +11119,43 @@ main(int argc, char* argv[])
 
 
 
+    // Sequential dataset mode (type 7): the user-supplied --simTime is the
+    // PER-PHASE length.  The run executes g_seqNumPhases attacks back-to-back,
+    // so extend the real simulation length to cover every phase.  Done before
+    // DeclareAttackStates/scheduling so all downstream timing uses the full run.
+    if (sybil_attack_enabled && sybil_attack_type == 7)
+    {
+        g_seqPhaseDuration = simTime;
+        simTime            = simTime * static_cast<double>(g_seqNumPhases);
+        std::cout << "[sybil_attacks] Sequential mode: " << g_seqNumPhases
+                  << " phases x " << g_seqPhaseDuration << "s = "
+                  << simTime << "s total run.\n";
+    }
+
     // Resolve attack type and populate per-node attacker flags.
     // Must run after routing_test / N_RSUs adjustments.
     DeclareAttackStates();
     DeclareAttackers();
+
+    // Sequential dataset mode: emit phase/attacker metadata so the single
+    // communication_log can be labelled — which attack ran in each time window
+    // and which node IDs are the attackers.
+    if (sybil_attack_enabled && sybil_attack_type == 7)
+    {
+        std::ofstream pf((outputDir + "/attack_phases.csv").c_str());
+        pf << "phase,attack_type,start_time,end_time\n";
+        for (uint32_t p = 0; p < g_seqNumPhases; ++p)
+        {
+            double s = std::max(static_cast<double>(p) * g_seqPhaseDuration,
+                                g_attackOnsetTime);
+            double e = static_cast<double>(p + 1) * g_seqPhaseDuration - g_seqPhaseGapSec;
+            pf << p << "," << g_seqAttackTypes[p] << "," << s << "," << e << "\n";
+        }
+        std::ofstream af((outputDir + "/sybil_attackers.csv").c_str());
+        af << "attacker_node_id\n";
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
+            if (IsSybilVehicle(i)) af << i << "\n";
+    }
 
     InitializeCommunicationCsv();
     InitializeVehicleNeighborTableCsv();
@@ -11424,7 +11485,13 @@ main(int argc, char* argv[])
             // Type 1 (Outsider): the attacker never sends legitimate V2V beacons
             // or V2RSU self-reports.  It only listens and sends forged reports
             // (scheduled by ScheduleAttackTraffic).  Skip normal scheduling here.
+            // In sequential mode the same suppression applies, but ONLY during
+            // the outsider phase (ActiveAttackTypeAt(t) == 1); in the later
+            // insider phases the attacker emits normal beacons as usual.
             if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
+                continue;
+            if (g_activeAttackType == ATTACK_SEQUENTIAL_1234 && IsSybilVehicle(i) &&
+                ActiveAttackTypeAt(t) == 1u)
                 continue;
 
             Ptr<Socket> vehicleSocket = CreateSenderSocket(g_vehicleNodes.Get(i));
@@ -11523,18 +11590,22 @@ main(int argc, char* argv[])
     // NetAnim visualisation
     // -----------------------------------------------------------------------
 
-    AnimationInterface anim(animFile);
-    // With 95 vehicles beaconing every ~0.1 s the default 50 000 packet cap
-    // is hit in ~11 s, after which AnimationInterface calls StopAnimation()
-    // and all position updates stop too.  Set a large cap so the full
-    // simulation is recorded.  For routing_test (3 vehicles) 50 000 is fine;
-    // for SUMO modes scale by node count and simTime.
+    // Skip NetAnim entirely in sweep mode: the XML grows to hundreds of MB on
+    // long SUMO runs and is pure dead weight (and I/O contention) when dozens of
+    // parallel sweep jobs would all write it.  Visual runs still produce it.
+    if (!sweepMode)
     {
+        AnimationInterface anim(animFile);
+        // With 95 vehicles beaconing every ~0.1 s the default 50 000 packet cap
+        // is hit in ~11 s, after which AnimationInterface calls StopAnimation()
+        // and all position updates stop too.  Set a large cap so the full
+        // simulation is recorded.  For routing_test (3 vehicles) 50 000 is fine;
+        // for SUMO modes scale by node count and simTime.
         uint64_t estPkts = static_cast<uint64_t>(
             (N_Vehicles + N_RSUs) * simTime * 20);   // ~20 pkt/node/s
         anim.SetMaxPktsPerTraceFile(std::max(uint64_t(50000), estPkts));
+        ColorAndLabelNodes(anim, g_vehicleNodes, g_rsuNodes, g_controllerNode);
     }
-    ColorAndLabelNodes(anim, g_vehicleNodes, g_rsuNodes, g_controllerNode);
 
     // -----------------------------------------------------------------------
     // Startup summary
