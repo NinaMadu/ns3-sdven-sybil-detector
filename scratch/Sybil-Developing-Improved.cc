@@ -522,6 +522,11 @@ static std::vector<std::deque<RssiIdentityObservation> > g_rssiCoLocationWindows
 static std::vector<std::map<uint32_t, uint32_t> > g_rssiCoLocationFlags;
 static std::vector<std::map<uint32_t, std::deque<TrajectorySample> > > g_vehicleTrajectoryWindows;
 static std::vector<std::map<uint32_t, uint32_t> > g_trajectoryShadowingFlags;
+// Continuous simDTW-proxy score (Eq 3.5) and whether enough aligned samples existed
+// to compute it at all, persisted alongside the boolean flag above so consumers can
+// tell "scored low" apart from "never scored" (see NeighborAwarenessRecord::trajShadowCompared).
+static std::vector<std::map<uint32_t, double> > g_trajectoryShadowingScores;
+static std::vector<std::map<uint32_t, bool> > g_trajectoryShadowingCompared;
 static std::vector<std::set<uint32_t> > g_sdnUnsupportedRsuApprovals;
 static std::vector<std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> > >
     g_computedDetectionEvidenceTables;
@@ -549,6 +554,8 @@ ResetAwarenessTables()
     g_vehicleTrajectoryWindows.assign(
         N_Vehicles, std::map<uint32_t, std::deque<TrajectorySample> >());
     g_trajectoryShadowingFlags.assign(N_Vehicles, std::map<uint32_t, uint32_t>());
+    g_trajectoryShadowingScores.assign(N_Vehicles, std::map<uint32_t, double>());
+    g_trajectoryShadowingCompared.assign(N_Vehicles, std::map<uint32_t, bool>());
     g_sdnUnsupportedRsuApprovals.assign(N_RSUs, std::set<uint32_t>());
     g_computedDetectionEvidenceTables.assign(
         N_RSUs, std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> >());
@@ -2591,6 +2598,18 @@ EvaluateTrajectoryShadowing(uint32_t observerVehicleId,
     double avgSpeedDiff = totalSpeedDiff / static_cast<double>(matched);
     double avgHeadingDiff = totalHeadingDiff / static_cast<double>(matched);
 
+    // Continuous simDTW-proxy (Eq 3.5): a Phi_coloc-style Gaussian-ish kernel over the
+    // three normalized deviations, in (0,1] -- 1 means trajectories coincide exactly on
+    // position/speed/heading, decaying smoothly instead of the hard theta cutoffs below.
+    // Recorded even when the hard thresholds don't all trip, so the notebook-side MLP can
+    // learn its own cutoff instead of only seeing the boolean flag's all-or-nothing view.
+    double normDistance = avgDistance / kTrajectoryThetaDistanceM;
+    double normSpeed = avgSpeedDiff / kTrajectoryThetaSpeedMps;
+    double normHeading = avgHeadingDiff / kTrajectoryThetaHeadingDeg;
+    double shadowScore = std::exp(-(normDistance + normSpeed + normHeading) / 3.0);
+    g_trajectoryShadowingScores[observerVehicleId][claimedId] = shadowScore;
+    g_trajectoryShadowingCompared[observerVehicleId][claimedId] = true;
+
     if (avgDistance <= kTrajectoryThetaDistanceM &&
         avgSpeedDiff <= kTrajectoryThetaSpeedMps &&
         avgHeadingDiff <= kTrajectoryThetaHeadingDeg)
@@ -2652,6 +2671,24 @@ GetTrajectoryShadowingFlags(uint32_t observerVehicleId, uint32_t claimedId)
     return (it == g_trajectoryShadowingFlags[observerVehicleId].end())
            ? SUSPICION_NONE
            : it->second;
+}
+
+static double
+GetTrajectoryShadowingScore(uint32_t observerVehicleId, uint32_t claimedId)
+{
+    if (observerVehicleId >= g_trajectoryShadowingScores.size())
+        return 0.0;
+    auto it = g_trajectoryShadowingScores[observerVehicleId].find(claimedId);
+    return (it == g_trajectoryShadowingScores[observerVehicleId].end()) ? 0.0 : it->second;
+}
+
+static bool
+GetTrajectoryShadowingCompared(uint32_t observerVehicleId, uint32_t claimedId)
+{
+    if (observerVehicleId >= g_trajectoryShadowingCompared.size())
+        return false;
+    auto it = g_trajectoryShadowingCompared[observerVehicleId].find(claimedId);
+    return (it == g_trajectoryShadowingCompared[observerVehicleId].end()) ? false : it->second;
 }
 
 static uint32_t
@@ -4097,6 +4134,7 @@ InitializeVehicleNeighborTableCsv()
     out << "time,event,observer_vehicle_id,observed_real_id,observed_claimed_id,"
         << "first_seen_time,last_seen_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,"
         << "estimated_distance,received_beacon_count,suspicion_flags,"
+        << "traj_shadow_score,traj_shadow_compared,"
         << "dirty,last_reported_to_rsu_time,neighbor_table_size,trigger_seq,status\n";
 }
 
@@ -5098,6 +5136,8 @@ LogVehicleNeighborTableEvent(const std::string& event,
         << record.claimedDistance << ","
         << record.receivedBeaconCount << ","
         << record.suspicionFlags << ","
+        << record.trajShadowScore << ","
+        << (record.trajShadowCompared ? 1 : 0) << ","
         << (record.dirty ? 1 : 0) << ","
         << record.lastReportedToRsuTime << ","
         << tableSize << ","
@@ -8384,6 +8424,8 @@ UpdateVehicleNeighborRecord(uint32_t observerVehicleId,
                                                                   bsm);
     record.suspicionFlags |= GetTrajectoryShadowingFlags(observerVehicleId,
                                                         observedClaimedId);
+    record.trajShadowScore = GetTrajectoryShadowingScore(observerVehicleId, observedClaimedId);
+    record.trajShadowCompared = GetTrajectoryShadowingCompared(observerVehicleId, observedClaimedId);
     record.dirty = true;
 
     LogRssiVerification(observerVehicleId, observedClaimedId,

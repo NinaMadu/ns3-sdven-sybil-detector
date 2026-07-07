@@ -184,6 +184,11 @@ struct NeighborAwarenessRecord
     double   rssiDbm               = -999.0; ///< PHY-measured signal strength (dBm); -999 = not yet observed
     double   rssiEstimatedDistance = -1.0;   ///< Distance inferred from rssiDbm via path-loss inverse (metres)
     uint32_t rssiVerificationState = RSSI_UNVERIFIED;
+    // Continuous counterpart of SUSPICION_TRAJECTORY_SHADOWING (simDTW proxy, Eq 3.5):
+    // exp(-mean(normalized distance/speed/heading deviation)) in (0,1], 1 = closest match.
+    // Logged alongside the boolean flag so consumers aren't limited to a single bit.
+    double   trajShadowScore       = 0.0;    ///< 0 = no shadowing evidence found (see trajShadowCompared)
+    bool     trajShadowCompared    = false;  ///< true once enough aligned samples existed to score at all
 };
 
 struct V2RsuAwarenessReport
