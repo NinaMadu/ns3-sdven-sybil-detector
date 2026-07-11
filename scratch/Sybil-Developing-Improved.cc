@@ -668,6 +668,42 @@ RunCommandCapture(const std::string& command)
     return TrimShellOutput(output);
 }
 
+// ---------------------------------------------------------------------------
+// IPFS publish safety valve (crash fix for high-percentage sequential runs).
+//
+// Without a running IPFS daemon, every evidence / isolation / revocation
+// publish used to fork a doomed `/bin/sh -c "ipfs add ..."` (via popen) AND a
+// `mkdir -p` per file.  At 80-100% attacker density that is thousands of
+// fork+exec per simulated second from a multi-GB-RSS process; fork() then
+// starts failing with ENOMEM (or trips the OOM killer / cgroup cap) in the
+// later, higher-intensity attack phases -- the "crashes when it reaches attack
+// type 4/5" failure, reproduced at pct=80 (5271 evidence files + ~10k forks by
+// sim t=18.5s, RSS climbing ~2->15GB).
+//
+//   * g_ipfsPublishEnabled (--ipfsPublish, default false) gates the `ipfs add`
+//     popen.  With it off, CIDs stay "local://<path>" exactly as they already
+//     were whenever `ipfs add` failed on a box with no daemon, so CSV/dataset
+//     content is unchanged.  The read path already resolves local:// by
+//     reading the file directly, so nothing downstream breaks.
+//   * EnsureIpfsDir() creates each output dir ONCE (was a std::system mkdir on
+//     every single publish) and roots it under --outputDir, so a parallel
+//     sweep keeps small per-run dirs instead of piling hundreds of thousands
+//     of tiny JSON files into one shared, never-cleaned directory.
+// ---------------------------------------------------------------------------
+static bool g_ipfsPublishEnabled = false;
+
+static std::string
+EnsureIpfsDir(const std::string& leaf)
+{
+    static std::set<std::string> s_created;
+    const std::string base = outputDir.empty()
+                             ? std::string("sybil-attack/outputs") : outputDir;
+    const std::string dir = base + "/" + leaf;
+    if (s_created.insert(dir).second)
+        std::system(("mkdir -p '" + dir + "' >/dev/null 2>&1").c_str());
+    return dir;
+}
+
 static std::string
 JsonBool(bool value)
 {
@@ -1234,8 +1270,7 @@ PublishVehicleRegistrationRecordToIpfs(uint32_t vehicleId,
                                        double requestTime)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-registration";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-registration");
 
     std::ostringstream path;
     path << dir << "/veh" << vehicleId
@@ -1255,8 +1290,10 @@ PublishVehicleRegistrationRecordToIpfs(uint32_t vehicleId,
                                                   requestTime);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: vehicle registration IPFS publish failed. "
                   << "Registration JSON files are still written under " << dir << ".\n";
@@ -1388,8 +1425,7 @@ PublishTokenCommitmentToIpfs(uint32_t vehicleId,
                              const std::string& tokenHashHex)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-token-records";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-token-records");
 
     std::ostringstream path;
     path << dir << "/veh" << vehicleId
@@ -1401,8 +1437,10 @@ PublishTokenCommitmentToIpfs(uint32_t vehicleId,
         out << BuildTokenCommitmentJson(vehicleId, registrationCid, tokenHashHex);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: token commitment IPFS publish failed. "
                   << "Token JSON files are still written under " << dir << ".\n";
@@ -1536,8 +1574,7 @@ static std::string
 PublishTokenManifestToIpfs()
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-token-manifests";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-token-manifests");
 
     std::ostringstream path;
     path << dir << "/token_manifest_t"
@@ -1549,8 +1586,10 @@ PublishTokenManifestToIpfs()
         out << BuildTokenManifestJson();
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: token manifest IPFS publish failed. "
                   << "Manifest JSON files are still written under " << dir << ".\n";
@@ -1757,8 +1796,7 @@ PublishFlGlobalModelToIpfs(uint32_t round,
                            double loss)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-fl-models";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-fl-models");
 
     std::ostringstream path;
     path << dir << "/round" << round
@@ -1770,8 +1808,10 @@ PublishFlGlobalModelToIpfs(uint32_t round,
         out << BuildFlGlobalModelJson(round, modelHashHex, loss);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: FL model IPFS publish failed. "
                   << "FL model JSON files are still written under " << dir << ".\n";
@@ -1803,8 +1843,7 @@ static std::string
 PublishFlConsensusManifestToIpfs(const FlModelConsensusRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-fl-model-consensus";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-fl-model-consensus");
 
     std::ostringstream path;
     path << dir << "/round" << rec.round << "_consensus.json";
@@ -1814,8 +1853,10 @@ PublishFlConsensusManifestToIpfs(const FlModelConsensusRecord& rec)
         out << BuildFlConsensusManifestJson(rec);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: FL consensus manifest IPFS publish failed. "
                   << "Consensus JSON files are still written under " << dir << ".\n";
@@ -2007,8 +2048,7 @@ static std::string
 PublishComputedDetectionEvidenceToIpfs(const ComputedDetectionEvidenceRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-computed-detection-evidence";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-computed-detection-evidence");
 
     std::ostringstream path;
     path << dir << "/rsu" << rec.rsuId
@@ -2022,8 +2062,10 @@ PublishComputedDetectionEvidenceToIpfs(const ComputedDetectionEvidenceRecord& re
         out << BuildComputedDetectionEvidenceJson(rec);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: real IPFS publish failed. Install/start IPFS "
                   << "and ensure `ipfs add -Q` works. Computed evidence JSON files are still "
@@ -2065,8 +2107,7 @@ static std::string
 PublishIsolationRecordToIpfs(const IsolationRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-isolation-records";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-isolation-records");
 
     std::ostringstream path;
     path << dir << "/" << rec.entityType
@@ -2079,8 +2120,10 @@ PublishIsolationRecordToIpfs(const IsolationRecord& rec)
         out << BuildIsolationRecordJson(rec);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: isolation record IPFS publish failed. "
                   << "Isolation JSON files are still written under " << dir << ".\n";
@@ -2130,8 +2173,7 @@ static std::string
 PublishRevocationManifestToIpfs(const RevocationManifestRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-revocation-manifests";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-revocation-manifests");
 
     std::ostringstream path;
     path << dir << "/" << rec.entityType << rec.entityId
@@ -2143,8 +2185,10 @@ PublishRevocationManifestToIpfs(const RevocationManifestRecord& rec)
         out << BuildRevocationManifestJson(rec);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: revocation manifest IPFS publish failed. "
                   << "Manifest JSON files are still written under " << dir << ".\n";
@@ -11144,6 +11188,7 @@ main(int argc, char* argv[])
     cmd.AddValue("rssiStreak",         "Consecutive windows to confirm Sybil [default 2]",  rssiStreakRequired);
     cmd.AddValue("sweepMode",           "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
     cmd.AddValue("quietMode",           "Suppress all console output; CSV writes are unaffected", quietMode);
+    cmd.AddValue("ipfsPublish",         "Fork `ipfs add` per evidence/isolation/revocation record [default false]. Off = local:// CIDs, no per-record subprocess fork (prevents the high-percentage fork/OOM crash)", g_ipfsPublishEnabled);
     cmd.AddValue("outputDir",           "Base directory for per-run CSV logs (must exist) [default sybil-attack/outputs]", outputDir);
     // Dataset generation v2
     cmd.AddValue("datasetMode",         "Dataset mode: sequential_all6 | zone_concurrent (leave empty for legacy behaviour)", g_datasetMode);
