@@ -63,7 +63,10 @@ enum MessageType
     REG_CONFIRM             = 13,  ///< RSU→Vehicle: deliver token
     V2CTRL_HELLO            = 14,  ///< Vehicle→RSU→Controller: initiate V-Ctrl E2E channel
     CTRL2V_ACK              = 15,  ///< Controller→RSU→Vehicle: complete V-Ctrl handshake
-    CONTROLLER2CONTROLLER_COMMAND = 16 ///< Controller-to-controller command forward
+    CONTROLLER2CONTROLLER_COMMAND = 16, ///< Controller-to-controller command forward
+    V2I_AUTH_HELLO          = 17,  ///< Vehicle->RSU: paper V2I-AUTH phase 1
+    V2I_AUTH_CHALLENGE      = 18,  ///< RSU->Vehicle: paper V2I-AUTH phase 2
+    V2I_AUTH_PROOF          = 19   ///< Vehicle->RSU: paper V2I-AUTH phase 3
 };
 
 inline std::string
@@ -87,6 +90,9 @@ MessageTypeToString(uint32_t messageType)
     case V2CTRL_HELLO:           return "v2ctrl_hello";
     case CTRL2V_ACK:             return "ctrl2v_ack";
     case CONTROLLER2CONTROLLER_COMMAND: return "controller2controller_command";
+    case V2I_AUTH_HELLO:         return "v2i_auth_hello";
+    case V2I_AUTH_CHALLENGE:     return "v2i_auth_challenge";
+    case V2I_AUTH_PROOF:         return "v2i_auth_proof";
     default:                     return "unknown";
     }
 }
@@ -1607,9 +1613,11 @@ BuildBsmCoreData(uint32_t realVehicleId, uint32_t temporaryId, uint32_t messageC
             bsm.positionZ = pos.z;
         }
 
-        if (mob)
+        Ptr<ConstantVelocityMobilityModel> cv =
+            g_vehicleNodes.Get(realVehicleId)->GetObject<ConstantVelocityMobilityModel>();
+        if (cv)
         {
-            Vector vel = mob->GetVelocity();
+            Vector vel = cv->GetVelocity();
             bsm.speed = std::sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
             if (bsm.speed > 0.0)
             {
@@ -1711,6 +1719,5 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
             }
         }
     }
-    bool isBroadcastTx = (tx->destinationId == 0xFFFFFFFF);
-    MetricsOnTransmitForMessage(tx->messageType, expectedDeliveries, isBroadcastTx);
+    MetricsOnTransmitForMessage(tx->messageType, expectedDeliveries);
 }

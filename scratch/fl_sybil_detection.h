@@ -62,20 +62,31 @@ static const int kNumFeatures = 10;
 // leakage, out-of-registry checks, or suspicion flags.
 // ---------------------------------------------------------------------------
 
+// Feature order:
+//   0: f0_bsm_speed_norm
+//   1: f1_estimated_distance_norm
+//   2: f2_received_beacon_count_norm
+//   3: f3_neighbor_table_size_norm
+//   4: f4_neighbor_age_norm
+//   5: f5_mean_beacon_interval_norm
+//   6: f6_heading_sin
+//   7: f7_heading_cos
+//   8: f8_report_staleness_norm
+//   9: f9_position_radius_norm
 static const double kWeights[kNumFeatures] = {
-   -0.00999634256134, // f[0] bsm_speed_norm
-    0.613558340902,   // f[1] estimated_distance_norm
-   -1.34743487139,    // f[2] received_beacon_count_norm
-    0.539274862506,   // f[3] neighbor_table_size_norm
-   -0.988876275683,   // f[4] neighbor_age_norm
-   -0.0486799016935,  // f[5] mean_beacon_interval_norm
-    0.0593113933106,  // f[6] heading_sin
-    0.165896379578,   // f[7] heading_cos
-    0.029867438012,   // f[8] report_staleness_norm
-   -0.122046508331    // f[9] position_radius_norm
+    0.005841355288,
+    0.0943389270998,
+    -1.01631702063,
+    1.16155324077,
+    -0.251904296349,
+    -0.040942112454,
+    -0.0588368202469,
+    0.313469291325,
+    -0.301260950612,
+    0.0796172284961
 };
 
-static const double kBias = -0.00168292708603;
+static const double kBias = 0.356554563715;
 
 // ---------------------------------------------------------------------------
 // Sigmoid activation

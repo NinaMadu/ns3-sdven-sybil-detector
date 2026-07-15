@@ -99,6 +99,7 @@ Thumbs.db
 
 !rssi_mcc_sweep.py
 *.Zone.Identifier
+*Zone.Identifier
 
 # ── Reorganized ML/LLM tree (sybil-attack/ml): version-control the SOURCE, not
 #    the trained weights, datasets, or generated outputs. ──

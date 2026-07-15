@@ -168,19 +168,31 @@ def fuzzy_vehicle_scores(window: pd.DataFrame, feature_cols: List[str]) -> pd.Da
             + 0.10 * freshness
         )
 
-        rows.append(
-            {
-                "vehicle_id": int(vehicle_id),
-                "sample_count": int(n),
-                "positive_rate": positive_rate,
-                "data_amount_score": data_amount,
-                "label_balance_score": label_balance,
-                "mobility_score": mobility_score,
-                "interval_quality_score": interval_quality,
-                "freshness_score": freshness,
-                "fuzzy_score": fuzzy_score,
-            }
-        )
+        row = {
+            "vehicle_id": int(vehicle_id),
+            "sample_count": int(n),
+            "positive_rate": positive_rate,
+            "data_amount_score": data_amount,
+            "label_balance_score": label_balance,
+            "mobility_score": mobility_score,
+            "interval_quality_score": interval_quality,
+            "freshness_score": freshness,
+            "fuzzy_score": fuzzy_score,
+        }
+
+        latest = group.sort_values("time").iloc[-1] if "time" in group.columns else group.iloc[-1]
+        for col in ["original_vehicle_id", "run_index", "attack_type", "attack_percentage"]:
+            if col in group.columns:
+                row[col] = int(group[col].mode().iloc[0])
+
+        for col in ["rsu_id", "controller_id"]:
+            if col in group.columns:
+                row[col] = int(latest[col])
+
+        if "source_run" in group.columns:
+            row["source_run"] = str(group["source_run"].mode().iloc[0])
+
+        rows.append(row)
 
     return pd.DataFrame(rows).sort_values(
         ["fuzzy_score", "sample_count"], ascending=[False, False]
@@ -304,8 +316,9 @@ def main() -> None:
                 args.local_epochs,
                 args.learning_rate,
             )
-            rsu_id = int(group["rsu_id"].mode().iloc[0])
-            controller_id = int(group["controller_id"].mode().iloc[0])
+            latest = group.sort_values("time").iloc[-1] if "time" in group.columns else group.iloc[-1]
+            rsu_id = int(latest["rsu_id"])
+            controller_id = int(latest["controller_id"])
             vehicle_models[int(vehicle_id)] = (
                 local_weights,
                 local_bias,
