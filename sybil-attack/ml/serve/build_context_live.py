@@ -35,17 +35,19 @@ def _asof_join(left, right, tol):
 
 
 def assemble_ci(temporal, rssi=None, trust=None, ensemble=None, mobility=None,
-                carry_forward=False, tol=None):
+                extra=None, carry_forward=False, tol=None):
     """GRU-anchored assembly of the three (+optional) predictor outputs into cᵢ.
 
     Each arg is a DataFrame keyed by KEY (as the predictors emit). `temporal` is
-    required (the anchor). Returns the cᵢ DataFrame (one row per anchored 2 s cell).
+    required (the anchor). `extra` is a list of additional keyed sources (e.g. the
+    RSU-tier XGB p̄ outputs). Returns the cᵢ DataFrame (one row per anchored 2 s cell).
     """
     if temporal is None or len(temporal) == 0:
         return pd.DataFrame()
     ev = temporal.copy()
-    for df, name in [(rssi, "rssi"), (trust, "trust"),
-                     (ensemble, "ensemble"), (mobility, "mobility")]:
+    sources = [(rssi, "rssi"), (trust, "trust"), (ensemble, "ensemble"), (mobility, "mobility")]
+    sources += [(df, "extra") for df in (extra or [])]
+    for df, name in sources:
         if df is None or len(df) == 0:
             continue
         new = [c for c in df.columns if c not in KEY and c not in ev.columns]
