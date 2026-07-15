@@ -20,12 +20,15 @@ CSV_PATH = os.path.join(SIM_DIR, "sybil-attack", "outputs", "rssi_percentage_swe
 OUT_DIR  = os.path.join(SIM_DIR, "sybil-attack", "outputs")
 
 ATTACK_LABELS = {
+
+    "1": "Type 1 — Outsider Sybil",
     "2": "Type 2 — Direct Simultaneous",
     "3": "Type 3 — Direct Non-Simultaneous",
     "4": "Type 4 — Indirect Relay",
+    "5": "Type 5 — Malicious RSU",
 }
-COLORS = {"2": "#e15759", "3": "#4e79a7", "4": "#59a14f"}
-MARKERS = {"2": "o", "3": "s", "4": "^"}
+COLORS = {"1": "#f28e2b", "2": "#e15759", "3": "#4e79a7", "4": "#59a14f", "5": "#b07aa1"}
+MARKERS = {"1": "D", "2": "o", "3": "s", "4": "^", "5": "v"}
 
 # ── Load CSV ───────────────────────────────────────────────────────────────────
 data = {}   # data[attack_type][pct] = {TP, FP, TN, FN, FPR, MCC, ...}

@@ -1,0 +1,10 @@
+Run Commands
+cd /home/sdvn_defense_sybil/35_sybil_attack_project/ns-allinone-3.35/ns-3.35/sybil-attack
+commands/run_vehicle_tier_v2.sh start
+
+Monitor Commands
+commands/run_vehicle_tier_v2.sh status          # one-shot: stage, progress, RAM, GPU
+commands/monitor_vehicle_tier_v2.sh live        # auto-refresh every 15s
+commands/monitor_vehicle_tier_v2.sh logs        # live-tail the notebook currently running
+commands/monitor_vehicle_tier_v2.sh mem         # live-tail the RAM/GPU sampler
+commands/run_vehicle_tier_v2.sh stop            # abort if needed

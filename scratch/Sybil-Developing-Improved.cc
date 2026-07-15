@@ -140,9 +140,33 @@ std::string rsuRegionalAwarenessCsv = "sybil-attack/outputs/rsu_regional_awarene
 std::string computedDetectionEvidenceCsv = "sybil-attack/outputs/computed_detection_evidence_log.csv";
 std::string controllerVehicleTableCsv = "sybil-attack/outputs/controller_vehicle_table_log.csv";
 std::string controllerGlobalAwarenessCsv = "sybil-attack/outputs/controller_global_awareness_log.csv";
+
+
+
 std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.xml";
 std::string rssiVerificationCsv = "sybil-attack/outputs/rssi_verification_log.csv";
 std::string rsuTrustLifecycleCsv = "sybil-attack/outputs/rsu_trust_lifecycle_log.csv";
+std::string rsuApprovalLogCsv    = "sybil-attack/outputs/rsu_approval_log.csv";
+std::string controllerLogCsv     = "sybil-attack/outputs/controller_log.csv";
+
+
+// Persistent CSV file handles — opened once after headers are written, closed at program exit.
+// Eliminates per-row open/write/close syscall overhead (hundreds of thousands of operations).
+std::ofstream g_csvComm;
+std::ofstream g_csvVehicleNeighbor;
+std::ofstream g_csvRsuVehicleTable;
+std::ofstream g_csvRsuObservation;
+std::ofstream g_csvRsuRegional;
+std::ofstream g_csvControllerVehicle;
+std::ofstream g_csvControllerGlobal;
+std::ofstream g_csvRssiVerif;
+
+
+// Base directory for all per-run CSV logs. Overridable with --outputDir so a
+// parallel sweep can keep each run's logs in its own folder (e.g. one per
+// attack_type/percentage) instead of clobbering the shared default files.
+// The directory must already exist (the simulator does not create it).
+std::string outputDir = "sybil-attack/outputs";
 
 // ---------------------------------------------------------------------------
 // Global containers (NOT static — extern'd in sybil_types.h so attack
@@ -534,6 +558,11 @@ static std::vector<std::deque<RssiIdentityObservation> > g_rssiCoLocationWindows
 static std::vector<std::map<uint32_t, uint32_t> > g_rssiCoLocationFlags;
 static std::vector<std::map<uint32_t, std::deque<TrajectorySample> > > g_vehicleTrajectoryWindows;
 static std::vector<std::map<uint32_t, uint32_t> > g_trajectoryShadowingFlags;
+// Continuous simDTW-proxy score (Eq 3.5) and whether enough aligned samples existed
+// to compute it at all, persisted alongside the boolean flag above so consumers can
+// tell "scored low" apart from "never scored" (see NeighborAwarenessRecord::trajShadowCompared).
+static std::vector<std::map<uint32_t, double> > g_trajectoryShadowingScores;
+static std::vector<std::map<uint32_t, bool> > g_trajectoryShadowingCompared;
 static std::vector<std::set<uint32_t> > g_sdnUnsupportedRsuApprovals;
 static std::vector<std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> > >
     g_computedDetectionEvidenceTables;
@@ -581,6 +610,8 @@ ResetAwarenessTables()
     g_vehicleTrajectoryWindows.assign(
         N_Vehicles, std::map<uint32_t, std::deque<TrajectorySample> >());
     g_trajectoryShadowingFlags.assign(N_Vehicles, std::map<uint32_t, uint32_t>());
+    g_trajectoryShadowingScores.assign(N_Vehicles, std::map<uint32_t, double>());
+    g_trajectoryShadowingCompared.assign(N_Vehicles, std::map<uint32_t, bool>());
     g_sdnUnsupportedRsuApprovals.assign(N_RSUs, std::set<uint32_t>());
     g_computedDetectionEvidenceTables.assign(
         N_RSUs, std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> >());
@@ -684,6 +715,42 @@ RunCommandCapture(const std::string& command)
         output += buffer;
     pclose(pipe);
     return TrimShellOutput(output);
+}
+
+// ---------------------------------------------------------------------------
+// IPFS publish safety valve (crash fix for high-percentage sequential runs).
+//
+// Without a running IPFS daemon, every evidence / isolation / revocation
+// publish used to fork a doomed `/bin/sh -c "ipfs add ..."` (via popen) AND a
+// `mkdir -p` per file.  At 80-100% attacker density that is thousands of
+// fork+exec per simulated second from a multi-GB-RSS process; fork() then
+// starts failing with ENOMEM (or trips the OOM killer / cgroup cap) in the
+// later, higher-intensity attack phases -- the "crashes when it reaches attack
+// type 4/5" failure, reproduced at pct=80 (5271 evidence files + ~10k forks by
+// sim t=18.5s, RSS climbing ~2->15GB).
+//
+//   * g_ipfsPublishEnabled (--ipfsPublish, default false) gates the `ipfs add`
+//     popen.  With it off, CIDs stay "local://<path>" exactly as they already
+//     were whenever `ipfs add` failed on a box with no daemon, so CSV/dataset
+//     content is unchanged.  The read path already resolves local:// by
+//     reading the file directly, so nothing downstream breaks.
+//   * EnsureIpfsDir() creates each output dir ONCE (was a std::system mkdir on
+//     every single publish) and roots it under --outputDir, so a parallel
+//     sweep keeps small per-run dirs instead of piling hundreds of thousands
+//     of tiny JSON files into one shared, never-cleaned directory.
+// ---------------------------------------------------------------------------
+static bool g_ipfsPublishEnabled = false;
+
+static std::string
+EnsureIpfsDir(const std::string& leaf)
+{
+    static std::set<std::string> s_created;
+    const std::string base = outputDir.empty()
+                             ? std::string("sybil-attack/outputs") : outputDir;
+    const std::string dir = base + "/" + leaf;
+    if (s_created.insert(dir).second)
+        std::system(("mkdir -p '" + dir + "' >/dev/null 2>&1").c_str());
+    return dir;
 }
 
 static std::string
@@ -1641,8 +1708,7 @@ PublishVehicleRegistrationRecordToIpfs(uint32_t vehicleId,
                                        double requestTime)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-registration";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-registration");
 
     std::ostringstream path;
     path << dir << "/veh" << vehicleId
@@ -1662,8 +1728,10 @@ PublishVehicleRegistrationRecordToIpfs(uint32_t vehicleId,
                                                   requestTime);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: vehicle registration IPFS publish failed. "
                   << "Registration JSON files are still written under " << dir << ".\n";
@@ -2005,8 +2073,7 @@ PublishTokenCommitmentToIpfs(uint32_t vehicleId,
                              const std::string& tokenHashHex)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-token-records";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-token-records");
 
     std::ostringstream path;
     path << dir << "/veh" << vehicleId
@@ -2018,8 +2085,10 @@ PublishTokenCommitmentToIpfs(uint32_t vehicleId,
         out << BuildTokenCommitmentJson(vehicleId, registrationCid, tokenHashHex);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: token commitment IPFS publish failed. "
                   << "Token JSON files are still written under " << dir << ".\n";
@@ -2155,8 +2224,7 @@ static std::string
 PublishTokenManifestToIpfs()
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-token-manifests";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-token-manifests");
 
     std::ostringstream path;
     path << dir << "/token_manifest_t"
@@ -2168,8 +2236,10 @@ PublishTokenManifestToIpfs()
         out << BuildTokenManifestJson();
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: token manifest IPFS publish failed. "
                   << "Manifest JSON files are still written under " << dir << ".\n";
@@ -2376,8 +2446,7 @@ PublishFlGlobalModelToIpfs(uint32_t round,
                            double loss)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-fl-models";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-fl-models");
 
     std::ostringstream path;
     path << dir << "/round" << round
@@ -2389,8 +2458,10 @@ PublishFlGlobalModelToIpfs(uint32_t round,
         out << BuildFlGlobalModelJson(round, modelHashHex, loss);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: FL model IPFS publish failed. "
                   << "FL model JSON files are still written under " << dir << ".\n";
@@ -2422,8 +2493,7 @@ static std::string
 PublishFlConsensusManifestToIpfs(const FlModelConsensusRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-fl-model-consensus";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-fl-model-consensus");
 
     std::ostringstream path;
     path << dir << "/round" << rec.round << "_consensus.json";
@@ -2433,8 +2503,10 @@ PublishFlConsensusManifestToIpfs(const FlModelConsensusRecord& rec)
         out << BuildFlConsensusManifestJson(rec);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: FL consensus manifest IPFS publish failed. "
                   << "Consensus JSON files are still written under " << dir << ".\n";
@@ -2626,8 +2698,7 @@ static std::string
 PublishComputedDetectionEvidenceToIpfs(const ComputedDetectionEvidenceRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-computed-detection-evidence";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-computed-detection-evidence");
 
     std::ostringstream path;
     path << dir << "/rsu" << rec.rsuId
@@ -2641,8 +2712,10 @@ PublishComputedDetectionEvidenceToIpfs(const ComputedDetectionEvidenceRecord& re
         out << BuildComputedDetectionEvidenceJson(rec);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: real IPFS publish failed. Install/start IPFS "
                   << "and ensure `ipfs add -Q` works. Computed evidence JSON files are still "
@@ -2684,8 +2757,7 @@ static std::string
 PublishIsolationRecordToIpfs(const IsolationRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-isolation-records";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-isolation-records");
 
     std::ostringstream path;
     path << dir << "/" << rec.entityType
@@ -2698,8 +2770,10 @@ PublishIsolationRecordToIpfs(const IsolationRecord& rec)
         out << BuildIsolationRecordJson(rec);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: isolation record IPFS publish failed. "
                   << "Isolation JSON files are still written under " << dir << ".\n";
@@ -2749,8 +2823,7 @@ static std::string
 PublishRevocationManifestToIpfs(const RevocationManifestRecord& rec)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-revocation-manifests";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-revocation-manifests");
 
     std::ostringstream path;
     path << dir << "/" << rec.entityType << rec.entityId
@@ -2762,8 +2835,10 @@ PublishRevocationManifestToIpfs(const RevocationManifestRecord& rec)
         out << BuildRevocationManifestJson(rec);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: revocation manifest IPFS publish failed. "
                   << "Manifest JSON files are still written under " << dir << ".\n";
@@ -3241,6 +3316,18 @@ EvaluateTrajectoryShadowing(uint32_t observerVehicleId,
     double avgSpeedDiff = totalSpeedDiff / static_cast<double>(matched);
     double avgHeadingDiff = totalHeadingDiff / static_cast<double>(matched);
 
+    // Continuous simDTW-proxy (Eq 3.5): a Phi_coloc-style Gaussian-ish kernel over the
+    // three normalized deviations, in (0,1] -- 1 means trajectories coincide exactly on
+    // position/speed/heading, decaying smoothly instead of the hard theta cutoffs below.
+    // Recorded even when the hard thresholds don't all trip, so the notebook-side MLP can
+    // learn its own cutoff instead of only seeing the boolean flag's all-or-nothing view.
+    double normDistance = avgDistance / kTrajectoryThetaDistanceM;
+    double normSpeed = avgSpeedDiff / kTrajectoryThetaSpeedMps;
+    double normHeading = avgHeadingDiff / kTrajectoryThetaHeadingDeg;
+    double shadowScore = std::exp(-(normDistance + normSpeed + normHeading) / 3.0);
+    g_trajectoryShadowingScores[observerVehicleId][claimedId] = shadowScore;
+    g_trajectoryShadowingCompared[observerVehicleId][claimedId] = true;
+
     if (avgDistance <= kTrajectoryThetaDistanceM &&
         avgSpeedDiff <= kTrajectoryThetaSpeedMps &&
         avgHeadingDiff <= kTrajectoryThetaHeadingDeg)
@@ -3302,6 +3389,24 @@ GetTrajectoryShadowingFlags(uint32_t observerVehicleId, uint32_t claimedId)
     return (it == g_trajectoryShadowingFlags[observerVehicleId].end())
            ? SUSPICION_NONE
            : it->second;
+}
+
+static double
+GetTrajectoryShadowingScore(uint32_t observerVehicleId, uint32_t claimedId)
+{
+    if (observerVehicleId >= g_trajectoryShadowingScores.size())
+        return 0.0;
+    auto it = g_trajectoryShadowingScores[observerVehicleId].find(claimedId);
+    return (it == g_trajectoryShadowingScores[observerVehicleId].end()) ? 0.0 : it->second;
+}
+
+static bool
+GetTrajectoryShadowingCompared(uint32_t observerVehicleId, uint32_t claimedId)
+{
+    if (observerVehicleId >= g_trajectoryShadowingCompared.size())
+        return false;
+    auto it = g_trajectoryShadowingCompared[observerVehicleId].find(claimedId);
+    return (it == g_trajectoryShadowingCompared[observerVehicleId].end()) ? false : it->second;
 }
 
 static uint32_t
@@ -3761,6 +3866,43 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
                     std::vector<uint8_t> sigBytes(sigTag.sig, sigTag.sig + 64);
                     sigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
                 }
+
+
+                BsmCoreData bsm = bsmTag.GetBsm();
+
+                // Log RSU-level RSSI to rssi_verification_log so the RSSI
+                // Analyzer dataset contains RSU observations (not just V2V).
+                // Observer ID is encoded as N_Vehicles + rsuIndex to distinguish
+                // RSU rows from vehicle rows in the CSV.
+                if (signalNoise.signal > -998.0)
+                {
+                    Ptr<MobilityModel> rsuMob =
+                        g_rsuNodes.Get(rsuIndex)->GetObject<MobilityModel>();
+                    Vector rsuPos = rsuMob ? rsuMob->GetPosition() : Vector(0, 0, 0);
+                    Vector claimedPos(bsm.positionX, bsm.positionY, bsm.positionZ);
+                    double claimedDist = DistanceBetween(rsuPos, claimedPos);
+                    double rssiDist    = RssiToDistance(signalNoise.signal);
+                    double mismatch    = std::fabs(rssiDist - claimedDist);
+                    std::string stateStr = (mismatch > kRssiDistMismatchM) ? "MISMATCH" : "VERIFIED";
+                    uint32_t sflags = (mismatch > kRssiDistMismatchM)
+                                          ? SUSPICION_RSSI_DISTANCE_MISMATCH
+                                          : SUSPICION_NONE;
+                    sflags |= GetRssiCoLocationFlags(observerIndex, tag.GetClaimedNodeId());
+
+                    auto& rout = g_csvRssiVerif;
+                    rout << Simulator::Now().GetSeconds() << ","
+                         << (N_Vehicles + rsuIndex) << ","
+                         << tag.GetClaimedNodeId() << ","
+                         << tag.GetRealNodeId() << ","
+                         << signalNoise.signal << ","
+                         << rssiDist << ","
+                         << claimedDist << ","
+                         << mismatch << ","
+                         << kRssiDistMismatchM << ","
+                         << stateStr << ","
+                         << sflags << "\n";
+                }
+
                 RecordComputedDetectionEvidence(rsuIndex,
                                                 tag,
                                                 bsmTag.GetBsm(),
@@ -4697,6 +4839,22 @@ LoadVinData()
 }
 
 static void
+InitializeRsuApprovalLogCsv()
+{
+    std::ofstream out(rsuApprovalLogCsv.c_str(), std::ios::out);
+    out << "run_id,sim_time,rsu_id,zone_id,approved_claimed_id,"
+           "rssi_corroborated,is_malicious_rsu\n";
+}
+
+static void
+InitializeControllerLogCsv()
+{
+    std::ofstream out(controllerLogCsv.c_str(), std::ios::out);
+    out << "run_id,sim_time,controller_id,zone_id,"
+           "fraudulent_registrations,model_param_norm,is_malicious_ctrl\n";
+}
+
+static void
 InitializeCommunicationCsv()
 {
     std::ofstream out(communicationCsv.c_str(), std::ios::out);
@@ -4706,7 +4864,12 @@ InitializeCommunicationCsv()
         << "bsm_speed,bsm_heading,v2rsu_report_type,v2rsu_window_start,v2rsu_window_end,"
         << "v2rsu_neighbor_count,v2rsu_suspicious_count,"
         << "rsu2sdn_claimed_vehicle_id,rsu2sdn_observer_count,rsu2sdn_report_count,"
-        << "rsu2sdn_trust_score,rsu2sdn_suspicion_flags,status\n";
+        << "rsu2sdn_trust_score,rsu2sdn_suspicion_flags,status,attack_type";
+    if (!g_datasetMode.empty())
+        out << ",run_id,seed,scenario_id,observing_zone,tx_home_zone,"
+               "observer_obu_id,observing_rsu_id,is_attacker,attack_type_label,"
+               "active_attack_pct,sybil_fanout";
+    out << "\n";
 }
 
 static void
@@ -4725,6 +4888,7 @@ InitializeVehicleNeighborTableCsv()
     out << "time,event,observer_vehicle_id,observed_real_id,observed_claimed_id,"
         << "first_seen_time,last_seen_time,bsm_x,bsm_y,bsm_z,bsm_speed,bsm_heading,"
         << "estimated_distance,received_beacon_count,suspicion_flags,"
+        << "traj_shadow_score,traj_shadow_compared,"
         << "dirty,last_reported_to_rsu_time,neighbor_table_size,trigger_seq,status\n";
 }
 
@@ -4795,6 +4959,21 @@ InitializeRssiVerificationCsv()
 }
 
 static void
+OpenPersistentCsvHandles()
+{
+    g_csvComm.open           (communicationCsv.c_str(),           std::ios::app);
+    g_csvVehicleNeighbor.open(vehicleNeighborTableCsv.c_str(),    std::ios::app);
+    g_csvRsuVehicleTable.open(rsuVehicleTableCsv.c_str(),         std::ios::app);
+    g_csvRsuObservation.open (rsuVehicleObservationCsv.c_str(),   std::ios::app);
+    g_csvRsuRegional.open    (rsuRegionalAwarenessCsv.c_str(),    std::ios::app);
+    g_csvControllerVehicle.open(controllerVehicleTableCsv.c_str(),std::ios::app);
+    g_csvControllerGlobal.open(controllerGlobalAwarenessCsv.c_str(),std::ios::app);
+    g_csvRssiVerif.open      (rssiVerificationCsv.c_str(),        std::ios::app);
+}
+
+
+
+static void
 InitializeRsuTrustLifecycleCsv()
 {
     std::ofstream out(rsuTrustLifecycleCsv.c_str(), std::ios::out);
@@ -4838,6 +5017,9 @@ LogComputedDetectionEvidenceEvent(const std::string& event,
                                   const std::string& status,
                                   uint32_t triggerSeq = 0)
 {
+
+
+    if (sweepMode) return;
     std::ofstream out(computedDetectionEvidenceCsv.c_str(), std::ios::app);
     out << Simulator::Now().GetSeconds() << ","
         << event << ","
@@ -5329,8 +5511,17 @@ AutoConfigureSumoMode()
     // Only auto-set simTime when the user left it at the 12 s default.
     // If the user passed an explicit --simTime value, honour it so that
     // short test runs (e.g. --simTime=60) work with the full-length traces.
+    //
+    // Dataset sequential modes (type 7 = seq-1234, type 9 = seq-all-6) are
+    // exempt: for those, --simTime is the PER-PHASE length, not the total run
+    // length, and the real total is computed later (phase count x --simTime).
+    // This function runs BEFORE that multiplication, so without this guard a
+    // small, deliberate per-phase value like --simTime=6 (<=12) gets silently
+    // rewritten to the trace's ~300s length here, which the later phase-count
+    // multiply then blows up to ~1800s total -- a run nobody asked for.
     const double kDefaultSimTime = 12.0;
-    if (traceMaxTime > 0.0 && simTime <= kDefaultSimTime)
+    bool isSequentialDatasetMode = (sybil_attack_type == 7u || sybil_attack_type == 9u);
+    if (traceMaxTime > 0.0 && simTime <= kDefaultSimTime && !isSequentialDatasetMode)
     {
         std::cout << "[Mobility] sumoAutoConfig: simTime " << simTime
                   << " -> " << traceMaxTime
@@ -5631,6 +5822,8 @@ LogVehicleNeighborTableEvent(const std::string& event,
         << record.claimedDistance << ","
         << record.receivedBeaconCount << ","
         << record.suspicionFlags << ","
+        << record.trajShadowScore << ","
+        << (record.trajShadowCompared ? 1 : 0) << ","
         << (record.dirty ? 1 : 0) << ","
         << record.lastReportedToRsuTime << ","
         << tableSize << ","
@@ -9181,6 +9374,8 @@ UpdateVehicleNeighborRecord(uint32_t observerVehicleId,
                                                                   bsm);
     record.suspicionFlags |= GetTrajectoryShadowingFlags(observerVehicleId,
                                                         observedClaimedId);
+    record.trajShadowScore = GetTrajectoryShadowingScore(observerVehicleId, observedClaimedId);
+    record.trajShadowCompared = GetTrajectoryShadowingCompared(observerVehicleId, observedClaimedId);
     record.dirty = true;
 
     LogRssiVerification(observerVehicleId, observedClaimedId,
@@ -10666,7 +10861,43 @@ LogReceivedPacket(const std::string& receiverRole,
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.rsuReportCount   : 0u) << ","
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.trustScore       : 0.0) << ","
         << (hasRsuCtrlAwareness ? rsuCtrlRecord.suspicionFlags   : 0u) << ","
-        << (hasTag ? "received_tagged" : "received_untagged") << "\n";
+        << (hasTag ? "received_tagged" : "received_untagged") << ","
+        << ActiveAttackTypeAt(Simulator::Now().GetSeconds());
+    if (!g_datasetMode.empty())
+    {
+        double   now    = Simulator::Now().GetSeconds();
+        uint32_t realId = hasTag ? tag.GetRealNodeId() : 0u;
+        uint32_t obsZone = 0u, obzObu = 0u, obsRsu = 0u;
+        if (receiverRole == "vehicle")
+        {
+            obzObu  = receiverId;
+            obsZone = ZoneOfVehicle(receiverId);
+        }
+        else if (receiverRole == "rsu_edge")
+        {
+            obsRsu  = receiverId;
+            obsZone = (receiverId < g_rsuControllerAssignment.size())
+                      ? g_rsuControllerAssignment[receiverId] : 0u;
+        }
+        uint32_t txHomeZone = ZoneOfVehicle(realId);
+        uint32_t isAtk      = (hasTag &&
+                               tag.GetRealNodeId() != tag.GetClaimedNodeId()) ? 1u : 0u;
+        uint32_t rowAtkType = GetRowAttackType(realId, now);
+        uint32_t rowAtkPct  = GetActiveAttackPct(realId, now);
+        uint32_t rowFanout  = GetVehicleFanoutForLog(realId);
+        out << "," << g_runId
+            << "," << g_runSeed
+            << "," << g_scenarioId
+            << "," << obsZone
+            << "," << txHomeZone
+            << "," << obzObu
+            << "," << obsRsu
+            << "," << isAtk
+            << "," << rowAtkType
+            << "," << rowAtkPct
+            << "," << rowFanout;
+    }
+    out << "\n";
 
     // M1 PDR: only credit V2V beacon delivery when the receiver is another vehicle.
     bool isV2VBroadcast = hasTag && tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
@@ -11219,13 +11450,41 @@ SendRsuControllerReport(uint32_t rsuIndex)
     // Type 5: malicious RSU upserts fabricated Sybil records into its own regional
     // awareness table before reporting.  The controller receives and stores them as
     // legitimate vehicles, propagating the Sybil IDs upward.
+    // For mode 9, RSUs are marked malicious for the whole run but injection must
+    // only fire during phase 5 (attack-type 5 window), and — under stepped
+    // intensity — only for the subset of malicious RSUs active in the current
+    // sub-window (IsMaliciousRsuActiveNow), giving phase 5 the same real
+    // intensity ramp phases 1-4 already have via SchedulePhaseWindowFanout.
+    double now = Simulator::Now().GetSeconds();
+    bool seq6RsuGate = (g_activeAttackType != ATTACK_SEQUENTIAL_ALL6) ||
+                       (ActiveAttackTypeAt6(now) == 5u &&
+                        IsMaliciousRsuActiveNow(rsuIndex, now));
     bool maliciousRsuInjection =
         sybil_attack_enabled &&
         IsRsuMalicious(rsuIndex) &&
-        rsuIndex < g_rsuRegionalAwarenessTables.size();
+        rsuIndex < g_rsuRegionalAwarenessTables.size() &&
+        seq6RsuGate;
     if (maliciousRsuInjection)
     {
         InjectSybilRecordsIntoRsuTable(rsuIndex, g_rsuRegionalAwarenessTables[rsuIndex]);
+
+        // Dataset-mode: log each injected phantom to rsu_approval_log.csv.
+        if (!g_datasetMode.empty())
+        {
+            double   now    = Simulator::Now().GetSeconds();
+            uint32_t zoneId = GetControllerIndexForRsu(rsuIndex);
+            std::ofstream af(rsuApprovalLogCsv.c_str(), std::ios::app);
+            for (uint32_t k = 0u; k < RsuSybilBudget(); ++k)
+            {
+                uint32_t sybilId = N_Vehicles + 100u + rsuIndex * N_SYBIL_RSU_MAX + k;
+                int rssiCorr = 0;
+                auto it = g_rsuRegionalAwarenessTables[rsuIndex].find(sybilId);
+                if (it != g_rsuRegionalAwarenessTables[rsuIndex].end())
+                    rssiCorr = (it->second.rssiVerifiedCount > 0u) ? 1 : 0;
+                af << g_runId << "," << now << "," << rsuIndex << "," << zoneId << ","
+                   << sybilId << "," << rssiCorr << ",1\n";
+            }
+        }
 
         for (uint32_t k = 0; k < RsuSybilBudget(); ++k)
         {
@@ -11389,8 +11648,21 @@ SendControllerRsuCommand(uint32_t rsuIndex)
     // Type 6: malicious controller injects Sybil records into its global table.
     // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections
     // when N_RSUs > 1).  Records then flow back to RSUs via controller commands.
-    if (sybil_attack_enabled && rsuIndex == 0)
+    // For mode 9, only fire during phase 6 (attack-type 6 window).
+    bool seq6CtrlGate = (g_activeAttackType != ATTACK_SEQUENTIAL_ALL6) ||
+                        (ActiveAttackTypeAt6(Simulator::Now().GetSeconds()) == 6u);
+    if (sybil_attack_enabled && rsuIndex == 0 && seq6CtrlGate)
+    {
         InjectSybilRecordsIntoControllerTable(g_controllerGlobalAwarenessTable);
+        if (!g_datasetMode.empty() && g_controllerIsMalicious)
+        {
+            double   now       = Simulator::Now().GetSeconds();
+            uint32_t nPhantoms = SdnSybilBudget();
+            std::ofstream cf(controllerLogCsv.c_str(), std::ios::app);
+            cf << g_runId << "," << now << ",0,0,"
+               << nPhantoms << "," << static_cast<double>(nPhantoms) << ",1\n";
+        }
+    }
 
     ControllerVehicleRecord target;
     bool hasTarget = SelectControllerTargetForRsu(rsuIndex, target);
@@ -11893,7 +12165,11 @@ main(int argc, char* argv[])
         }
     }
 
-    std::string configFile = "";  // consumed above; listed here so --help shows it
+    std::string configFile          = "";  // consumed above; listed here so --help shows it
+    // Dataset generation v2 — local parse strings (parsed after cmd.Parse)
+    std::string g_intensityLadderStr;
+    std::string g_sybilFanoutRangeStr;
+    std::string g_zoneProfilesPath;
     CommandLine cmd;
     cmd.AddValue("SecEnabled",                 "Enable crypto, registration & token auth (false = plain network)", g_secEnabled);
     cmd.AddValue("config",                     "Path to .cfg scenario file (key=value)",  configFile);
@@ -11908,7 +12184,7 @@ main(int argc, char* argv[])
     cmd.AddValue("beaconJitterMax",            "Maximum random V2V beacon timing jitter in seconds", beaconJitterMax);
     cmd.AddValue("rsuReportInterval",          "RSU→Controller report period",           rsuReportInterval);
     cmd.AddValue("sybil_attack_enabled",       "Enable Sybil attack behavior",           sybil_attack_enabled);
-    cmd.AddValue("sybil_attack_type",          "Attack variant 0-6 (see sybil_attacks.h)",sybil_attack_type);
+    cmd.AddValue("sybil_attack_type",          "Attack variant 0-6, or 7=sequential 1->2->3->4 dataset mode (see sybil_attacks.h)",sybil_attack_type);
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
     cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
@@ -11961,7 +12237,114 @@ main(int argc, char* argv[])
     cmd.AddValue("mobilityMode5Name",          "Display name for mobility_mode=5 placeholder",mobilityMode5Name);
     cmd.AddValue("mobilityMode5TraceFile",     "SUMO/ns-2 mobility trace for mobility_mode=5",mobilityMode5TraceFile);
     cmd.AddValue("mobilityMode5RsuPositionFile","Optional RSU CSV for mobility_mode=5",mobilityMode5RsuPositionFile);
+
+    // RSSI detector tuning
+    cmd.AddValue("rssiClusterRadius",  "Co-location cluster radius (m) [default 25]",      rssiClusterRadius);
+    cmd.AddValue("rssiDist1Thresh",    "1-RSU fallback distance threshold (m) [default 15]",rssiDist1Thresh);
+    cmd.AddValue("rssiWindowSec",      "Rolling observation window (s) [default 2.0]",      rssiWindowSec);
+    cmd.AddValue("rssiMinSamples",     "Min samples per RSU before including in detection [default 8]", rssiMinSamples);
+    cmd.AddValue("rssiStreak",         "Consecutive windows to confirm Sybil [default 2]",  rssiStreakRequired);
+    cmd.AddValue("sweepMode",           "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
+    cmd.AddValue("quietMode",           "Suppress all console output; CSV writes are unaffected", quietMode);
+    cmd.AddValue("ipfsPublish",         "Fork `ipfs add` per evidence/isolation/revocation record [default false]. Off = local:// CIDs, no per-record subprocess fork (prevents the high-percentage fork/OOM crash)", g_ipfsPublishEnabled);
+    cmd.AddValue("outputDir",           "Base directory for per-run CSV logs (must exist) [default sybil-attack/outputs]", outputDir);
+    // Dataset generation v2
+    cmd.AddValue("datasetMode",         "Dataset mode: sequential_all6 | zone_concurrent (leave empty for legacy behaviour)", g_datasetMode);
+    cmd.AddValue("intensitySchedule",   "Mode-9 intensity schedule: fixed | stepped [default fixed]", g_intensitySchedule);
+    cmd.AddValue("intensityLadder",     "Stepped-intensity pct ladder e.g. 20,40,60,80,100 [default 20,40,60,80,100]", g_intensityLadderStr);
+    cmd.AddValue("intensitySubwindows", "Sub-windows per phase for stepped intensity [default 5]", g_intensitySubwindows);
+    cmd.AddValue("sybilFanoutRange",    "Sybil fanout range min,max e.g. 2,20 [default 2,10]", g_sybilFanoutRangeStr);
+    cmd.AddValue("sybilIdsPerAttacker", "Fixed Sybil fanout per attacker (overrides sybilFanoutRange) [default 0=use range]", g_fanoutFixed);
+    cmd.AddValue("zoneProfiles",        "Path to zone_profiles.csv (required for zone_concurrent mode)", g_zoneProfilesPath);
+    cmd.AddValue("seed",                "Seed for reproducible attacker selection and fanout draws [default 42]", g_runSeed);
+    cmd.AddValue("runId",               "Run identifier stamped in dataset CSV columns (default: auto)", g_runId);
+    cmd.AddValue("scenarioId",          "Scenario label for run_meta.json (default: auto)", g_scenarioId);
+    
     cmd.Parse(argc, argv);
+
+    // Redirect every per-run CSV log under --outputDir so a parallel sweep can
+    // keep each run's communication log in its own folder. The directory must
+    // already exist; the caller (sweep script) is responsible for creating it.
+    if (!outputDir.empty())
+    {
+        communicationCsv             = outputDir + "/communication_log.csv";
+        vehicleNeighborTableCsv      = outputDir + "/vehicle_neighbor_table_log.csv";
+        rsuVehicleTableCsv           = outputDir + "/rsu_vehicle_table_log.csv";
+        rsuVehicleObservationCsv     = outputDir + "/rsu_vehicle_observation_rows_log.csv";
+        rsuRegionalAwarenessCsv      = outputDir + "/rsu_regional_awareness_log.csv";
+        computedDetectionEvidenceCsv = outputDir + "/computed_detection_evidence_log.csv";
+        controllerVehicleTableCsv    = outputDir + "/controller_vehicle_table_log.csv";
+        controllerGlobalAwarenessCsv = outputDir + "/controller_global_awareness_log.csv";
+        rssiVerificationCsv          = outputDir + "/rssi_verification_log.csv";
+        // animFile (NetAnim XML, ~30 MB/run) is intentionally NOT redirected —
+        // dataset run folders hold communication/table CSV logs only.
+        rsuApprovalLogCsv = outputDir + "/rsu_approval_log.csv";
+        controllerLogCsv  = outputDir + "/controller_log.csv";
+    }
+
+    // ── Dataset generation v2: post-parse processing ────────────────────────
+    // Parse --sybilFanoutRange "min,max"
+    if (!g_sybilFanoutRangeStr.empty())
+    {
+        auto pos = g_sybilFanoutRangeStr.find(',');
+        if (pos != std::string::npos)
+        {
+            try {
+                g_fanoutMin = static_cast<uint32_t>(
+                    std::stoul(g_sybilFanoutRangeStr.substr(0, pos)));
+                g_fanoutMax = static_cast<uint32_t>(
+                    std::stoul(g_sybilFanoutRangeStr.substr(pos + 1u)));
+            } catch (...) {}
+        }
+    }
+    if (g_fanoutMax < g_fanoutMin) g_fanoutMax = g_fanoutMin;
+    g_fanoutMin = std::max(1u, std::min(20u, g_fanoutMin));
+    g_fanoutMax = std::max(g_fanoutMin, std::min(20u, g_fanoutMax));
+    if (g_fanoutFixed > 0u) g_fanoutFixed = std::min(20u, g_fanoutFixed);
+
+    // Parse --intensityLadder
+    if (!g_intensityLadderStr.empty())
+        g_intensityLadder = ParseIntensityLadder(g_intensityLadderStr);
+    if (g_intensityLadder.empty())
+        g_intensityLadder = {20u, 40u, 60u, 80u, 100u};
+
+    // Bidirectional sync: --datasetMode ↔ sybil_attack_type
+    if (!g_datasetMode.empty() && sybil_attack_enabled)
+    {
+        if      (g_datasetMode == "sequential_all6" && sybil_attack_type != 9u)
+            sybil_attack_type = 9u;
+        else if (g_datasetMode == "zone_concurrent"  && sybil_attack_type != 8u)
+            sybil_attack_type = 8u;
+    }
+    if (g_datasetMode.empty())
+    {
+        if      (sybil_attack_type == 9u) g_datasetMode = "sequential_all6";
+        else if (sybil_attack_type == 8u) g_datasetMode = "zone_concurrent";
+    }
+
+    // Auto-fill scenario_id and run_id if not provided
+    if (g_scenarioId.empty())
+        g_scenarioId = g_datasetMode.empty() ? "baseline" : g_datasetMode;
+    if (g_runId.empty())
+        g_runId = g_scenarioId + "_s" + std::to_string(g_runSeed);
+
+    if (proposed_method != kNoLegacyProposedMethod)
+    {
+        // Legacy alias, restored alongside the mode-8/9 dataset cherry-pick: some
+        // sweep scripts (e.g. collect_sybil_metrics.py) still pass --proposed_method
+        // instead of --solution_mode.
+        switch (proposed_method)
+        {
+        case 0:  solution_mode = MODE_NO_DETECTION; break;
+        case 1:  solution_mode = MODE_LIGHTWEIGHT;  break;
+        case 2:  solution_mode = MODE_BASELINE_ML;  break;
+        case 3:  solution_mode = MODE_BASELINE_FL;  break;
+        case 4:  solution_mode = MODE_FULL;         break;
+        default: solution_mode = proposed_method;   break;
+        }
+    }
+
+    
     if (proposed_method != kNoLegacyProposedMethod)
         solution_mode = MapLegacyProposedMethod(proposed_method);
     ConfigureSolutionMode();
@@ -12036,10 +12419,113 @@ main(int argc, char* argv[])
 
 
 
+    // Sequential dataset mode (type 7): the user-supplied --simTime is the
+    // PER-PHASE length.  The run executes g_seqNumPhases attacks back-to-back,
+    // so extend the real simulation length to cover every phase.  Done before
+    // DeclareAttackStates/scheduling so all downstream timing uses the full run.
+    if (sybil_attack_enabled && sybil_attack_type == 7)
+    {
+        g_seqPhaseDuration = simTime;
+        simTime            = simTime * static_cast<double>(g_seqNumPhases);
+        std::cout << "[sybil_attacks] Sequential mode: " << g_seqNumPhases
+                  << " phases x " << g_seqPhaseDuration << "s = "
+                  << simTime << "s total run.\n";
+    }
+
+    // Sequential-all-6 dataset mode (type 9): same logic, but 6 phases.
+    if (sybil_attack_enabled && sybil_attack_type == 9)
+    {
+        // Zone-profiles CSV must be present for mode 8, not mode 9.
+        g_seq6PhaseDuration = simTime;
+        simTime             = simTime * static_cast<double>(kSeq6NumPhases);
+        std::cout << "[sybil_attacks] Sequential-all-6 mode: " << kSeq6NumPhases
+                  << " phases x " << g_seq6PhaseDuration << "s = "
+                  << simTime << "s total run.\n";
+    }
+
+    // Zone-concurrent mode (type 8): parse zone profiles before DeclareAttackers.
+    if (sybil_attack_enabled && sybil_attack_type == 8)
+    {
+        if (g_zoneProfilesPath.empty())
+        {
+            std::cerr << "[dataset] ERROR: --datasetMode=zone_concurrent requires "
+                         "--zoneProfiles=<path>\n";
+            return 1;
+        }
+        ParseZoneProfiles(g_zoneProfilesPath);
+        if (g_zoneProfiles.empty())
+        {
+            std::cerr << "[dataset] ERROR: zone_profiles CSV empty or invalid: "
+                      << g_zoneProfilesPath << "\n";
+            return 1;
+        }
+    }
+
     // Resolve attack type and populate per-node attacker flags.
     // Must run after routing_test / N_RSUs adjustments.
     DeclareAttackStates();
     DeclareAttackers();
+
+    // Sequential dataset mode: emit phase/attacker metadata so the single
+    // communication_log can be labelled — which attack ran in each time window
+    // and which node IDs are the attackers.
+    if (sybil_attack_enabled && sybil_attack_type == 7)
+    {
+        std::ofstream pf((outputDir + "/attack_phases.csv").c_str());
+        pf << "phase,attack_type,start_time,end_time\n";
+        for (uint32_t p = 0; p < g_seqNumPhases; ++p)
+        {
+            double s = std::max(static_cast<double>(p) * g_seqPhaseDuration,
+                                g_attackOnsetTime);
+            double e = static_cast<double>(p + 1) * g_seqPhaseDuration - g_seqPhaseGapSec;
+            pf << p << "," << g_seqAttackTypes[p] << "," << s << "," << e << "\n";
+        }
+        std::ofstream af((outputDir + "/sybil_attackers.csv").c_str());
+        af << "attacker_node_id\n";
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
+            if (IsSybilVehicle(i)) af << i << "\n";
+    }
+
+    // Sequential-all-6 mode (type 9): emit phase/attacker metadata.
+    if (sybil_attack_enabled && sybil_attack_type == 9)
+    {
+        std::ofstream pf((outputDir + "/attack_phases_seq6.csv").c_str());
+        pf << "phase,attack_type,start_time,end_time\n";
+        for (uint32_t p = 0u; p < kSeq6NumPhases; ++p)
+        {
+            double s = std::max(static_cast<double>(p) * g_seq6PhaseDuration,
+                                g_attackOnsetTime);
+            double e = static_cast<double>(p + 1u) * g_seq6PhaseDuration - kSeq6PhaseGapSec;
+            pf << p << "," << kSeq6AttackTypes[p] << "," << s << "," << e << "\n";
+        }
+        std::ofstream af((outputDir + "/sybil_attackers_seq6.csv").c_str());
+        af << "attacker_node_id\n";
+        for (uint32_t i = 0u; i < N_Vehicles; ++i)
+            if (IsSybilVehicle(i)) af << i << "\n";
+    }
+
+    // Write run_meta.json for any dataset mode.
+    if (!g_datasetMode.empty())
+    {
+        double perPhase = (sybil_attack_type == 9u) ? g_seq6PhaseDuration :
+                          (sybil_attack_type == 7u) ? g_seqPhaseDuration  : simTime;
+        std::ofstream mf((outputDir + "/run_meta.json").c_str());
+        mf << "{\n"
+           << "  \"mode\": \""          << g_datasetMode        << "\",\n"
+           << "  \"seed\": "            << g_runSeed             << ",\n"
+           << "  \"run_id\": \""        << g_runId               << "\",\n"
+           << "  \"scenario_id\": \""   << g_scenarioId          << "\",\n"
+           << "  \"sim_time_per_phase\":" << perPhase             << ",\n"
+           << "  \"total_sim_time\": "  << simTime               << ",\n"
+           << "  \"intensity_schedule\":\"" << g_intensitySchedule << "\",\n"
+           << "  \"fanout_min\": "      << g_fanoutMin            << ",\n"
+           << "  \"fanout_max\": "      << g_fanoutMax            << ",\n"
+           << "  \"sybil_attack_percentage\":" << sybil_attack_percentage << ",\n"
+           << "  \"N_Vehicles\": "      << N_Vehicles             << ",\n"
+           << "  \"N_RSUs\": "          << N_RSUs                 << ",\n"
+           << "  \"N_Controllers\": "   << N_Controllers          << "\n"
+           << "}\n";
+    }
 
     InitializeCommunicationCsv();
     InitializeVehicleNeighborTableCsv();
@@ -12051,6 +12537,13 @@ main(int argc, char* argv[])
     InitializeControllerGlobalAwarenessCsv();
     InitializeRssiVerificationCsv();
     InitializeRsuTrustLifecycleCsv();
+
+    if (!g_datasetMode.empty())
+    {
+        InitializeRsuApprovalLogCsv();
+        InitializeControllerLogCsv();
+    }
+    OpenPersistentCsvHandles();
     InitializeMetricsCsvFiles();
 
     g_secMetrics = Create<SecurityEvaluationMetrics>();
@@ -12077,6 +12570,26 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
 
     InstallSelectedMobility();
+
+    // Zone-based dataset modes: freeze vehicle home zones from spawn positions
+    // (requires RSU mobility to be installed first, so must be AFTER InstallSelectedMobility).
+    if (!g_datasetMode.empty())
+        InitVehicleHomeZones();
+
+    // Zone-concurrent mode: per-zone attacker selection needs zone assignments.
+    if (g_activeAttackType == ATTACK_ZONE_CONCURRENT)
+    {
+        DeclareAttackersMode8();
+        std::ofstream af((outputDir + "/sybil_attackers_mode8.csv").c_str());
+        af << "attacker_node_id,attack_type,zone_id,fanout\n";
+        for (uint32_t i = 0u; i < N_Vehicles; ++i)
+            if (IsSybilVehicle(i))
+                af << i << ","
+                   << (i < g_vehicleAttackType.size() ? g_vehicleAttackType[i] : 0u) << ","
+                   << ZoneOfVehicle(i) << ","
+                   << (i < g_vehicleFanout.size() ? g_vehicleFanout[i] : 0u) << "\n";
+    }
+
     InitializeRssiSolution();
 
     // -----------------------------------------------------------------------
@@ -12362,7 +12875,19 @@ main(int argc, char* argv[])
             // Type 1 (Outsider): the attacker never sends legitimate V2V beacons
             // or V2RSU self-reports.  It only listens and sends forged reports
             // (scheduled by ScheduleAttackTraffic).  Skip normal scheduling here.
+            // In sequential mode the same suppression applies, but ONLY during
+            // the outsider phase (ActiveAttackTypeAt(t) == 1); in the later
+            // insider phases the attacker emits normal beacons as usual.
             if (g_activeAttackType == ATTACK_OUTSIDER && IsSybilVehicle(i))
+                continue;
+            if (g_activeAttackType == ATTACK_SEQUENTIAL_1234 && IsSybilVehicle(i) &&
+                ActiveAttackTypeAt(t) == 1u)
+                continue;
+            if (g_activeAttackType == ATTACK_ZONE_CONCURRENT && IsSybilVehicle(i) &&
+                i < g_vehicleAttackType.size() && g_vehicleAttackType[i] == 1u)
+                continue;
+            if (g_activeAttackType == ATTACK_SEQUENTIAL_ALL6 && IsSybilVehicle(i) &&
+                ActiveAttackTypeAt6(t) == 1u)
                 continue;
 
             Ptr<Socket> vehicleSocket = CreateSenderSocket(g_vehicleNodes.Get(i));
@@ -12461,18 +12986,22 @@ main(int argc, char* argv[])
     // NetAnim visualisation
     // -----------------------------------------------------------------------
 
-    AnimationInterface anim(animFile);
-    // With 95 vehicles beaconing every ~0.1 s the default 50 000 packet cap
-    // is hit in ~11 s, after which AnimationInterface calls StopAnimation()
-    // and all position updates stop too.  Set a large cap so the full
-    // simulation is recorded.  For routing_test (3 vehicles) 50 000 is fine;
-    // for SUMO modes scale by node count and simTime.
+    // Skip NetAnim entirely in sweep mode: the XML grows to hundreds of MB on
+    // long SUMO runs and is pure dead weight (and I/O contention) when dozens of
+    // parallel sweep jobs would all write it.  Visual runs still produce it.
+    if (!sweepMode)
     {
+        AnimationInterface anim(animFile);
+        // With 95 vehicles beaconing every ~0.1 s the default 50 000 packet cap
+        // is hit in ~11 s, after which AnimationInterface calls StopAnimation()
+        // and all position updates stop too.  Set a large cap so the full
+        // simulation is recorded.  For routing_test (3 vehicles) 50 000 is fine;
+        // for SUMO modes scale by node count and simTime.
         uint64_t estPkts = static_cast<uint64_t>(
             (N_Vehicles + N_RSUs) * simTime * 20);   // ~20 pkt/node/s
         anim.SetMaxPktsPerTraceFile(std::max(uint64_t(50000), estPkts));
+        ColorAndLabelNodes(anim, g_vehicleNodes, g_rsuNodes, g_controllerNode);
     }
-    ColorAndLabelNodes(anim, g_vehicleNodes, g_rsuNodes, g_controllerNode);
 
     // -----------------------------------------------------------------------
     // Startup summary
