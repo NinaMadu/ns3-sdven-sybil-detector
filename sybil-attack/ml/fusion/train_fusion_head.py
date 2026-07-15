@@ -19,6 +19,7 @@ Run in ml/.venv (torch):  python ml/fusion/train_fusion_head.py
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -133,6 +134,20 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     out.to_parquet(args.out, index=False)
     print(f"wrote {out.shape} -> {args.out}")
+
+    # ── DEPLOYMENT export: the trained head weights + impute fill, so Eq 3.18 can
+    #    be applied to fresh live φ (the real-time daemon). Head is deterministic
+    #    (seed, full-batch) → this reproduces the exact ŷ_i in the parquet above. ──
+    wpath = os.path.join(os.path.dirname(os.path.abspath(args.out)), "fusion_head_weights.json")
+    payload = {
+        "phi_cols": PHI_COLS,                                    # Eq 3.18 concat order (80)
+        "weight": model.fc.weight.detach().cpu().numpy().ravel().tolist(),   # (80,)
+        "bias": float(model.fc.bias.detach().cpu().numpy().ravel()[0]),
+        "impute_fill": {c: float(fill[c]) for c in PHI_COLS},    # train-split φ means
+        "val_mcc": float(best_mcc), "seed": args.seed,
+    }
+    json.dump(payload, open(wpath, "w"), indent=2)
+    print(f"wrote head weights -> {wpath}")
 
 
 if __name__ == "__main__":

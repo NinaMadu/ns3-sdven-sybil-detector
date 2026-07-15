@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "llm", "common"))   # constants
 sys.path.insert(0, os.path.join(_HERE, "..", "llm", "stage2_agents"))  # consensus_infer, agents
 
 import build_context_live as BC          # noqa: E402
+import ensemble_live as EL               # noqa: E402  (Eq 3.18 head + Eq 3.20 ŷ_ens)
 import protocol as PROTO                 # noqa: E402
 import consensus_infer as CI             # noqa: E402
 import agents as A                       # noqa: E402
@@ -78,6 +79,7 @@ class Daemon:
         self.gru = gru.TemporalPredictor.load()
         self.rssi = rssi.RSSIPredictor.load()
         self.trust = trust.TrustPredictor.load()
+        self.head = EL.FusionHeadLive.load()          # Eq 3.18 head (weights, no refit)
 
         print("[daemon] loading frozen consensus config + 3 LoRA agents (GPU) ...", flush=True)
         self.cfg = CI.load_config()
@@ -97,6 +99,9 @@ class Daemon:
         ci = BC.assemble_ci(t_df, rssi=r_df, trust=u_df,
                             carry_forward=self.carry_forward,
                             tol=(self.tol if self.carry_forward else None))
+        # Eq 3.18 ŷ_i (from live φ) + Eq 3.20 ŷ_ens. Until the RSU XGBs are wired,
+        # p̄_temp/p̄_rssi are absent so ŷ_ens renormalises to ŷ_i alone.
+        ci = EL.enrich(ci, head=self.head)
         if only_new:
             ci = ci[ci["window_start_seconds"] > self.last_t]
         self.last_t = max(self.last_t, t)
