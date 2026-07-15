@@ -26,19 +26,16 @@ Run in the GPU env:
 import argparse
 import json
 import os
-import time
 
 import numpy as np
 import pandas as pd
-import torch
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "common"))
 import constants as C          # noqa: E402  (constants + eval_fusion live in llm/common)
-import agents as A
-from eval_fusion import extract_json, dir_size_mb  # noqa: E402
+import agents as A             # noqa: E402
+import consensus_infer as I    # noqa: E402  (shared label-free generation + Eq 3.22 math)
+from eval_fusion import dir_size_mb  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -46,33 +43,6 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 def load_split(agent, split):
     path = os.path.join(_HERE, f"data_{agent}", f"{split}.jsonl")
     return [json.loads(l) for l in open(path)]
-
-
-def generate(model, tok, rows, batch, max_new):
-    """Return list of parsed dicts (verdict/attack_type/confidence) aligned to rows."""
-    preds, n = [], len(rows)
-    gen_tokens, dt = 0, 0.0
-    for start in range(0, n, batch):
-        chunk = rows[start:start + batch]
-        prompts = [tok.apply_chat_template(r["messages"][:-1], add_generation_prompt=True,
-                                           tokenize=False) for r in chunk]
-        enc = tok(prompts, return_tensors="pt", padding=True).to(model.device)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        t0 = time.time()
-        with torch.no_grad():
-            out = model.generate(**enc, max_new_tokens=max_new, do_sample=False,
-                                 pad_token_id=tok.pad_token_id)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        dt += time.time() - t0
-        gen = out[:, enc["input_ids"].shape[1]:]
-        gen_tokens += int((gen != tok.pad_token_id).sum().item())
-        for text in tok.batch_decode(gen, skip_special_tokens=True):
-            preds.append(extract_json(text))
-        print(f"    {min(start + batch, n)}/{n}", end="\r", flush=True)
-    print()
-    return preds, dt, gen_tokens
 
 
 def score_binary(y_true_sybil, d):
@@ -110,18 +80,8 @@ def main():
 
     adir = dict(zip(A.AGENT_ORDER, args.adapters))
 
-    tok = AutoTokenizer.from_pretrained(adir["a1"])
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    tok.padding_side = "left"
-
     print(f"Loading shared base {args.base} + 3 LoRA adapters ...")
-    base = AutoModelForCausalLM.from_pretrained(args.base, dtype=torch.bfloat16,
-                                                device_map={"": 0})
-    model = PeftModel.from_pretrained(base, adir["a1"], adapter_name="a1")
-    model.load_adapter(adir["a2"], adapter_name="a2")
-    model.load_adapter(adir["a3"], adapter_name="a3")
-    model.eval()
+    tok, model = I.load_agents(args.base, adir)
 
     # rows are identical context across agents; the SYSTEM prompt differs per agent,
     # so load each agent's own split (system prompt baked into messages).
@@ -138,7 +98,8 @@ def main():
                 gold[split] = [json.loads(r["messages"][-1]["content"]) for r in rows]
             model.set_adapter(agent)
             print(f"  [{agent}] generating {split} ({len(rows)}) ...")
-            preds, dt, ntok = generate(model, tok, rows, args.batch, args.max_new)
+            preds, dt, ntok = I.agent_generate(
+                model, tok, [r["messages"][:-1] for r in rows], args.batch, args.max_new)
             results.setdefault(agent, {})[split] = preds
             if split == "test":
                 results[agent]["_lat"] = {
@@ -148,25 +109,10 @@ def main():
     os.makedirs(args.scorecards, exist_ok=True)
 
     # ---- per-agent scorecards + decision matrices ---------------------------
-    D = {}          # split -> (n, 3) binary decisions
-    PT = {}         # split -> (n, 3) predicted attack_type strings
-    CF = {}         # split -> (n, 3) confidence weights
-    conf_w = {"high": 1.0, "medium": 0.6, "low": 0.3}
+    D, PT, CF = {}, {}, {}          # split -> (n, 3) decision / attack-type / conf
     for split in ("val", "test"):
-        n = len(gold[split])
-        D[split] = np.zeros((n, 3), int)
-        PT[split] = np.empty((n, 3), object)
-        CF[split] = np.zeros((n, 3))
-        for j, agent in enumerate(A.AGENT_ORDER):
-            for i, p in enumerate(results[agent][split]):
-                if p is None:
-                    PT[split][i, j] = "legitimate"
-                    continue
-                at = p.get("attack_type")
-                at = at if at in C.ATTACK_CLASSES else "legitimate"
-                D[split][i, j] = 1 if p.get("verdict") == "sybil" else 0
-                PT[split][i, j] = at
-                CF[split][i, j] = conf_w.get(p.get("confidence", "medium"), 0.6)
+        D[split], PT[split], CF[split] = I.build_decision_matrices(
+            {a: results[a][split] for a in A.AGENT_ORDER})
 
     for j, agent in enumerate(A.AGENT_ORDER):
         yt = [1 if g["verdict"] == "sybil" else 0 for g in gold["test"]]
@@ -185,34 +131,19 @@ def main():
         print(f"  [{agent}] test binary-MCC={mcc} FPR={fpr} mc-MCC={mc['mcc']} json={jvalid:.3f}")
 
     # ---- Eq 3.22 consensus: uniform ω, θ calibrated on val ------------------
-    def consensus(split, omega, theta):
-        s = D[split] @ np.asarray(omega)                       # Σ ω_a d_a
-        Dg = (s >= theta).astype(int)
-        # variant vote among firing agents (confidence-weighted); ties -> a3
-        yv = []
-        for i in range(len(Dg)):
-            if Dg[i] == 0:
-                yv.append("legitimate"); continue
-            score = {}
-            for j in range(3):
-                if D[split][i, j] == 1 and PT[split][i, j] != "legitimate":
-                    score[PT[split][i, j]] = score.get(PT[split][i, j], 0) + CF[split][i, j] * omega[j]
-            yv.append(max(score, key=score.get) if score else PT[split][i, 2])
-        return Dg, yv
-
     omega = [1/3, 1/3, 1/3]
     yt_val = [1 if g["verdict"] == "sybil" else 0 for g in gold["val"]]
     from sklearn.metrics import matthews_corrcoef
     best_theta, best_m = 0.5, -1.0
     for theta in sorted(set(np.round(np.arange(0.0, 1.0001, 1/3), 4))):  # {0,1/3,2/3,1}
-        Dg, _ = consensus("val", omega, theta)
+        Dg, _ = I.consensus(D["val"], PT["val"], CF["val"], omega, theta)
         m = matthews_corrcoef(yt_val, Dg)
         if m > best_m:
             best_theta, best_m = float(theta), m
 
     yt = [1 if g["verdict"] == "sybil" else 0 for g in gold["test"]]
     yt_mc = [g["attack_type"] for g in gold["test"]]
-    Dg, yv = consensus("test", omega, best_theta)
+    Dg, yv = I.consensus(D["test"], PT["test"], CF["test"], omega, best_theta)
     mcc, fpr = score_binary(yt, Dg.tolist())
     mc = score_multiclass(yt_mc, yv)
 
@@ -220,7 +151,8 @@ def main():
     ablation = {}
     for j, agent in enumerate(A.AGENT_ORDER):
         w = [0.0 if k == j else 0.5 for k in range(3)]
-        Dg2, _ = consensus("test", w, best_theta * (sum(w)))  # scale θ to the 2-agent mass
+        Dg2, _ = I.consensus(D["test"], PT["test"], CF["test"], w,
+                             best_theta * (sum(w)))  # scale θ to the 2-agent mass
         ablation[f"omega_{agent}=0"] = {"binary_mcc": score_binary(yt, Dg2.tolist())[0]}
 
     consensus_sc = {
