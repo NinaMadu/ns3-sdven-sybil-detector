@@ -1,0 +1,5 @@
+zone_id,attack_type,attack_pct,fanout_min,fanout_max
+0,3,50,2,8
+1,2,50,2,8
+2,5,100,3,5
+3,6,100,3,5

@@ -184,6 +184,11 @@ struct NeighborAwarenessRecord
     double   rssiDbm               = -999.0; ///< PHY-measured signal strength (dBm); -999 = not yet observed
     double   rssiEstimatedDistance = -1.0;   ///< Distance inferred from rssiDbm via path-loss inverse (metres)
     uint32_t rssiVerificationState = RSSI_UNVERIFIED;
+    // Continuous counterpart of SUSPICION_TRAJECTORY_SHADOWING (simDTW proxy, Eq 3.5):
+    // exp(-mean(normalized distance/speed/heading deviation)) in (0,1], 1 = closest match.
+    // Logged alongside the boolean flag so consumers aren't limited to a single bit.
+    double   trajShadowScore       = 0.0;    ///< 0 = no shadowing evidence found (see trajShadowCompared)
+    bool     trajShadowCompared    = false;  ///< true once enough aligned samples existed to score at all
 };
 
 struct V2RsuAwarenessReport
@@ -1433,7 +1438,10 @@ enum SybilAttackType
     ATTACK_INSIDER_DIRECT_NON_SIMULTANEOUS = 3,  ///< Fake IDs rotated over time
     ATTACK_INSIDER_INDIRECT                = 4,  ///< Fake IDs injected via a relay node
     ATTACK_MALICIOUS_RSU                   = 5,  ///< Compromised RSU fabricates vehicle reports
-    ATTACK_MALICIOUS_SDN_CONTROLLER        = 6   ///< Compromised controller manipulates commands
+    ATTACK_MALICIOUS_SDN_CONTROLLER        = 6,  ///< Compromised controller manipulates commands
+    ATTACK_SEQUENTIAL_1234                 = 7,  ///< Run attacks 1→2→3→4 back-to-back, one per time phase (ML dataset mode)
+    ATTACK_ZONE_CONCURRENT                 = 8,  ///< Multiple attack variants concurrent in geographic zones (FL federation dataset)
+    ATTACK_SEQUENTIAL_ALL6                 = 9   ///< Run attacks 1→2→3→4→5→6 back-to-back, full 7-class dataset
 };
 
 // ---------------------------------------------------------------------------

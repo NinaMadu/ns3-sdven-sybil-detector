@@ -99,3 +99,31 @@ Thumbs.db
 
 !rssi_mcc_sweep.py
 *.Zone.Identifier
+
+# ── Reorganized ML/LLM tree (sybil-attack/ml): version-control the SOURCE, not
+#    the trained weights, datasets, or generated outputs. ──
+!sybil-attack/ml/
+!sybil-attack/ml/**/
+!sybil-attack/ml/**/*.py
+!sybil-attack/ml/**/*.ipynb
+!sybil-attack/ml/**/*.md
+!sybil-attack/ml/**/*.sh
+!sybil-attack/ml/**/*.txt
+# Never track heavyweight artifacts / model weights / data / archive (order
+# matters — these re-ignores come AFTER the source whitelist above).
+sybil-attack/ml/.venv/
+sybil-attack/ml/_archive/
+sybil-attack/ml/**/adapters/
+sybil-attack/ml/**/bakeoff/
+sybil-attack/ml/**/context/
+sybil-attack/ml/**/cache/
+sybil-attack/ml/**/data/
+sybil-attack/ml/**/data_*/
+sybil-attack/ml/**/preds/
+sybil-attack/ml/fusion/spine/
+# (analyzers/**/outputs and fusion/outputs are already caught by the global
+#  sybil-attack/**/outputs/** rule above.)
+
+# Large regenerable dataset (239MB) — rebuild via
+# notebooks/ml_models/rssi-analyzer/build_rssi_dataset.py. Never track.
+sybil-attack/notebooks/ml_models/rssi-analyzer/rssi_dataset.csv
