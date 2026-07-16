@@ -180,12 +180,17 @@ def full_proba(model, X):
     return full
 
 
-def build_features_live(run_dir, t=None, run_id="live", nrows=None):
-    df = pd.read_csv(Path(run_dir) / "communication_log.csv",
-                     usecols=lambda c: c in set(USE_COLS), nrows=nrows)
+def build_features_live(run_dir, t=None, run_id="live", nrows=None, rows=None):
+    """`rows`: pre-read comm-log DataFrame already filtered to <= t (daemon LogCache fast
+    path; may include non-RSU rows — filtered here). When given, the CSV read is skipped."""
+    if rows is not None:
+        df = rows
+    else:
+        df = pd.read_csv(Path(run_dir) / "communication_log.csv",
+                         usecols=lambda c: c in set(USE_COLS), nrows=nrows)
+        if t is not None:
+            df = df[df["receive_time"] <= float(t)]
     df = df[(df["receiver_role"] == "rsu_edge") & (df["flow"].isin(RSU_RX_FLOWS))].copy()
-    if t is not None:
-        df = df[df["receive_time"] <= float(t)]
     if df.empty:
         return pd.DataFrame()
     b = dedup_beacons(df)
@@ -206,8 +211,8 @@ class TemporalXGBPredictor:
         m.load_model(str(model_json))
         return cls(m)
 
-    def score_logs(self, run_dir, t=None, run_id="live", nrows=None):
-        fdf = build_features_live(run_dir, t=t, run_id=run_id, nrows=nrows)
+    def score_logs(self, run_dir, t=None, run_id="live", nrows=None, rows=None):
+        fdf = build_features_live(run_dir, t=t, run_id=run_id, nrows=nrows, rows=rows)
         if fdf is None or fdf.empty:
             return pd.DataFrame()
         fp = full_proba(self.model, fdf[FEATURES])

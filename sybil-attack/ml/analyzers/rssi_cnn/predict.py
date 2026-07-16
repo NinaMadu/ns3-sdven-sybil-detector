@@ -67,17 +67,20 @@ class RSSIAnalyzerCNN(nn.Module):
         return (logit, phi) if return_phi else logit
 
 
-def build_windows_live(run_dir, t=None, run_id="live", W=WINDOW_W, nrows=None):
+def build_windows_live(run_dir, t=None, run_id="live", W=WINDOW_W, nrows=None, rows=None):
     """Causal, label-free twin of RSSIWindowDataset.
 
-    Returns (X[N,4,W] float32, meta DataFrame). Empty -> (None, None).
+    `rows`: pre-read rssi-log DataFrame already filtered to <= t (daemon LogCache fast
+    path); when given, the CSV read is skipped. Returns (X[N,4,W] float32, meta), or Nones.
     Channels are NOT yet z-scored here (predictor applies persisted chan stats).
     """
-    run_dir = Path(run_dir)
-    df = pd.read_csv(run_dir / "rssi_verification_log.csv",
-                     usecols=lambda c: c in set(RSSI_USE), nrows=nrows)
-    if t is not None:
-        df = df[df["time"] <= float(t)]
+    if rows is not None:
+        df = rows.copy()
+    else:
+        df = pd.read_csv(Path(run_dir) / "rssi_verification_log.csv",
+                         usecols=lambda c: c in set(RSSI_USE), nrows=nrows)
+        if t is not None:
+            df = df[df["time"] <= float(t)]
     if df.empty:
         return None, None
     df = df.drop_duplicates(subset=DEDUP_COLS)
@@ -152,8 +155,8 @@ class RSSIPredictor:
         y_hat_i = 1.0 / (1.0 + np.exp(-logit))
         return phi, y_hat_i                                 # (N,32), (N,)
 
-    def score_logs(self, run_dir, t=None, run_id="live", nrows=None):
-        X, meta = build_windows_live(run_dir, t=t, run_id=run_id, nrows=nrows)
+    def score_logs(self, run_dir, t=None, run_id="live", nrows=None, rows=None):
+        X, meta = build_windows_live(run_dir, t=t, run_id=run_id, nrows=nrows, rows=rows)
         if X is None:
             return pd.DataFrame()
         phi, y_hat_i = self._extract(X)

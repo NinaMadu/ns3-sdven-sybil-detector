@@ -75,18 +75,22 @@ class TemporalGRU(nn.Module):
         return (logits, phi) if return_phi else logits
 
 
-def build_windows_live(run_dir, t=None, run_id="live", W=WINDOW_W, step=WINDOW_STEP, nrows=None):
+def build_windows_live(run_dir, t=None, run_id="live", W=WINDOW_W, step=WINDOW_STEP,
+                       nrows=None, rows=None):
     """Causal, label-free twin of the notebook's build_windows.
 
-    Returns (X[N,W,10] float32, L[N] int, meta DataFrame with run_id/receiver_id/
-    claimed_node_id/window_start_seconds). Empty -> (None, None, None).
+    `rows`: pre-read comm-log DataFrame already filtered to <= t (the daemon's LogCache
+    fast path); when given, the CSV read is skipped. Returns (X[N,W,10] float32, L[N] int,
+    meta DataFrame with run_id/receiver_id/claimed_node_id/window_start_seconds), or Nones.
     """
-    run_dir = Path(run_dir)
-    df = pd.read_csv(run_dir / "communication_log.csv",
-                     usecols=lambda c: c in NEED_COLS, nrows=nrows)
+    if rows is not None:
+        df = rows
+    else:
+        df = pd.read_csv(Path(run_dir) / "communication_log.csv",
+                         usecols=lambda c: c in NEED_COLS, nrows=nrows)
+        if t is not None:
+            df = df[df["receive_time"] <= float(t)]
     df = df[(df["flow"] == "v2v_beacon") & (df["receiver_role"] == "vehicle")].copy()
-    if t is not None:
-        df = df[df["receive_time"] <= float(t)]
     if df.empty:
         return None, None, None
     df["run_id"] = run_id
@@ -163,8 +167,8 @@ class TemporalPredictor:
         prob = e / e.sum(1, keepdims=True)
         return phi, prob                     # (N,32), (N,7)
 
-    def score_logs(self, run_dir, t=None, run_id="live", nrows=None):
-        X, L, meta = build_windows_live(run_dir, t=t, run_id=run_id, nrows=nrows)
+    def score_logs(self, run_dir, t=None, run_id="live", nrows=None, rows=None):
+        X, L, meta = build_windows_live(run_dir, t=t, run_id=run_id, nrows=nrows, rows=rows)
         if X is None:
             return pd.DataFrame()
         phi, prob = self._extract_phi(self._scale(X), L)

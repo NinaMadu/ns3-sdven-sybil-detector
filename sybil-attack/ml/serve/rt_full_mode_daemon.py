@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "llm", "stage2_agents"))  # consens
 
 import build_context_live as BC          # noqa: E402
 import ensemble_live as EL               # noqa: E402  (Eq 3.18 head + Eq 3.20 ŷ_ens)
+import log_cache as LC                    # noqa: E402  (incremental tail reader)
 import protocol as PROTO                 # noqa: E402
 import consensus_infer as CI             # noqa: E402
 import agents as A                       # noqa: E402
@@ -61,12 +62,14 @@ def _confidence(d_row, dg):
 
 class Daemon:
     def __init__(self, run_dir, cap=None, carry_forward=True, tol=20.0,
-                 batch=16, max_new=128, agent_device=0, max_identities=None):
+                 batch=16, max_new=128, agent_device=0, max_identities=None,
+                 window_margin=30.0):
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
         self.carry_forward = carry_forward
         self.tol = tol
+        self.window_margin = window_margin     # bounded incremental windowing lookback (s)
         self.batch = batch
         self.max_new = max_new
         self.max_identities = max_identities   # cap rows scored per window (testing/throttle)
@@ -86,6 +89,17 @@ class Daemon:
         # NOTE: RSU rssi XGB (p̄_rssi, λ=0.2) deferred — pending native re-save; until
         # then ŷ_ens renormalises over ŷ_i + p̄_temp (0.8 of the ensemble weight).
 
+        # incremental log caches: parse each physical log ONCE, then per-SCORE ingest
+        # only the appended tail (kills the ~60 s/SCORE full re-read). comm feeds GRU +
+        # temporal-XGB; rssi feeds the CNN; neighbor feeds trust.
+        rd = self.run_dir
+        self.comm_cache = LC.LogCache(os.path.join(rd, "communication_log.csv"),
+                                      (lambda c: c in set(txgb.USE_COLS)), "receive_time", nrows=cap)
+        self.rssi_cache = LC.LogCache(os.path.join(rd, "rssi_verification_log.csv"),
+                                      (lambda c: c in set(rssi.RSSI_USE)), "time", nrows=cap)
+        self.nb_cache = LC.LogCache(os.path.join(rd, trust.T.NEIGHBOR_LOG),
+                                    (lambda c: c in trust.T.NEIGHBOR_COLS), "time", nrows=cap)
+
         print("[daemon] loading frozen consensus config + 3 LoRA agents (GPU) ...", flush=True)
         self.cfg = CI.load_config()
         self.tok, self.model = CI.load_agents(self.cfg["base"], self.cfg["adapters"],
@@ -97,12 +111,30 @@ class Daemon:
     # -- the full chain for one scoring window -------------------------------
     def score(self, t, only_new=True, max_identities=None):
         max_identities = self.max_identities if max_identities is None else max_identities
-        t_df = self.gru.score_logs(self.run_dir, t=t, run_id=self.run_id, nrows=self.cap)
+        # ingest appended log tails; then take views. Bounded incremental windowing:
+        # with only_new we only keep windows > last_t, so the SLICE-SAFE vehicle-tier
+        # predictors (GRU/CNN/trust — their history features come from log columns, and
+        # trust's T_hist recursion re-warms within the margin) window only the recent
+        # slice [last_t - margin, t] instead of all history. The RSU temporal-XGB needs
+        # full history (claimed-id age / beacons-so-far) but is cheap, so it gets upto(t).
+        self.comm_cache.refresh(); self.rssi_cache.refresh(); self.nb_cache.refresh()
+        lo = (self.last_t - self.window_margin) \
+            if (only_new and self.last_t != float("-inf")) else float("-inf")
+        comm_full = self.comm_cache.upto(t)
+        if len(comm_full) == 0:
+            return []
+        comm_recent = self.comm_cache.between(lo, t)
+        rssi_recent = self.rssi_cache.between(lo, t)
+        nb_recent = self.nb_cache.between(lo, t)
+        t_df = self.gru.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=comm_recent)
         if len(t_df) == 0:
             return []
-        r_df = self.rssi.score_logs(self.run_dir, t=t, run_id=self.run_id, nrows=self.cap)
-        u_df = self.trust.score_logs(self.run_dir, t=t, run_id=self.run_id, nrows=self.cap)
-        x_df = self.txgb.score_logs(self.run_dir, t=t, run_id=self.run_id, nrows=self.cap)
+        r_df = self.rssi.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=rssi_recent)
+        # trust neighbor read cached (rows=); its internal rssi/consensus merges still
+        # read from disk (capped) — a secondary follow-up to cache too.
+        u_df = self.trust.score_logs(self.run_dir, t=t, run_id=self.run_id,
+                                     nrows=self.cap, rows=nb_recent)
+        x_df = self.txgb.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=comm_full)
         p_temp = x_df[["run_id", "claimed_node_id", "window_start_seconds", "p_bar_temp"]] \
             if len(x_df) else None
         ci = BC.assemble_ci(t_df, rssi=r_df, trust=u_df, extra=([p_temp] if p_temp is not None else None),
@@ -213,6 +245,8 @@ def main():
     ap.add_argument("--cap", type=int, default=None, help="nrows cap on raw log reads (testing)")
     ap.add_argument("--no-carry-forward", dest="carry_forward", action="store_false", default=True)
     ap.add_argument("--tol", type=float, default=20.0)
+    ap.add_argument("--window-margin", type=float, default=30.0,
+                    help="bounded incremental windowing lookback (s) for GRU/CNN/trust")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--once", type=float, default=None, help="score once at t and print (no socket)")
@@ -222,7 +256,7 @@ def main():
 
     d = Daemon(args.run_dir, cap=args.cap, carry_forward=args.carry_forward,
                tol=args.tol, batch=args.batch, max_new=args.max_new,
-               max_identities=args.max_identities)
+               max_identities=args.max_identities, window_margin=args.window_margin)
     if args.once is not None:
         vs = d.score(args.once, only_new=False, max_identities=args.max_identities)
         print(f"\n=== {len(vs)} verdicts @ t={args.once} ===")
