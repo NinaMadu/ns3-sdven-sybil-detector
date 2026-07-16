@@ -768,23 +768,42 @@ OutsiderSendSybilReport(uint32_t vehicleIndex)
 // claimed identity.  This makes the outsider observable at the vehicle tier so
 // that FL-based detection (which runs on V2V beacons) can classify it.
 //
-// The beacon uses:
+// The beacon uses, for phantom neighbor `slot`:
 //   realNodeId    = vehicleIndex  (actual physical transmitter)
-//   claimedNodeId = N_Vehicles + 50 + vehicleIndex  (out-of-registry ID)
-//
-// At the receiver: feat[0]=1 and feat[7]~0.4-1.0 (geometry-dependent).
-// sigmoid(2.0 + 4.5*f[7] - 2.80) > 0.56 for most receiver geometries → TP.
+//   claimedNodeId = N_Vehicles + 200 + vehicleIndex*N_SYBIL_OUTSIDER_NEIGHBORS_MAX + slot
+//     (the SAME per-slot Sybil ID that OutsiderSendSybilReport injects as neighbor k,
+//      so the V2V beacon and the V2I report describe one coherent phantom).
+//   claimedPos    = own position + the per-slot drifting offset (mirrors the report),
+//     so each phantom moves smoothly instead of sitting at a fixed +7 m offset.
 // ---------------------------------------------------------------------------
 static void
-OutsiderBroadcastSybilBeacon(uint32_t vehicleIndex)
+OutsiderBroadcastSybilBeacon(uint32_t vehicleIndex, uint32_t slot)
 {
     if (!g_vehicleIsAttacker[vehicleIndex]) return;
     double now = Simulator::Now().GetSeconds();
     if (now < g_attackOnsetTime) return;
+    if (slot >= OutsiderNeighborBudget()) return;   // respect the runtime neighbor budget
 
-    uint32_t fakeClaimedId = N_Vehicles + 50u + vehicleIndex;
+    uint32_t fakeClaimedId =
+        N_Vehicles + 200u + vehicleIndex * N_SYBIL_OUTSIDER_NEIGHBORS_MAX + slot;
 
     Vector pos = g_vehicleNodes.Get(vehicleIndex)->GetObject<MobilityModel>()->GetPosition();
+
+    // Per-slot claimed-position offset with coherent drift — identical to the
+    // phantom-neighbor trajectories in OutsiderSendSybilReport.
+    static const double kBaseOffX[N_SYBIL_OUTSIDER_NEIGHBORS_MAX] = { +25.0, -25.0, +10.0, -12.0 };
+    static const double kBaseOffY[N_SYBIL_OUTSIDER_NEIGHBORS_MAX] = {  +5.0,  -5.0, +20.0, +14.0 };
+    static const double kDirX[N_SYBIL_OUTSIDER_NEIGHBORS_MAX]     = {  +1.0,  +0.8,  +0.4,  -0.3 };
+    static const double kDirY[N_SYBIL_OUTSIDER_NEIGHBORS_MAX]     = {  +0.1,  -0.2,  +0.9,  +0.7 };
+    static const double kSpeed[N_SYBIL_OUTSIDER_NEIGHBORS_MAX]    = {   4.0,   3.0,   2.5,   3.5 };
+    double elapsed     = std::max(0.0, now - g_attackOnsetTime);
+    double offsetScale = ClaimedOffsetScale();
+    double driftScale  = MobilityDriftScale();
+    double norm = std::sqrt(kDirX[slot] * kDirX[slot] + kDirY[slot] * kDirY[slot]);
+    double dirX = (norm > 0.0) ? kDirX[slot] / norm : 1.0;
+    double dirY = (norm > 0.0) ? kDirY[slot] / norm : 0.0;
+    double offX = kBaseOffX[slot] * offsetScale + dirX * kSpeed[slot] * driftScale * elapsed;
+    double offY = kBaseOffY[slot] * offsetScale + dirY * kSpeed[slot] * driftScale * elapsed;
 
     Ptr<Socket> sock = CreateSenderSocket(g_vehicleNodes.Get(vehicleIndex));
     sock->SetAllowBroadcast(true);
@@ -796,19 +815,16 @@ OutsiderBroadcastSybilBeacon(uint32_t vehicleIndex)
     tx->destinationId = 0xFFFFFFFF;
     tx->messageType   = static_cast<uint32_t>(V2V_BEACON);
     tx->sequenceNumber = g_seq++;
-    // 7.0 m X offset: effective RSSI-distance mismatch ~7.0-8.0 m for road
-    // receivers, below the always-detect boundary of 8.56 m.  Early beacons TP;
-    // once receivedBeaconCount reaches 4-5, f[8] weight drives z below 0.56 →
-    // natural TP→FN transition giving ~65-75% recall (MCC target 0.67-0.80).
-    tx->claimedX      = pos.x + 7.0;
-    tx->claimedY      = pos.y + 4.0;
+    tx->claimedX      = pos.x + offX;
+    tx->claimedY      = pos.y + offY;
     tx->claimedZ      = 0.0;
 
     std::cout << "[t=" << now << "] "
               << "[SEND] [OUTSIDER_SYBIL_BEACON]   "
               << "Vehicle=" << vehicleIndex
+              << " Slot=" << slot
               << " FakeClaimedId=" << fakeClaimedId
-              << " ClaimedOffset=(+7.5,+5)"
+              << " ClaimedOffset=(" << offX << "," << offY << ")"
               << " -> Broadcast" << std::endl;
 
     SendTaggedPacket(sock, Ipv4Address("255.255.255.255"), VEHICLE_PORT, tx);
@@ -1984,10 +2000,14 @@ ScheduleAttackTraffic(double simTime, double beaconInterval, double rsuReportInt
                     Simulator::Schedule(
                         Seconds(t + 0.05 * static_cast<double>(i) + 0.30),
                         &OutsiderSendSybilReport, i);
-                    // V2V beacon so FL vehicle-tier inference can classify this
-                    Simulator::Schedule(
-                        Seconds(t + 0.05 * static_cast<double>(i) + 0.35),
-                        &OutsiderBroadcastSybilBeacon, i);
+                    // V2V beacon per phantom neighbor so FL vehicle-tier inference can
+                    // classify each out-of-registry identity (excess slots self-skip
+                    // via OutsiderNeighborBudget()).
+                    for (uint32_t slot = 0; slot < N_SYBIL_OUTSIDER_NEIGHBORS_MAX; ++slot)
+                        Simulator::Schedule(
+                            Seconds(t + 0.05 * static_cast<double>(i) + 0.35
+                                      + 0.05 * static_cast<double>(slot)),
+                            &OutsiderBroadcastSybilBeacon, i, slot);
                 }
         break;
 

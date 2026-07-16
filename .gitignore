@@ -17,6 +17,7 @@
 !scratch/sybil_types.h
 !scratch/rssi_sybil_detection.h
 !scratch/fl_sybil_detection.h
+!scratch/llm_realtime_detection.h
 
 # Project folder and tracked runtime inputs.
 !sybil-attack/

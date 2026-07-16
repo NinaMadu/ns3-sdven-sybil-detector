@@ -27,6 +27,7 @@
 #include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
 #include "rssi_sybil_detection.h"
 #include "fl_sybil_detection.h"
+#include "llm_realtime_detection.h"   // full-mode (MODE_FULL) real-time LLM detector
 
 #include <algorithm>
 #include <chrono>
@@ -81,6 +82,14 @@ uint32_t solution_mode = MODE_NO_DETECTION; ///< 1=FL (FLEMDS) 2=RSSI 3=ML place
 uint32_t full_crypto_profile = 1;        ///< Inside full mode: 1=current classical, 2=real PQC Kyber + Dilithium/ML-DSA.
 uint32_t proposed_method = kNoLegacyProposedMethod; ///< Backward-compatible alias for old proposed_method values.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
+// RSSI co-location detection tuning + logging flags (bound by CmdLine below).
+double   rssiClusterRadius  = 25.0;   ///< Co-location cluster radius (m).
+double   rssiDist1Thresh    = 15.0;   ///< 1-RSU fallback distance threshold (m).
+double   rssiWindowSec      = 2.0;    ///< Rolling observation window (s).
+uint32_t rssiMinSamples     = 8;      ///< Min samples per RSU before including in detection.
+uint32_t rssiStreakRequired = 2;      ///< Consecutive windows to confirm Sybil.
+bool     sweepMode          = false;  ///< Suppress per-packet logging for fast threshold sweeps.
+bool     quietMode          = false;  ///< Suppress console output (CSV writes unaffected).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
 double v2vReliableRange = 100.0;      ///< Reliable local V2V beacon evaluation radius (metres).
 double rsuVehicleRecordTimeout = 3.0; ///< Seconds before an RSU forgets an unseen vehicle.
@@ -3523,6 +3532,12 @@ FLSolutionModeActive()
     return solution_mode == MODE_BASELINE_FL;
 }
 
+static bool
+FullSolutionModeActive()
+{
+    return solution_mode == MODE_FULL;
+}
+
 static uint32_t
 MapLegacyProposedMethod(uint32_t legacyMode)
 {
@@ -3824,6 +3839,10 @@ RecordUnblockedLightweightGlobalMiss(const ControllerGlobalAwarenessRecord& reco
                           "sdn_controller",
                           evidence);
 }
+
+// Euclidean distance helper — defined later (~L5090); forward-declared here so the
+// functions below (first use in WifiMonitorSnifferRx) can call it.
+static double DistanceBetween(const ns3::Vector& a, const ns3::Vector& b);
 
 static void
 WifiMonitorSnifferRx(uint32_t observerIndex,
@@ -13047,8 +13066,14 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
 
     Simulator::Stop(Seconds(simTime));
+    // Full-mode (MODE_FULL): launch the persistent LLM detector daemon and schedule
+    // periodic SCORE windows. Blocks briefly while the daemon loads its models.
+    if (FullSolutionModeActive())
+        LLMRealtimeDetector::Init(10.0);
     Simulator::Run();
     Simulator::Destroy();
+    if (FullSolutionModeActive())
+        LLMRealtimeDetector::FinalizeAndReport();
 
     WriteMetricsRow(simTime);
     WriteFinalSummary();
