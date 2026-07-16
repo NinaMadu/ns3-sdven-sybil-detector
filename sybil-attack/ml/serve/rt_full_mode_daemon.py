@@ -61,7 +61,7 @@ def _confidence(d_row, dg):
 
 class Daemon:
     def __init__(self, run_dir, cap=None, carry_forward=True, tol=20.0,
-                 batch=16, max_new=128, agent_device=0):
+                 batch=16, max_new=128, agent_device=0, max_identities=None):
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
@@ -69,6 +69,7 @@ class Daemon:
         self.tol = tol
         self.batch = batch
         self.max_new = max_new
+        self.max_identities = max_identities   # cap rows scored per window (testing/throttle)
         self.last_t = float("-inf")
 
         t0 = time.time()
@@ -95,6 +96,7 @@ class Daemon:
 
     # -- the full chain for one scoring window -------------------------------
     def score(self, t, only_new=True, max_identities=None):
+        max_identities = self.max_identities if max_identities is None else max_identities
         t_df = self.gru.score_logs(self.run_dir, t=t, run_id=self.run_id, nrows=self.cap)
         if len(t_df) == 0:
             return []
@@ -178,8 +180,11 @@ class Daemon:
         f.write(PROTO.TOK_READY + "\n")
         f.flush()
         try:
-            for line in f:
-                line = line.strip()
+            while True:
+                raw = f.readline()
+                if not raw:                       # client closed
+                    break
+                line = raw.strip()
                 if not line:
                     continue
                 if line == PROTO.TOK_SHUTDOWN:
@@ -216,7 +221,8 @@ def main():
     args = ap.parse_args()
 
     d = Daemon(args.run_dir, cap=args.cap, carry_forward=args.carry_forward,
-               tol=args.tol, batch=args.batch, max_new=args.max_new)
+               tol=args.tol, batch=args.batch, max_new=args.max_new,
+               max_identities=args.max_identities)
     if args.once is not None:
         vs = d.score(args.once, only_new=False, max_identities=args.max_identities)
         print(f"\n=== {len(vs)} verdicts @ t={args.once} ===")
