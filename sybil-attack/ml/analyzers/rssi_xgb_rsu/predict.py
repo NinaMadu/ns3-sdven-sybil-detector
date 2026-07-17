@@ -90,11 +90,16 @@ def build_rsu_features(df, run_id, window_sec=WINDOW_SEC, step_sec=STEP_SEC):
     return pd.DataFrame(records)
 
 
-def build_features_live(run_dir, t=None, run_id="live", nrows=None):
-    df = pd.read_csv(Path(run_dir) / "rssi_verification_log.csv",
-                     usecols=lambda c: c in set(RSSI_USE), nrows=nrows)
-    if t is not None:
-        df = df[df["time"] <= float(t)]
+def build_features_live(run_dir, t=None, run_id="live", nrows=None, rows=None):
+    """`rows`: pre-read rssi-log DataFrame already filtered to <= t (daemon LogCache
+    fast path); when given, the CSV read is skipped."""
+    if rows is not None:
+        df = rows.copy()
+    else:
+        df = pd.read_csv(Path(run_dir) / "rssi_verification_log.csv",
+                         usecols=lambda c: c in set(RSSI_USE), nrows=nrows)
+        if t is not None:
+            df = df[df["time"] <= float(t)]
     if df.empty:
         return pd.DataFrame()
     df = df.drop_duplicates(subset=DEDUP)
@@ -112,8 +117,8 @@ class RSSIXGBPredictor:
     def load(cls, model_pkl=MODEL_PKL, features_pkl=FEATURES_PKL):
         return cls(joblib.load(model_pkl), joblib.load(features_pkl))
 
-    def score_logs(self, run_dir, t=None, run_id="live", nrows=None):
-        fdf = build_features_live(run_dir, t=t, run_id=run_id, nrows=nrows)
+    def score_logs(self, run_dir, t=None, run_id="live", nrows=None, rows=None):
+        fdf = build_features_live(run_dir, t=t, run_id=run_id, nrows=nrows, rows=rows)
         if fdf is None or fdf.empty:
             return pd.DataFrame()
         fdf = fdf.copy()

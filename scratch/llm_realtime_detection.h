@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -70,6 +71,11 @@ static std::string g_out    = "sybil-attack/outputs/full_mode_verdicts.csv";
 static FILE* g_conn = nullptr;          // buffered line I/O over the socket
 static std::vector<Verdict> g_lastVerdicts;   // verdicts from the most recent RunWindow
 
+// Option-A sink: the .cc registers a callback here to inject each window's verdicts
+// into g_computedDetectionEvidenceTables and run the cross-RSU Eq 3.22 consensus.
+// Called by RunWindow after each score (nullptr => verdicts only go to the CSV).
+static void (*g_verdictSink)(const std::vector<Verdict>&) = nullptr;
+
 // ── config setters (optional; call before Init). [[maybe_unused]] because the .cc
 //    may configure none of them and just call Init() with defaults. ─────────────
 [[maybe_unused]] static void SetInterval(double s)      { g_interval = s; }
@@ -77,6 +83,7 @@ static std::vector<Verdict> g_lastVerdicts;   // verdicts from the most recent R
 [[maybe_unused]] static void SetSocket(const std::string& p)  { g_sock = p; }
 [[maybe_unused]] static void SetRunDir(const std::string& p)  { g_runDir = p; }
 [[maybe_unused]] static void SetOutput(const std::string& p)  { g_out = p; }
+[[maybe_unused]] static void SetVerdictSink(void (*cb)(const std::vector<Verdict>&)) { g_verdictSink = cb; }
 
 // ── launch the persistent daemon in the background ───────────────────────────
 static void LaunchDaemon()
@@ -148,6 +155,16 @@ static std::string JsonStr(const std::string& s, const std::string& key)
     return e == std::string::npos ? "" : s.substr(p, e - p);
 }
 
+// The daemon process died (crash / OOM / killed). Detection stops for the rest of the
+// run, but the SIMULATION MUST NOT die with it: close the socket and continue. (SIGPIPE
+// is ignored in Init, so writes to the dead socket surface as ferror, handled by caller.)
+static void LoseDaemon()
+{
+    std::cerr << "[LLMRealtime] detector daemon lost — full-mode detection DISABLED for "
+                 "the remainder of the run (see " << g_daemonLog << ")\n" << std::flush;
+    if (g_conn) { std::fclose(g_conn); g_conn = nullptr; }
+}
+
 // ── one scoring window: SCORE now -> read verdicts until END -> CSV + vector ──
 static void RunWindow()
 {
@@ -161,6 +178,12 @@ static void RunWindow()
 
     std::fprintf(g_conn, "SCORE %.3f\n", now);
     std::fflush(g_conn);
+    if (std::ferror(g_conn))          // SIGPIPE is ignored, so a dead daemon shows here
+    {
+        LoseDaemon();
+        ns3::Simulator::Schedule(ns3::Seconds(g_interval), &RunWindow);
+        return;
+    }
 
     static bool wroteHeader = false;
     FILE* out = std::fopen(g_out.c_str(), wroteHeader ? "a" : "w");
@@ -172,10 +195,11 @@ static void RunWindow()
 
     char line[8192];
     int n = 0;
+    bool gotEnd = false;
     while (std::fgets(line, sizeof(line), g_conn))
     {
         std::string s(line);
-        if (s.rfind("END", 0) == 0) break;
+        if (s.rfind("END", 0) == 0) { gotEnd = true; break; }
         if (s.empty() || s[0] != '{') continue;
 
         Verdict v;
@@ -194,11 +218,20 @@ static void RunWindow()
     }
     if (out) std::fclose(out);
 
+    if (!gotEnd)                      // stream closed mid-reply: the daemon died
+    {
+        LoseDaemon();
+        ns3::Simulator::Schedule(ns3::Seconds(g_interval), &RunWindow);
+        return;
+    }
+
     std::cout << "[LLMRealtime] t=" << now << "s scored -> " << n << " verdicts\n" << std::flush;
 
-    // Option A (evidence injection into g_computedDetectionEvidenceTables +
-    // cross-RSU Eq 3.22) is applied by the .cc, which reads g_lastVerdicts here and
-    // may schedule the effect at now + g_detectLatency (modeled detection latency).
+    // Option A: hand this window's verdicts to the .cc sink, which injects them into
+    // g_computedDetectionEvidenceTables and runs the cross-RSU Eq 3.22 consensus. The
+    // sink applies g_detectLatency (modeled detection latency) if configured.
+    if (g_verdictSink)
+        g_verdictSink(g_lastVerdicts);
 
     ns3::Simulator::Schedule(ns3::Seconds(g_interval), &RunWindow);
 }
@@ -207,6 +240,9 @@ static void RunWindow()
 static void Init(double interval)
 {
     g_interval = interval;
+    // A daemon crash must not take the sim down via SIGPIPE on socket writes; we detect
+    // a dead daemon via ferror / a truncated reply instead (see RunWindow/LoseDaemon).
+    std::signal(SIGPIPE, SIG_IGN);
     std::string dir = g_out.substr(0, g_out.find_last_of('/'));
     if (!dir.empty())
     {

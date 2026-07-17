@@ -81,22 +81,24 @@ class Daemon:
         rssi = _load_predictor("rssi_predict", "analyzers/rssi_cnn/predict.py")
         trust = _load_predictor("trust_predict", "analyzers/vehicle_trust/predict.py")
         txgb = _load_predictor("txgb_predict", "analyzers/temporal_xgb_rsu/predict.py")
+        rxgb = _load_predictor("rxgb_predict", "analyzers/rssi_xgb_rsu/predict.py")
         self.gru = gru.TemporalPredictor.load()
         self.rssi = rssi.RSSIPredictor.load()
         self.trust = trust.TrustPredictor.load()
         self.txgb = txgb.TemporalXGBPredictor.load()  # RSU-tier p̄_temp (Eq 3.19)
+        self.rxgb = rxgb.RSSIXGBPredictor.load()       # RSU-tier p̄_rssi (Eq 3.19)
         self.head = EL.FusionHeadLive.load()          # Eq 3.18 head (weights, no refit)
-        # NOTE: RSU rssi XGB (p̄_rssi, λ=0.2) deferred — pending native re-save; until
-        # then ŷ_ens renormalises over ŷ_i + p̄_temp (0.8 of the ensemble weight).
+        # ŷ_ens (Eq 3.20) now blends all 3 terms: ŷ_i + p̄_temp + p̄_rssi (λ 0.3/0.5/0.2).
 
         # incremental log caches: parse each physical log ONCE, then per-SCORE ingest
         # only the appended tail (kills the ~60 s/SCORE full re-read). comm feeds GRU +
-        # temporal-XGB; rssi feeds the CNN; neighbor feeds trust.
+        # temporal-XGB; rssi feeds the CNN + rssi-XGB (union cols); neighbor feeds trust.
         rd = self.run_dir
         self.comm_cache = LC.LogCache(os.path.join(rd, "communication_log.csv"),
                                       (lambda c: c in set(txgb.USE_COLS)), "receive_time", nrows=cap)
+        _rssi_cols = set(rssi.RSSI_USE) | set(rxgb.RSSI_USE)   # CNN needs 5, XGB needs 7
         self.rssi_cache = LC.LogCache(os.path.join(rd, "rssi_verification_log.csv"),
-                                      (lambda c: c in set(rssi.RSSI_USE)), "time", nrows=cap)
+                                      (lambda c: c in _rssi_cols), "time", nrows=cap)
         self.nb_cache = LC.LogCache(os.path.join(rd, trust.T.NEIGHBOR_LOG),
                                     (lambda c: c in trust.T.NEIGHBOR_COLS), "time", nrows=cap)
 
@@ -134,14 +136,21 @@ class Daemon:
         # read from disk (capped) — a secondary follow-up to cache too.
         u_df = self.trust.score_logs(self.run_dir, t=t, run_id=self.run_id,
                                      nrows=self.cap, rows=nb_recent)
+        # RSU-tier XGBs (Eq 3.19): p̄_temp from the comm log, p̄_rssi from the rssi log.
+        # Both need full history (claimed-id age / observer stats) but are cheap.
         x_df = self.txgb.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=comm_full)
-        p_temp = x_df[["run_id", "claimed_node_id", "window_start_seconds", "p_bar_temp"]] \
-            if len(x_df) else None
-        ci = BC.assemble_ci(t_df, rssi=r_df, trust=u_df, extra=([p_temp] if p_temp is not None else None),
+        rssi_full = self.rssi_cache.upto(t)
+        rx_df = self.rxgb.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=rssi_full)
+        pbar = []
+        if len(x_df):
+            pbar.append(x_df[["run_id", "claimed_node_id", "window_start_seconds", "p_bar_temp"]])
+        if len(rx_df):
+            pbar.append(rx_df[["run_id", "claimed_node_id", "window_start_seconds", "p_bar_rssi"]])
+        ci = BC.assemble_ci(t_df, rssi=r_df, trust=u_df, extra=(pbar or None),
                             carry_forward=self.carry_forward,
                             tol=(self.tol if self.carry_forward else None))
-        # Eq 3.18 ŷ_i (from live φ) + Eq 3.20 ŷ_ens. Until the RSU XGBs are wired,
-        # p̄_temp/p̄_rssi are absent so ŷ_ens renormalises to ŷ_i alone.
+        # Eq 3.18 ŷ_i (from live φ) + Eq 3.20 ŷ_ens = renorm(λ1·ŷ_i + λ2·p̄_temp + λ3·p̄_rssi)
+        # over the terms present for each window (all 3 now wired).
         ci = EL.enrich(ci, head=self.head)
         if only_new:
             ci = ci[ci["window_start_seconds"] > self.last_t]

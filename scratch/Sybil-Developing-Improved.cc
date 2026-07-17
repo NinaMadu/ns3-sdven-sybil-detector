@@ -5015,18 +5015,22 @@ LogRssiVerification(uint32_t observerVehicleId,
 
     double mismatch = std::fabs(record.rssiEstimatedDistance - record.claimedDistance);
 
-    std::ofstream out(rssiVerificationCsv.c_str(), std::ios::app);
-    out << Simulator::Now().GetSeconds() << ","
-        << observerVehicleId << ","
-        << observedClaimedId << ","
-        << observedRealId << ","
-        << record.rssiDbm << ","
-        << record.rssiEstimatedDistance << ","
-        << record.claimedDistance << ","
-        << mismatch << ","
-        << kRssiDistMismatchM << ","
-        << stateStr[stateIdx] << ","
-        << record.suspicionFlags << "\n";
+    // Write the vehicle-observer rssi rows through the SAME global stream the
+    // RSU-observer rows use (g_csvRssiVerif), NOT a private ofstream. Two independent
+    // buffered streams appending to one file flush at different moments and can splice
+    // a line into the middle of another → torn rows. A single stream writes sequential,
+    // atomic lines. (Matches how every other log in this sim is written.)
+    g_csvRssiVerif << Simulator::Now().GetSeconds() << ","
+                   << observerVehicleId << ","
+                   << observedClaimedId << ","
+                   << observedRealId << ","
+                   << record.rssiDbm << ","
+                   << record.rssiEstimatedDistance << ","
+                   << record.claimedDistance << ","
+                   << mismatch << ","
+                   << kRssiDistMismatchM << ","
+                   << stateStr[stateIdx] << ","
+                   << record.suspicionFlags << "\n";
 }
 
 static void
@@ -5240,6 +5244,63 @@ RecordComputedDetectionEvidence(uint32_t rsuIndex,
                               rec.attackVariant,
                               evidenceCids,
                               aggregatedEvidenceHashHex);
+}
+
+// ── Option A: full-mode LLM detector → RSU evidence → cross-RSU Eq 3.22 consensus ──
+// The real-time LLM detector (llm_realtime_detection.h) produces per-(claimed_id,window)
+// verdicts. This sink turns each SYBIL verdict into a ComputedDetectionEvidenceRecord and
+// injects it into g_computedDetectionEvidenceTables, then runs the SAME weighted cross-RSU
+// consensus the rule-based path uses — so the LLM's decision becomes an RSU detection vote
+// that the SDN controller aggregates (Eq 3.22). Registered via SetVerdictSink() before Run.
+static void
+InjectLLMDetectionEvidence(const std::vector<LLMRealtimeDetector::Verdict>& verdicts)
+{
+    if (g_computedDetectionEvidenceTables.empty())
+        return;
+    double now = Simulator::Now().GetSeconds();
+    uint32_t injected = 0, consensusHits = 0;
+    for (std::size_t i = 0; i < verdicts.size(); ++i)
+    {
+        const LLMRealtimeDetector::Verdict& v = verdicts[i];
+        if (v.d != 1)
+            continue;   // only a sybil verdict casts an RSU detection vote
+        uint32_t claimedId = v.claimedId;
+        // Route the vote to an RSU: nearest RSU for a real vehicle id; a deterministic
+        // RSU for out-of-registry (fake) claimed ids (>= N_Vehicles), which have no node.
+        uint32_t rsuId = (claimedId < N_Vehicles && N_RSUs > 0)
+                             ? FindNearestRsu(claimedId)
+                             : (N_RSUs > 0 ? (claimedId % N_RSUs) : 0);
+        if (rsuId >= g_computedDetectionEvidenceTables.size())
+            continue;
+
+        ComputedDetectionEvidenceRecord rec;
+        rec.rsuId            = rsuId;
+        rec.claimedVehicleId = claimedId;
+        rec.observationTime  = now;
+        rec.suspicionFlags   = SUSPICION_ID_MISMATCH;   // non-NONE => counts as a vote
+        rec.detectionScore   = (v.yHatEns >= 0.0) ? v.yHatEns : 1.0;
+        rec.attackVariant    = v.attackType;
+
+        std::vector<ComputedDetectionEvidenceRecord>& rows =
+            g_computedDetectionEvidenceTables[rsuId][claimedId];
+        rows.push_back(rec);
+        if (rows.size() > 50)           // bound growth (matches the rule-based path)
+            rows.erase(rows.begin());
+        ++injected;
+
+        double   weightedVoteSum = 0.0;
+        uint32_t contributingRsuVotes = 0;
+        std::vector<std::string> evidenceCids;
+        std::string aggregatedHashHex;
+        if (EvaluateWeightedGlobalDetectionConsensus(claimedId, weightedVoteSum,
+                                                     contributingRsuVotes, evidenceCids,
+                                                     aggregatedHashHex))
+            ++consensusHits;
+    }
+    if (injected)
+        std::cout << "[LLMRealtime] injected " << injected << " sybil verdict(s) into RSU "
+                  << "evidence tables; cross-RSU Eq 3.22 consensus D_global=1 for "
+                  << consensusHits << " identity(ies)\n" << std::flush;
 }
 
 static double
@@ -13067,9 +13128,13 @@ main(int argc, char* argv[])
 
     Simulator::Stop(Seconds(simTime));
     // Full-mode (MODE_FULL): launch the persistent LLM detector daemon and schedule
-    // periodic SCORE windows. Blocks briefly while the daemon loads its models.
+    // periodic SCORE windows. Blocks briefly while the daemon loads its models. The
+    // sink feeds each window's verdicts into the RSU evidence tables + Eq 3.22 consensus.
     if (FullSolutionModeActive())
+    {
+        LLMRealtimeDetector::SetVerdictSink(&InjectLLMDetectionEvidence);
         LLMRealtimeDetector::Init(10.0);
+    }
     Simulator::Run();
     Simulator::Destroy();
     if (FullSolutionModeActive())
