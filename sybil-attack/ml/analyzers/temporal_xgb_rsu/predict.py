@@ -68,13 +68,29 @@ def shannon_entropy(values, n_bins=10):
     return float(-np.sum(probs * np.log2(probs)))
 
 
-def build_global_context(b_sorted, window_size, window_step):
+def build_global_context(b_sorted, window_size, window_step, first_seen_override=None,
+                         grid_anchor=None):
     t = b_sorted["receive_time"].values
     cid = b_sorted["claimed_node_id"].values
     tid = b_sorted["bsm_temporary_id"].values
-    first_seen = b_sorted.groupby("claimed_node_id")["receive_time"].min().values
+    fs_series = b_sorted.groupby("claimed_node_id")["receive_time"].min()
+    if first_seen_override is not None:                 # global first-seen for new_ids
+        fs_series = fs_series.copy()
+        for c in fs_series.index:
+            ov = first_seen_override.get(int(c))
+            if ov is not None and ov < fs_series[c]:
+                fs_series[c] = ov
+    first_seen = fs_series.values
     t0, t1 = float(t.min()), float(t.max())
-    starts = np.arange(np.floor(t0), t1 + window_step, window_step)
+    # Window grid MUST be anchored identically to the full-history run or a bounded slice
+    # produces the same snapped-window labels over different beacon spans. grid_anchor =
+    # floor(global earliest beacon); the grid start is the aligned grid point <= t0. When
+    # None (offline/full path) this reduces to np.floor(t0) — the original behaviour.
+    if grid_anchor is None:
+        s_start = np.floor(t0)
+    else:
+        s_start = grid_anchor + np.floor((t0 - grid_anchor) / window_step) * window_step
+    starts = np.arange(s_start, t1 + window_step, window_step)
     ctx = {}
     for s in starts:
         e = s + window_size
@@ -94,15 +110,26 @@ def build_global_context(b_sorted, window_size, window_step):
 
 
 def build_feature_table(beacons_df, window_size=WINDOW_SIZE_S, window_step=WINDOW_STEP_S,
-                        min_beacons=MIN_BEACONS_WINDOW):
+                        min_beacons=MIN_BEACONS_WINDOW,
+                        first_seen_override=None, cum_before=None, grid_anchor=None):
+    """`first_seen_override` (cid -> global earliest receive_time) and `cum_before`
+    (cid -> deduped-beacon count with receive_time < the slice start) let the daemon feed
+    a BOUNDED recent slice yet keep the two cumulative features — claimed_id_age_s and
+    claimed_id_beacons_seen_so_far — globally exact. Both None => verbatim offline path
+    (the slice is the full history, so the slice's own first-seen/count are global)."""
     b = beacons_df.sort_values("receive_time").reset_index(drop=True)
-    context, starts = build_global_context(b, window_size, window_step)
+    context, starts = build_global_context(b, window_size, window_step,
+                                           first_seen_override=first_seen_override,
+                                           grid_anchor=grid_anchor)
     first_seen_global = b.groupby("claimed_node_id")["receive_time"].min().to_dict()
     rows = []
     for cidv, g in b.groupby("claimed_node_id"):
         g = g.sort_values("receive_time").reset_index(drop=True)
         gt0, gt1 = g["receive_time"].min(), g["receive_time"].max()
         fs = first_seen_global[cidv]
+        if first_seen_override is not None and cidv in first_seen_override:
+            fs = min(fs, first_seen_override[cidv])   # global earliest incl. pre-slice history
+        cb = int(cum_before.get(cidv, 0)) if cum_before is not None else 0  # beacons < slice start
         rel = starts[(starts <= gt1) & (starts + window_size > gt0)]
         prev_end = None
         for s in rel:
@@ -114,7 +141,7 @@ def build_feature_table(beacons_df, window_size=WINDOW_SIZE_S, window_step=WINDO
             tids = w["bsm_temporary_id"].astype(str).values
             tch = max(int((tids[1:] != tids[:-1]).sum()), 0) if len(tids) > 1 else 0
             gap = (s - prev_end) if prev_end is not None else 0.0
-            beacons_so_far = int((g["receive_time"] < e).sum())
+            beacons_so_far = int((g["receive_time"] < e).sum()) + cb
             dx = np.diff(w["bsm_x"].values)
             dy = np.diff(w["bsm_y"].values)
             sp = w["bsm_speed"].values
@@ -162,6 +189,28 @@ def build_feature_table(beacons_df, window_size=WINDOW_SIZE_S, window_step=WINDO
     return pd.DataFrame(rows)
 
 
+def ingest_history(rows, first_seen, cum, upto_exclusive):
+    """Fold deduped RSU beacons with receive_time < upto_exclusive into the running
+    `first_seen` (cid -> global earliest receive_time) and `cum` (cid -> deduped-beacon
+    count) dicts. Mirrors build_features_live's RSU filter + dedup so the counts line up
+    exactly with beacons_so_far. Used by the daemon to advance cumulative state over the
+    bounded gap since the previous slice start (keeps per-SCORE cost constant)."""
+    if rows is None or len(rows) == 0:
+        return
+    df = rows[(rows["receiver_role"] == "rsu_edge") & (rows["flow"].isin(RSU_RX_FLOWS))]
+    df = df[df["receive_time"] < float(upto_exclusive)]
+    if df.empty:
+        return
+    b = dedup_beacons(df)
+    grp = b.groupby("claimed_node_id")["receive_time"]
+    for cid, mn in grp.min().items():
+        cid = int(cid)
+        first_seen[cid] = min(first_seen[cid], float(mn)) if cid in first_seen else float(mn)
+    for cid, cnt in grp.count().items():
+        cid = int(cid)
+        cum[cid] = cum.get(cid, 0) + int(cnt)
+
+
 def dedup_beacons(df):
     dup = (df.groupby(BEACON_KEY)["receiver_id"].nunique()
              .rename("observer_count").reset_index())
@@ -180,9 +229,12 @@ def full_proba(model, X):
     return full
 
 
-def build_features_live(run_dir, t=None, run_id="live", nrows=None, rows=None):
+def build_features_live(run_dir, t=None, run_id="live", nrows=None, rows=None,
+                        first_seen_override=None, cum_before=None, grid_anchor=None):
     """`rows`: pre-read comm-log DataFrame already filtered to <= t (daemon LogCache fast
-    path; may include non-RSU rows — filtered here). When given, the CSV read is skipped."""
+    path; may include non-RSU rows — filtered here). When given, the CSV read is skipped.
+    `first_seen_override`/`cum_before`: incremental cumulative state (see build_feature_table)
+    so `rows` can be a bounded recent slice without losing the age/beacons-so-far features."""
     if rows is not None:
         df = rows
     else:
@@ -194,7 +246,8 @@ def build_features_live(run_dir, t=None, run_id="live", nrows=None, rows=None):
     if df.empty:
         return pd.DataFrame()
     b = dedup_beacons(df)
-    fdf = build_feature_table(b)
+    fdf = build_feature_table(b, first_seen_override=first_seen_override, cum_before=cum_before,
+                              grid_anchor=grid_anchor)
     if fdf.empty:
         return fdf
     fdf["run_id"] = run_id
@@ -211,8 +264,11 @@ class TemporalXGBPredictor:
         m.load_model(str(model_json))
         return cls(m)
 
-    def score_logs(self, run_dir, t=None, run_id="live", nrows=None, rows=None):
-        fdf = build_features_live(run_dir, t=t, run_id=run_id, nrows=nrows, rows=rows)
+    def score_logs(self, run_dir, t=None, run_id="live", nrows=None, rows=None,
+                   first_seen_override=None, cum_before=None, grid_anchor=None):
+        fdf = build_features_live(run_dir, t=t, run_id=run_id, nrows=nrows, rows=rows,
+                                  first_seen_override=first_seen_override, cum_before=cum_before,
+                                  grid_anchor=grid_anchor)
         if fdf is None or fdf.empty:
             return pd.DataFrame()
         fp = full_proba(self.model, fdf[FEATURES])

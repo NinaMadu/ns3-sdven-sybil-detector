@@ -125,6 +125,27 @@ double rsuTrustDisagreementEpsilon = 0.20;   ///< epsilon_5 minimum deviation fr
 
 
 double weightedDetectionConsensusThreshold = 1.0; ///< theta_consensus for weighted RSU detection votes.
+uint32_t llmRevokeMinWindows = 2;            ///< Phase-4 FP safety: a REAL id (< N_Vehicles) needs
+                                             ///< the LLM to flag it as sybil across >= this many
+                                             ///< distinct score windows before revocation; fake ids
+                                             ///< (>= N_Vehicles, can't be legitimate) revoke on the
+                                             ///< first window. 1 = no persistence filter.
+double   llmEnsembleGate = 0.5;              ///< Full-mode throughput: ŷ_ens threshold to send an id
+                                             ///< to the 3-agent LLM; below it the ensemble clears it
+                                             ///< as legit with no LLM call (pre-filter A).
+uint32_t llmMaxCandidates = 48;              ///< Top-K identities/window (by ŷ_ens) adjudicated by
+                                             ///< the LLM; raise for dense-attack runs (pre-filter B).
+uint32_t llmMaxIdentities = 0;               ///< Hard ceiling on identities considered/window (0=none).
+uint32_t p4SelfTestRealId = 0;               ///< >0: run the P4 FP-safety self-test on this REAL
+                                             ///< vehicle id instead of the daemon (proves the
+                                             ///< real-id corroboration branch: t=10 DEFERRED,
+                                             ///< t=20 REVOKED). Throwaway test harness, off by default.
+double   detectLatencySec = 0.05;            ///< Modeled full-mode detection→revocation reaction
+                                             ///< delay (sim-seconds): the LLM verdict is decided at
+                                             ///< the SCORE instant t, but the crypto revocation +
+                                             ///< blacklist take effect at t + detectLatencySec, so
+                                             ///< a sybil stays active during the reaction window and
+                                             ///< M7 reports a realistic time-to-revoke. 0 = instant.
 double vehicleSpacing = 35.0;                ///< Initial spacing between vehicles.
 double minVehicleSpeed = 8.0;                ///< Slowest vehicle speed in m/s.
 double maxVehicleSpeed = 16.0;               ///< Fastest vehicle speed in m/s.
@@ -5252,19 +5273,77 @@ RecordComputedDetectionEvidence(uint32_t rsuIndex,
 // injects it into g_computedDetectionEvidenceTables, then runs the SAME weighted cross-RSU
 // consensus the rule-based path uses — so the LLM's decision becomes an RSU detection vote
 // that the SDN controller aggregates (Eq 3.22). Registered via SetVerdictSink() before Run.
+// Phase-4 FP safety: per-claimed-id count of DISTINCT score windows in which the LLM flagged
+// the id as sybil. A real vehicle is only revoked once this reaches llmRevokeMinWindows, so a
+// single false-positive verdict can't cut a legitimate vehicle off the network. lastWindow
+// dedups within a window (the daemon emits one verdict per (id,window), but guard anyway).
+struct LlmRevocationTracker
+{
+    uint32_t windowHits = 0;
+    double   lastWindow = -1.0;
+};
+static std::map<uint32_t, LlmRevocationTracker> g_llmRevocationTrack;
+
+// Identity-level ground truth (claimed ids ever seen with real!=claimed) used to score the
+// full-mode LLM detector's per-identity verdicts into the M5/M6 confusion matrix.
+static std::set<uint32_t> g_groundTruthSybilIds;
+
+// P3 modeled latency: the LLM verdict is decided at the SCORE instant, but the crypto
+// revocation is applied at t + detectLatencySec. This bundles the RevokeEntityCurrentCrypto
+// args into one struct so a single-arg void function can be Simulator::Schedule'd (the args
+// are copied into the event at schedule time, so they outlive this window's verdict buffer).
+struct PendingLlmRevoke
+{
+    std::string              entityType;
+    uint32_t                 entityId;
+    uint32_t                 authorityId;
+    std::string              attackVariant;
+    std::vector<std::string> evidenceCids;
+    std::string              aggregatedHashHex;
+};
+static void
+ApplyLlmRevoke(PendingLlmRevoke r)
+{
+    RevokeEntityCurrentCrypto(r.entityType, r.entityId, r.authorityId,
+                              r.attackVariant, r.evidenceCids, r.aggregatedHashHex);
+}
+
 static void
 InjectLLMDetectionEvidence(const std::vector<LLMRealtimeDetector::Verdict>& verdicts)
 {
     if (g_computedDetectionEvidenceTables.empty())
         return;
+    // Phase 0 guard: the revocation response below (manifest + blacklist + LKH re-key) is
+    // all gated on FullCryptoMechanismActive() downstream. If the run is MODE_FULL but
+    // g_secEnabled is off, votes still tally but nothing enforces — warn once so that is
+    // never a silent surprise.
+    static bool warnedNoCrypto = false;
+    if (!FullCryptoMechanismActive() && !warnedNoCrypto)
+    {
+        warnedNoCrypto = true;
+        std::cerr << "[LLMRealtime] WARNING: full crypto inactive (g_secEnabled off?); "
+                  << "LLM verdicts will vote but trigger no revocation/blacklist\n";
+    }
     double now = Simulator::Now().GetSeconds();
-    uint32_t injected = 0, consensusHits = 0;
+    uint32_t injected = 0, consensusHits = 0, revoked = 0, deferred = 0;
     for (std::size_t i = 0; i < verdicts.size(); ++i)
     {
         const LLMRealtimeDetector::Verdict& v = verdicts[i];
+        uint32_t claimedId = v.claimedId;
+
+        // Score EVERY verdict (sybil and legit) against ground truth into the M5/M6
+        // confusion matrix — this is how the full-mode detector's precision/recall/MCC
+        // gets measured. Ground truth = identity ever observed with real!=claimed id.
+        if (g_secMetrics)
+            g_secMetrics->RecordFullModeDecision(
+                claimedId,
+                g_groundTruthSybilIds.count(claimedId) > 0,   // isActuallySybil
+                (v.d == 1),                                   // predictedSybil
+                "rsu", now, detectLatencySec);                // revocation lands at t+L
+
         if (v.d != 1)
             continue;   // only a sybil verdict casts an RSU detection vote
-        uint32_t claimedId = v.claimedId;
+        bool isRealId = (claimedId < N_Vehicles);
         // Route the vote to an RSU: nearest RSU for a real vehicle id; a deterministic
         // RSU for out-of-registry (fake) claimed ids (>= N_Vehicles), which have no node.
         uint32_t rsuId = (claimedId < N_Vehicles && N_RSUs > 0)
@@ -5295,12 +5374,107 @@ InjectLLMDetectionEvidence(const std::vector<LLMRealtimeDetector::Verdict>& verd
         if (EvaluateWeightedGlobalDetectionConsensus(claimedId, weightedVoteSum,
                                                      contributingRsuVotes, evidenceCids,
                                                      aggregatedHashHex))
+        {
             ++consensusHits;
+
+            // Phase 4 FP safety: count DISTINCT score windows this id was flagged in (once
+            // per window). A real vehicle needs sustained corroboration; a fake id revokes now.
+            LlmRevocationTracker& trk = g_llmRevocationTrack[claimedId];
+            if (trk.lastWindow != now)
+            {
+                trk.windowHits++;
+                trk.lastWindow = now;
+            }
+            bool corroborated = !isRealId || (trk.windowHits >= std::max(1u, llmRevokeMinWindows));
+
+            if (!corroborated)
+            {
+                // Real id, not yet sustained across enough windows: its vote still stands in
+                // the evidence table (cross-RSU tally is real), but hold the revocation so a
+                // single false positive can't cut a legitimate vehicle off the network.
+                ++deferred;
+                std::cout << "[LLMRealtime] real id " << claimedId << " flagged (window "
+                          << trk.windowHits << "/" << std::max(1u, llmRevokeMinWindows)
+                          << ") — deferring revocation pending corroboration\n";
+                continue;
+            }
+
+            // Once corroborated (or a fake id) and consensus won, drive the SAME full-crypto
+            // revocation the rule-based path uses (:5241) — signed isolation record +
+            // threshold-endorsed revocation manifest (PQC or classical per full_crypto_profile)
+            // + RSU blacklist + LKH re-key + enforcement. Idempotent: repeat windows for an
+            // already-revoked id return the cached CID (:3029), so this is safe every window.
+            if (FullCryptoMechanismActive())
+            {
+                // P3: apply the revocation at t + detectLatencySec (modeled reaction delay),
+                // so the sybil stays active during the window and M7 reports a real latency.
+                PendingLlmRevoke r{"vehicle", claimedId, rsuId, v.attackType,
+                                   evidenceCids, aggregatedHashHex};
+                if (detectLatencySec > 0.0)
+                    Simulator::Schedule(Seconds(detectLatencySec), &ApplyLlmRevoke, r);
+                else
+                    ApplyLlmRevoke(r);
+                ++revoked;
+            }
+        }
     }
     if (injected)
         std::cout << "[LLMRealtime] injected " << injected << " sybil verdict(s) into RSU "
                   << "evidence tables; cross-RSU Eq 3.22 consensus D_global=1 for "
-                  << consensusHits << " identity(ies)\n" << std::flush;
+                  << consensusHits << " identity(ies); revoked " << revoked
+                  << " (full-crypto isolation+manifest+blacklist"
+                  << (detectLatencySec > 0.0 ? ", effective at t+" : "")
+                  << (detectLatencySec > 0.0 ? std::to_string(detectLatencySec) + "s" : "")
+                  << "), deferred " << deferred
+                  << " real id(s) pending corroboration\n" << std::flush;
+}
+
+// ---------------------------------------------------------------------------
+// P4SelfTestInject — controlled correctness test for the real-id FP-safety branch.
+//
+// No modeled attack impersonates a real vehicle id (all sybil ids are >= N_Vehicles), so the
+// P4 deferral branch only ever fires on a detector false-positive against a legitimate vehicle
+// — which is too rare to demonstrate naturally. This drives the SAME sink with a synthetic
+// sybil verdict for a REAL vehicle id, pre-seeding a suspicion vote in every RSU so the
+// cross-RSU Eq 3.22 consensus is guaranteed to fire, then relies on InjectLLMDetectionEvidence's
+// own logic. Called at t=10 (expect DEFERRED, window 1/llmRevokeMinWindows) and t=20 (expect
+// REVOKED, corroborated). Test-only; gated behind --p4SelfTest and never runs the daemon.
+// ---------------------------------------------------------------------------
+static void
+P4SelfTestInject(uint32_t realId)
+{
+    if (realId >= N_Vehicles)
+    {
+        std::cout << "[P4SelfTest] id " << realId << " is not a real vehicle id (>= N_Vehicles="
+                  << N_Vehicles << "); nothing to test\n" << std::flush;
+        return;
+    }
+    double now = Simulator::Now().GetSeconds();
+    // Seed a suspicion vote in every RSU so weightedVoteSum >= theta regardless of per-RSU weight.
+    for (uint32_t r = 0; r < N_RSUs && r < g_computedDetectionEvidenceTables.size(); ++r)
+    {
+        ComputedDetectionEvidenceRecord rec;
+        rec.rsuId            = r;
+        rec.claimedVehicleId = realId;
+        rec.observationTime  = now;
+        rec.suspicionFlags   = SUSPICION_ID_MISMATCH;
+        rec.detectionScore   = 0.99;
+        rec.attackVariant    = "nonsim";
+        g_computedDetectionEvidenceTables[r][realId].push_back(rec);
+    }
+    std::cout << "[P4SelfTest] t=" << now << " driving sink with a synthetic sybil verdict for "
+              << "REAL id " << realId << " (actually_sybil=" << (IsSybilVehicle(realId) ? "yes" : "no")
+              << ", so this models a FALSE POSITIVE on a legit vehicle)\n" << std::flush;
+    LLMRealtimeDetector::Verdict v;
+    v.claimedId    = realId;
+    v.windowStart  = now;
+    v.d            = 1;
+    v.attackTypeId = 0;
+    v.attackType   = "nonsim";
+    v.yHatEns      = 0.99;
+    std::vector<LLMRealtimeDetector::Verdict> vs;
+    vs.push_back(v);
+    InjectLLMDetectionEvidence(vs);
 }
 
 static double
@@ -10984,6 +11158,12 @@ LogReceivedPacket(const std::string& receiverRole,
     bool countForPDR    = !isV2VBroadcast || receiverRole == "vehicle";
 
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
+    // Identity-level ground truth for full-mode LLM detector metrics: a claimed id is
+    // "actually sybil" if any beacon under it carried a real!=claimed id (impersonation or
+    // an out-of-registry fake id). Consumed by InjectLLMDetectionEvidence when scoring the
+    // per-identity verdicts against ground truth (M5/M6 confusion matrix).
+    if (isSybil)
+        g_groundTruthSybilIds.insert(tag.GetClaimedNodeId());
     MetricsOnReceive(isSybil, delay, countForPDR);
     if (hasTag)
     {
@@ -12199,6 +12379,11 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("rsuTrustAnomalyThreshold",        rsuTrustAnomalyThreshold);
     getDouble("rsuTrustDisagreementEpsilon",    rsuTrustDisagreementEpsilon);
     getDouble("weightedDetectionConsensusThreshold", weightedDetectionConsensusThreshold);
+    getUint("llmRevokeMinWindows",               llmRevokeMinWindows);
+    getDouble("llmEnsembleGate",                 llmEnsembleGate);
+    getUint("llmMaxCandidates",                  llmMaxCandidates);
+    getUint("llmMaxIdentities",                  llmMaxIdentities);
+    getDouble("detectLatency",                   detectLatencySec);
     getDouble("vehicleSpacing",                  vehicleSpacing);
     getDouble("minVehicleSpeed",                 minVehicleSpeed);
     getDouble("maxVehicleSpeed",                 maxVehicleSpeed);
@@ -12302,6 +12487,12 @@ main(int argc, char* argv[])
     cmd.AddValue("rsuTrustAnomalyThreshold",   "S5 approval-anomaly threshold for RSU trust demotion", rsuTrustAnomalyThreshold);
     cmd.AddValue("rsuTrustDisagreementEpsilon", "epsilon_5 deviation from cross-RSU mean S5 required before RSU trust penalty", rsuTrustDisagreementEpsilon);
     cmd.AddValue("weightedDetectionConsensusThreshold", "theta_consensus for weighted RSU detection votes in full mode", weightedDetectionConsensusThreshold);
+    cmd.AddValue("llmRevokeMinWindows", "Full-mode FP safety: distinct score windows a REAL id (< N_Vehicles) must be flagged in before the LLM detector revokes it (fake ids revoke on window 1; 1 disables the filter)", llmRevokeMinWindows);
+    cmd.AddValue("llmEnsembleGate", "Full-mode throughput: ŷ_ens threshold to send an identity to the 3-agent LLM (below = ensemble-cleared legit, no LLM call)", llmEnsembleGate);
+    cmd.AddValue("llmMaxCandidates", "Full-mode throughput: max identities/window (top-K by ŷ_ens) adjudicated by the LLM; raise for dense-attack runs", llmMaxCandidates);
+    cmd.AddValue("llmMaxIdentities", "Full-mode throughput: hard ceiling on identities considered per window (0 = none)", llmMaxIdentities);
+    cmd.AddValue("detectLatency", "Full-mode modeled detection->revocation reaction delay in sim-seconds (verdict at t, revocation effective at t+detectLatency; 0 = instant)", detectLatencySec);
+    cmd.AddValue("p4SelfTest", "Full-mode P4 FP-safety self-test: REAL vehicle id to inject a synthetic sybil verdict for at t=10 and t=20 (0=off; proves deferral->corroboration; daemon not launched)", p4SelfTestRealId);
     cmd.AddValue("vehicleSpacing",             "Initial vehicle spacing in metres",vehicleSpacing);
     cmd.AddValue("minVehicleSpeed",            "Minimum bounded-road vehicle speed in m/s",minVehicleSpeed);
     cmd.AddValue("maxVehicleSpeed",            "Maximum bounded-road vehicle speed in m/s",maxVehicleSpeed);
@@ -12464,6 +12655,8 @@ main(int argc, char* argv[])
     g_isolationRecordsByEntity.clear();
     g_revocationManifestsByEntity.clear();
     g_latestRevocationManifestCids.clear();
+    g_llmRevocationTrack.clear();
+    g_groundTruthSybilIds.clear();
     g_rsuRevokedVehicleBlacklist.assign(N_RSUs, std::set<uint32_t>());
     g_vehicleV2IAuthSessions.assign(N_Vehicles, std::map<uint32_t, V2IAuthSessionState>());
     g_rsuV2IAuthSessions.assign(N_RSUs, std::map<uint32_t, V2IAuthSessionState>());
@@ -13132,12 +13325,42 @@ main(int argc, char* argv[])
     // sink feeds each window's verdicts into the RSU evidence tables + Eq 3.22 consensus.
     if (FullSolutionModeActive())
     {
-        LLMRealtimeDetector::SetVerdictSink(&InjectLLMDetectionEvidence);
-        LLMRealtimeDetector::Init(10.0);
+        // Phase 0: make the run self-describing — the LLM verdicts feed the full-crypto
+        // revocation path, whose signatures are classical or PQC depending on this profile.
+        std::cout << "[LLMRealtime] full-mode detection ARMED"
+                  << " crypto=" << (FullCryptoMechanismActive() ? FullCryptoProfileName()
+                                                                : "INACTIVE(g_secEnabled off)")
+                  << " signatures=" << (FullPqcProfileActive() ? "Dilithium/ML-DSA-65+Kyber768"
+                                                               : "current-ECDSA")
+                  << " consensus_theta=" << weightedDetectionConsensusThreshold
+                  << " real_id_min_windows=" << llmRevokeMinWindows
+                  << " ensemble_gate=" << llmEnsembleGate
+                  << " max_llm_candidates=" << llmMaxCandidates
+                  << " detect_latency=" << detectLatencySec << "s"
+                  << " -> verdicts drive isolation+manifest+blacklist\n" << std::flush;
+        if (p4SelfTestRealId > 0)
+        {
+            // P4 FP-safety self-test: skip the daemon, drive the sink with a synthetic real-id
+            // verdict across two windows to prove the deferral->corroboration branch.
+            std::cout << "[P4SelfTest] ENABLED for REAL id " << p4SelfTestRealId
+                      << " — expect t=10 DEFERRED (window 1/" << llmRevokeMinWindows
+                      << "), t=20 REVOKED (corroborated). Daemon NOT launched.\n" << std::flush;
+            Simulator::Schedule(Seconds(10.0), &P4SelfTestInject, p4SelfTestRealId);
+            Simulator::Schedule(Seconds(20.0), &P4SelfTestInject, p4SelfTestRealId);
+        }
+        else
+        {
+            LLMRealtimeDetector::SetVerdictSink(&InjectLLMDetectionEvidence);
+            LLMRealtimeDetector::SetEnsembleGate(llmEnsembleGate);
+            LLMRealtimeDetector::SetMaxLlmCandidates(static_cast<int>(llmMaxCandidates));
+            LLMRealtimeDetector::SetMaxIdentities(static_cast<int>(llmMaxIdentities));
+            LLMRealtimeDetector::SetDetectLatency(detectLatencySec);
+            LLMRealtimeDetector::Init(10.0);
+        }
     }
     Simulator::Run();
     Simulator::Destroy();
-    if (FullSolutionModeActive())
+    if (FullSolutionModeActive() && p4SelfTestRealId == 0)
         LLMRealtimeDetector::FinalizeAndReport();
 
     WriteMetricsRow(simTime);

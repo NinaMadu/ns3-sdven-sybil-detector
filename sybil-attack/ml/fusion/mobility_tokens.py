@@ -74,14 +74,15 @@ def _churn_per_identity(sets_df):
     return sets_df[["claimed_node_id", "window_start_seconds", "rho_c"]]
 
 
-def build_run(run_dir, man):
-    run_id = _run_id(run_dir)
-    comm = os.path.join(run_dir, "communication_log.csv")
-    df = read_run_log_filtered(comm, _COMM_COLS, "claimed_node_id", run_id, man=man)
-    if df.empty:
-        print(f"  {run_id}: no kept rows")
-        return None
+def tokens_from_df(df, run_id, verbose=True):
+    """Core mobility-token computation from a preloaded communication-log df with columns
+    [receive_time, claimed_node_id, bsm_speed, observer_obu_id]. Shared by the offline batch
+    build (build_run) and the live daemon (ml/serve/mobility_live) so both emit identical
+    {v_rel, rho_c, dt_sync} tokens on the same 2 s grid. Returns None if no usable rows."""
     df = df.dropna(subset=["receive_time", "claimed_node_id"])
+    if df.empty:
+        return None
+    df = df.copy()
     df["claimed_node_id"] = df["claimed_node_id"].astype(int)
     df["window_start_seconds"] = snap_grid(df["receive_time"].to_numpy())
 
@@ -103,12 +104,23 @@ def build_run(run_dir, man):
     agg = agg.merge(rho, on=["claimed_node_id", "window_start_seconds"], how="left")
 
     agg["run_id"] = run_id
-    print(f"  {run_id}: {len(agg):,} (id,window) rows | "
-          f"v_rel~{agg['v_rel'].median():.1f} | rho_c cov "
-          f"{agg['rho_c'].notna().mean()*100:.0f}% | dt_sync cov "
-          f"{agg['dt_sync'].notna().mean()*100:.0f}%")
+    if verbose:
+        print(f"  {run_id}: {len(agg):,} (id,window) rows | "
+              f"v_rel~{agg['v_rel'].median():.1f} | rho_c cov "
+              f"{agg['rho_c'].notna().mean()*100:.0f}% | dt_sync cov "
+              f"{agg['dt_sync'].notna().mean()*100:.0f}%")
     return agg[["run_id", "claimed_node_id", "window_start_seconds",
                 "v_rel", "rho_c", "dt_sync"]]
+
+
+def build_run(run_dir, man):
+    run_id = _run_id(run_dir)
+    comm = os.path.join(run_dir, "communication_log.csv")
+    df = read_run_log_filtered(comm, _COMM_COLS, "claimed_node_id", run_id, man=man)
+    if df.empty:
+        print(f"  {run_id}: no kept rows")
+        return None
+    return tokens_from_df(df, run_id)
 
 
 def main():

@@ -25,6 +25,7 @@ Run in ml/.venv with TF_USE_LEGACY_KERAS=1 TOKENIZERS_PARALLELISM=false MPLBACKE
 import argparse
 import importlib.util
 import json
+import math
 import os
 import socket
 import sys
@@ -39,6 +40,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "llm", "stage2_agents"))  # consens
 import build_context_live as BC          # noqa: E402
 import ensemble_live as EL               # noqa: E402  (Eq 3.18 head + Eq 3.20 ŷ_ens)
 import log_cache as LC                    # noqa: E402  (incremental tail reader)
+import mobility_live as ML               # noqa: E402  (Eq 3.31 {v_rel,rho_c,dt_sync})
 import protocol as PROTO                 # noqa: E402
 import consensus_infer as CI             # noqa: E402
 import agents as A                       # noqa: E402
@@ -63,7 +65,7 @@ def _confidence(d_row, dg):
 class Daemon:
     def __init__(self, run_dir, cap=None, carry_forward=True, tol=20.0,
                  batch=16, max_new=128, agent_device=0, max_identities=None,
-                 window_margin=30.0):
+                 window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=48):
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
@@ -72,7 +74,13 @@ class Daemon:
         self.window_margin = window_margin     # bounded incremental windowing lookback (s)
         self.batch = batch
         self.max_new = max_new
-        self.max_identities = max_identities   # cap rows scored per window (testing/throttle)
+        self.max_identities = max_identities   # hard ceiling on rows considered per window
+        # Ensemble pre-filter (A): the cheap RSU-tier ŷ_ens gates the expensive 3-agent LLM.
+        # Only identities the ensemble finds suspicious (ŷ_ens >= gate, or ŷ_ens missing)
+        # are adjudicated by the agents; the rest are ensemble-cleared as legit with NO LLM
+        # call — the paper's design (the LLM is the costly last stage over candidates only).
+        self.ensemble_gate = ensemble_gate     # ŷ_ens threshold to become an LLM candidate
+        self.max_llm_candidates = max_llm_candidates   # (B) top-K by ŷ_ens per window to LLM
         self.last_t = float("-inf")
 
         t0 = time.time()
@@ -86,7 +94,13 @@ class Daemon:
         self.rssi = rssi.RSSIPredictor.load()
         self.trust = trust.TrustPredictor.load()
         self.txgb = txgb.TemporalXGBPredictor.load()  # RSU-tier p̄_temp (Eq 3.19)
+        self._txgb_mod = txgb                          # module (for ingest_history)
         self.rxgb = rxgb.RSSIXGBPredictor.load()       # RSU-tier p̄_rssi (Eq 3.19)
+        # temporal-XGB incremental cumulative state: lets us feed a BOUNDED comm slice each
+        # window yet keep claimed_id_age_s / beacons_so_far globally exact (see predict.py).
+        self._txgb_first_seen = {}     # cid -> global earliest deduped-beacon receive_time
+        self._txgb_cum = {}            # cid -> deduped-beacon count with time < _txgb_upto
+        self._txgb_upto = float("-inf")  # cumulative state has folded in all beacons < this
         self.head = EL.FusionHeadLive.load()          # Eq 3.18 head (weights, no refit)
         # ŷ_ens (Eq 3.20) now blends all 3 terms: ŷ_i + p̄_temp + p̄_rssi (λ 0.3/0.5/0.2).
 
@@ -94,8 +108,11 @@ class Daemon:
         # only the appended tail (kills the ~60 s/SCORE full re-read). comm feeds GRU +
         # temporal-XGB; rssi feeds the CNN + rssi-XGB (union cols); neighbor feeds trust.
         rd = self.run_dir
+        # comm_cache serves both temporal_xgb (USE_COLS) and the Eq 3.31 mobility tokens,
+        # which additionally need observer_obu_id (absent from USE_COLS) for rho_c churn.
+        _comm_cols = set(txgb.USE_COLS) | set(ML.MOBILITY_COLS)
         self.comm_cache = LC.LogCache(os.path.join(rd, "communication_log.csv"),
-                                      (lambda c: c in set(txgb.USE_COLS)), "receive_time", nrows=cap)
+                                      (lambda c: c in _comm_cols), "receive_time", nrows=cap)
         _rssi_cols = set(rssi.RSSI_USE) | set(rxgb.RSSI_USE)   # CNN needs 5, XGB needs 7
         self.rssi_cache = LC.LogCache(os.path.join(rd, "rssi_verification_log.csv"),
                                       (lambda c: c in _rssi_cols), "time", nrows=cap)
@@ -108,7 +125,9 @@ class Daemon:
                                               device=agent_device)
         self.sysmsg = {a: A.AGENTS[a]["system"] for a in A.AGENT_ORDER}
         print(f"[daemon] READY in {time.time() - t0:.0f}s "
-              f"(θ={self.cfg['theta']}, ω={self.cfg['omega']})", flush=True)
+              f"(θ={self.cfg['theta']}, ω={self.cfg['omega']}; "
+              f"ensemble_gate={self.ensemble_gate}, max_llm_candidates={self.max_llm_candidates})",
+              flush=True)
 
     # -- the full chain for one scoring window -------------------------------
     def score(self, t, only_new=True, max_identities=None):
@@ -137,16 +156,32 @@ class Daemon:
         u_df = self.trust.score_logs(self.run_dir, t=t, run_id=self.run_id,
                                      nrows=self.cap, rows=nb_recent)
         # RSU-tier XGBs (Eq 3.19): p̄_temp from the comm log, p̄_rssi from the rssi log.
-        # Both need full history (claimed-id age / observer stats) but are cheap.
-        x_df = self.txgb.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=comm_full)
-        rssi_full = self.rssi_cache.upto(t)
-        rx_df = self.rxgb.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=rssi_full)
+        # Both are now BOUNDED-incremental like the vehicle-tier models. rssi-XGB features are
+        # all window-local → the recent slice suffices. temporal-XGB has two cumulative features
+        # (age, beacons-so-far); we advance a running first_seen/count over the gap since the
+        # last slice start and inject them, so the bounded slice stays globally exact.
+        if only_new and lo != float("-inf"):
+            gap = self.comm_cache.between(self._txgb_upto, lo)   # beacons since last slice start
+            self._txgb_mod.ingest_history(gap, self._txgb_first_seen, self._txgb_cum, lo)
+            self._txgb_upto = lo
+            # anchor the window grid to the GLOBAL earliest beacon (not the slice's) so bounded
+            # windows land on the same grid the full-history run used.
+            anchor = (float(math.floor(min(self._txgb_first_seen.values())))
+                      if self._txgb_first_seen else None)
+            x_df = self.txgb.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=comm_recent,
+                                        first_seen_override=self._txgb_first_seen,
+                                        cum_before=self._txgb_cum, grid_anchor=anchor)
+        else:
+            x_df = self.txgb.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=comm_full)
+        rx_df = self.rxgb.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=rssi_recent)
         pbar = []
         if len(x_df):
             pbar.append(x_df[["run_id", "claimed_node_id", "window_start_seconds", "p_bar_temp"]])
         if len(rx_df):
             pbar.append(rx_df[["run_id", "claimed_node_id", "window_start_seconds", "p_bar_rssi"]])
-        ci = BC.assemble_ci(t_df, rssi=r_df, trust=u_df, extra=(pbar or None),
+        # Eq 3.31 mobility tokens {v_rel, rho_c, dt_sync} from the same bounded comm slice.
+        mob_df = ML.build_mobility_live(comm_recent, self.run_id)
+        ci = BC.assemble_ci(t_df, rssi=r_df, trust=u_df, mobility=mob_df, extra=(pbar or None),
                             carry_forward=self.carry_forward,
                             tol=(self.tol if self.carry_forward else None))
         # Eq 3.18 ŷ_i (from live φ) + Eq 3.20 ŷ_ens = renorm(λ1·ŷ_i + λ2·p̄_temp + λ3·p̄_rssi)
@@ -160,7 +195,36 @@ class Daemon:
         if len(ci) == 0:
             return []
 
-        msgs = BC.build_messages(ci)
+        # ── Ensemble pre-filter (A) + bounded LLM (B) ────────────────────────────
+        # Split ci by the cheap ŷ_ens: below the gate → ensemble-cleared (d=0, no LLM);
+        # at/above the gate (or ŷ_ens missing) → LLM candidate. Among candidates only the
+        # top-K by ŷ_ens are adjudicated by the agents; any overflow in an overloaded
+        # window is emitted d=0 with a warning (never auto-revoked without LLM — keeps the
+        # P4 FP-safety contract). This turns a hundreds-of-identities LLM pass into a
+        # bounded top-K pass, which is what makes full-scale trace runs tractable.
+        yhe = ci["y_hat_ens"] if "y_hat_ens" in ci.columns else None
+        if yhe is None:
+            cand_mask = ci.index == ci.index          # no ensemble at all → all candidates
+        else:
+            cand_mask = (yhe >= self.ensemble_gate) | yhe.isna()
+        cleared = ci[~cand_mask]
+        cand = ci[cand_mask]
+        if yhe is not None and len(cand):
+            cand = cand.sort_values("y_hat_ens", ascending=False, na_position="first")
+        overflow = cand.iloc[self.max_llm_candidates:] if self.max_llm_candidates else cand.iloc[0:0]
+        cand = cand.iloc[:self.max_llm_candidates] if self.max_llm_candidates else cand
+        if len(overflow):
+            print(f"[daemon] WARNING: {len(overflow)} candidate(s) over LLM cap "
+                  f"({self.max_llm_candidates}) at t={t} — emitted d=0 (raise "
+                  f"--max-llm-candidates or --ensemble-gate)", flush=True)
+
+        # ensemble-cleared + overflow → cheap d=0 verdicts, no LLM
+        verdicts = self._skip_verdicts(cleared, reason="ensemble<gate: LLM skipped")
+        verdicts += self._skip_verdicts(overflow, reason="LLM cap exceeded: deferred")
+        if len(cand) == 0:
+            return verdicts
+
+        msgs = BC.build_messages(cand)
         contexts = [json.dumps(m["context"]) for m in msgs]
 
         # Eq 3.21 — three agents on the SAME contexts, distinct role prompt
@@ -178,7 +242,6 @@ class Daemon:
         Dg, yv = CI.consensus(D, PT, CF, self.cfg["omega"], self.cfg["theta"],
                               self.cfg["tie_break_idx"])
 
-        verdicts = []
         for i, m in enumerate(msgs):
             at = yv[i]
             reason = self._reason(preds_by_agent, i, at, int(Dg[i]))
@@ -206,6 +269,26 @@ class Daemon:
                 return str(p.get("reasoning", ""))[:300]
         p3 = preds_by_agent["a3"][i]
         return str((p3 or {}).get("reasoning", ""))[:300]
+
+    def _skip_verdicts(self, df, reason):
+        """Emit d=0 (legitimate) verdicts for rows the LLM did NOT adjudicate — the
+        ensemble-cleared majority and any over-cap overflow. No agent calls; the ŷ_ens
+        is carried through so the CSV/metrics still record why the id was cleared."""
+        out = []
+        if df is None or len(df) == 0:
+            return out
+        for _, r in df.iterrows():
+            yhe = r.get("y_hat_ens")
+            try:
+                yhe = float(yhe)
+            except (TypeError, ValueError):
+                yhe = None
+            out.append(PROTO.verdict_line(
+                claimed_id=int(r["claimed_node_id"]),
+                window_start=float(r["window_start_seconds"]),
+                d=0, attack_type="legitimate", attack_type_id=C.class_id("legitimate"),
+                confidence="high", y_hat_ens=yhe, reason=reason))
+        return out
 
     # -- socket server (protocol.py) -----------------------------------------
     def serve(self, sock_path):
@@ -259,13 +342,18 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--once", type=float, default=None, help="score once at t and print (no socket)")
-    ap.add_argument("--max-identities", type=int, default=None, help="cap rows scored (testing)")
+    ap.add_argument("--max-identities", type=int, default=None, help="hard ceiling on rows/window")
+    ap.add_argument("--ensemble-gate", type=float, default=0.5,
+                    help="ŷ_ens threshold to send an identity to the LLM (below = ensemble-cleared d=0)")
+    ap.add_argument("--max-llm-candidates", type=int, default=48,
+                    help="max identities/window adjudicated by the 3 agents (top-K by ŷ_ens)")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
 
     d = Daemon(args.run_dir, cap=args.cap, carry_forward=args.carry_forward,
                tol=args.tol, batch=args.batch, max_new=args.max_new,
-               max_identities=args.max_identities, window_margin=args.window_margin)
+               max_identities=args.max_identities, window_margin=args.window_margin,
+               ensemble_gate=args.ensemble_gate, max_llm_candidates=args.max_llm_candidates)
     if args.once is not None:
         vs = d.score(args.once, only_new=False, max_identities=args.max_identities)
         print(f"\n=== {len(vs)} verdicts @ t={args.once} ===")

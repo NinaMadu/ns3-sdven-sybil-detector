@@ -688,9 +688,11 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                                     m_complexityModel);
         WriteM10Row(timestampSec, receiverId, tier, modeStr, wallClockMs, flops);
 
-        // M5/M6 confusion matrix — skipped for FL mode (RecordFLPacketDecision
-        // counts every per-packet inference decision directly to avoid double-counting).
-        if (m_proposedMethod != MODE_BASELINE_FL)
+        // M5/M6 confusion matrix — skipped for FL mode (RecordFLPacketDecision) AND for
+        // MODE_FULL (RecordFullModeDecision). Those modes count their detector's own
+        // decisions directly; letting the per-packet path also write here would double-count
+        // and drown the detector's per-identity verdicts in per-packet FN/TN.
+        if (m_proposedMethod != MODE_BASELINE_FL && m_proposedMethod != MODE_FULL)
         {
             if      ( isActuallySybil &&  isFlagged) { m_windowMatrix.TP++; m_totalMatrix.TP++; }
             else if (!isActuallySybil &&  isFlagged) { m_windowMatrix.FP++; m_totalMatrix.FP++;
@@ -700,7 +702,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
             else                                     { m_windowMatrix.TN++; m_totalMatrix.TN++; }
         }
 
-        if (isFlagged && m_proposedMethod != MODE_BASELINE_FL)
+        if (isFlagged && m_proposedMethod != MODE_BASELINE_FL && m_proposedMethod != MODE_FULL)
         {
             // M7: record detection start only on first flag for this identity;
             // subsequent packets from the same Sybil claimedId are already tracked.
@@ -906,6 +908,56 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                     ? (predictedSybil ? "TP" : "TN")
                                     : (predictedSybil ? "FP" : "FN"))
                   << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // RecordFullModeDecision — MODE_FULL (=5) real-time LLM detector.
+    //   Called once per (claimed_id, window) verdict from InjectLLMDetectionEvidence,
+    //   for BOTH sybil (d=1) and legit (d=0) verdicts, so the M5/M6 confusion matrix
+    //   (TP/FP/TN/FN → precision/recall/MCC/FPR) is complete. Ground truth is the
+    //   identity-level set the sim accumulates (any beacon with real!=claimed id).
+    //   Also feeds M7 first-detection latency and M8 overhead, like the FL path.
+    // -------------------------------------------------------------------------
+    void RecordFullModeDecision(uint32_t           claimedId,
+                                bool               isActuallySybil,
+                                bool               predictedSybil,
+                                const std::string& tier,
+                                double             timestampSec,
+                                double             revLatencySec = 0.001)
+    {
+        if (m_proposedMethod != MODE_FULL) return;
+
+        // M5/M6: per-decision confusion matrix
+        if      ( isActuallySybil &&  predictedSybil) { m_windowMatrix.TP++; m_totalMatrix.TP++; }
+        else if (!isActuallySybil &&  predictedSybil)
+        {
+            m_windowMatrix.FP++; m_totalMatrix.FP++;
+            std::cout << "[M6] FULL_FP at t=" << timestampSec
+                      << " claimedId=" << claimedId << " (legit id flagged sybil)" << std::endl;
+        }
+        else if ( isActuallySybil && !predictedSybil) { m_windowMatrix.FN++; m_totalMatrix.FN++; }
+        else                                          { m_windowMatrix.TN++; m_totalMatrix.TN++; }
+
+        // M7: first-detection latency per flagged identity
+        if (predictedSybil &&
+            m_latencyTracker.pending.find(claimedId) == m_latencyTracker.pending.end())
+        {
+            m_latencyTracker.RecordDetectionStart(claimedId, m_proposedMethod, timestampSec);
+            // Revocation lands at t + revLatencySec (modeled detection→revocation reaction);
+            // RecordRevocationComplete adds the analytical crypto + inference overhead on top.
+            double revDelaySec = std::max(0.001, revLatencySec);
+            Simulator::Schedule(
+                Seconds(revDelaySec),
+                &SecurityEvaluationMetrics::OnRevocationComplete,
+                this, claimedId, isActuallySybil, timestampSec + revDelaySec);
+        }
+
+        // M8: overhead for flagged decisions
+        if (predictedSybil)
+        {
+            m_windowOverhead.AddEvent(40u, m_thresholdN, m_thresholdT, tier);
+            m_totalOverhead.AddEvent(40u, m_thresholdN, m_thresholdT, tier);
+        }
     }
 
     // -------------------------------------------------------------------------

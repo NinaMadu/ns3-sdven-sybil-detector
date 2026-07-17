@@ -61,6 +61,9 @@ struct Verdict
 
 static double      g_interval = 10.0;   // sim-seconds between SCORE requests
 static double      g_detectLatency = 0.0;  // modeled detection latency (verdict applied at t+L)
+static double      g_ensembleGate = 0.5;   // ŷ_ens threshold to send an id to the LLM (pre-filter A)
+static int         g_maxLlmCandidates = 48;// top-K by ŷ_ens adjudicated by the 3 agents/window (B)
+static int         g_maxIdentities = 0;    // hard ceiling on rows/window (0 = none)
 static std::string g_sock   = "/tmp/sybil_rt_detect.sock";       // MUST be < 108 chars
 static std::string g_runDir = "sybil-attack/outputs";            // where the sim writes logs
 static std::string g_python = "sybil-attack/ml/.venv/bin/python";
@@ -83,6 +86,9 @@ static void (*g_verdictSink)(const std::vector<Verdict>&) = nullptr;
 [[maybe_unused]] static void SetSocket(const std::string& p)  { g_sock = p; }
 [[maybe_unused]] static void SetRunDir(const std::string& p)  { g_runDir = p; }
 [[maybe_unused]] static void SetOutput(const std::string& p)  { g_out = p; }
+[[maybe_unused]] static void SetEnsembleGate(double g)   { g_ensembleGate = g; }
+[[maybe_unused]] static void SetMaxLlmCandidates(int k)  { g_maxLlmCandidates = k; }
+[[maybe_unused]] static void SetMaxIdentities(int n)     { g_maxIdentities = n; }
 [[maybe_unused]] static void SetVerdictSink(void (*cb)(const std::vector<Verdict>&)) { g_verdictSink = cb; }
 
 // ── launch the persistent daemon in the background ───────────────────────────
@@ -94,7 +100,11 @@ static void LaunchDaemon()
         << " --sock " << g_sock
         << " --run-dir " << g_runDir
         << " --window-margin 30"
-        << " > " << g_daemonLog << " 2>&1 &'";
+        << " --ensemble-gate " << g_ensembleGate
+        << " --max-llm-candidates " << g_maxLlmCandidates;
+    if (g_maxIdentities > 0)
+        cmd << " --max-identities " << g_maxIdentities;
+    cmd << " > " << g_daemonLog << " 2>&1 &'";
     std::cout << "[LLMRealtime] launching detector daemon: " << g_script << "\n"
               << "              log -> " << g_daemonLog << "\n" << std::flush;
     int r = std::system(cmd.str().c_str());
