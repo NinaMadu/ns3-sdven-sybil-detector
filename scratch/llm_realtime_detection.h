@@ -84,7 +84,13 @@ static void (*g_verdictSink)(const std::vector<Verdict>&) = nullptr;
 [[maybe_unused]] static void SetInterval(double s)      { g_interval = s; }
 [[maybe_unused]] static void SetDetectLatency(double s) { g_detectLatency = s; }
 [[maybe_unused]] static void SetSocket(const std::string& p)  { g_sock = p; }
-[[maybe_unused]] static void SetRunDir(const std::string& p)  { g_runDir = p; }
+[[maybe_unused]] static void SetRunDir(const std::string& p)  {
+    // Redirect all daemon-side paths together so --outputDir works end-to-end: the daemon
+    // reads the sim's logs from p, and writes its verdict CSV + log alongside them.
+    g_runDir = p;
+    g_out = p + "/full_mode_verdicts.csv";
+    g_daemonLog = p + "/rt_full_mode_daemon.log";
+}
 [[maybe_unused]] static void SetOutput(const std::string& p)  { g_out = p; }
 [[maybe_unused]] static void SetEnsembleGate(double g)   { g_ensembleGate = g; }
 [[maybe_unused]] static void SetMaxLlmCandidates(int k)  { g_maxLlmCandidates = k; }

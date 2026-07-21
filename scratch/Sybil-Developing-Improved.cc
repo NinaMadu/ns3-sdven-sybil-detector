@@ -12551,6 +12551,12 @@ main(int argc, char* argv[])
         // dataset run folders hold communication/table CSV logs only.
         rsuApprovalLogCsv = outputDir + "/rsu_approval_log.csv";
         controllerLogCsv  = outputDir + "/controller_log.csv";
+        // Make sure the run folder (and the revocation-manifest subdir) exist — the flag
+        // says "must exist", but a fresh datasets/<run> folder usually won't yet.
+        std::system(("mkdir -p " + outputDir + "/ipfs-revocation-manifests").c_str());
+        // Full-mode: point the detector daemon's run-dir (where it READS the sim's logs and
+        // writes its verdict CSV + log) at the same folder, or it would read the empty default.
+        LLMRealtimeDetector::SetRunDir(outputDir);
     }
 
     // ── Dataset generation v2: post-parse processing ────────────────────────
@@ -12820,6 +12826,8 @@ main(int argc, char* argv[])
     InitializeMetricsCsvFiles();
 
     g_secMetrics = Create<SecurityEvaluationMetrics>();
+    if (!outputDir.empty())
+        g_secMetrics->SetOutputDir(outputDir);   // redirect M1-M10 + summary with --outputDir
     g_secMetrics->Initialize(N_Vehicles, N_RSUs, solution_mode);
 
     // -----------------------------------------------------------------------

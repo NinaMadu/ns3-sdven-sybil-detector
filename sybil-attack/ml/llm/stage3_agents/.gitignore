@@ -1,0 +1,7 @@
+# Generated Stage-3 artifacts — machine-local, regenerable, never committed.
+# Code + fl_config.json + README are tracked; weights/data/logs are not.
+data_fl/
+runs/
+final_models/
+*.log
+__pycache__/

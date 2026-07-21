@@ -1,0 +1,65 @@
+{
+  "_note": "FROZEN Stage-3 LLM-FL configuration. This is the single source of truth so both D1 conditions (local-only, LLM-FL) and both heterogeneity endpoints differ ONLY in federation, never in incidental hyperparameters. Base model / LoRA recipe are IDENTICAL to Stage-2 (train_lora_generic.py defaults) so the federated result stays directly comparable to the centralized run.",
+
+  "base_model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "agents": ["a1", "a2", "a3"],
+
+  "lora": {
+    "r": 8,
+    "alpha": 16,
+    "dropout": 0.05,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
+                       "gate_proj", "up_proj", "down_proj"]
+  },
+
+  "local_train": {
+    "_note": "Per-round LOCAL step budget at each (zone, agent). Kept identical in both D1 conditions (supervisor: 'round count and all training hyperparameters are identical across conditions'). One local epoch per round over the balanced zone data.",
+    "epochs_per_round": 1,
+    "batch": 8,
+    "grad_accum": 2,
+    "max_len": 1024,
+    "lr": 2e-4,
+    "lr_scheduler": "cosine",
+    "warmup_ratio": 0.03,
+    "bf16": true
+  },
+
+  "fedprox": {
+    "_note": "FedProx proximal coefficient mu (Eq 3.33). mu=0 recovers plain FedAvg-style local training. 0.01 is a standard non-IID default; tune here without touching code.",
+    "mu": 0.01
+  },
+
+  "federation": {
+    "n_zones": 4,
+    "max_rounds": 5,
+    "_note_stop": "Eq 3.73: stop at first round T whose newest 5-round validation MCC_macro window has (max-min) < conv_tol. If never satisfied within max_rounds, report 'not converged by round N'.",
+    "conv_window": 5,
+    "conv_tol": 0.001,
+    "seeds": [42]
+  },
+
+  "partition": {
+    "_note": "Attacker = is_sybil==1 (attack_type in 1..6); legitimate = attack_type 0. Each endpoint gives the per-zone TARGET attacker fraction. zone_size 'auto' = the largest EQUAL zone size feasible across ALL endpoints given the real train pools, so every zone in every endpoint is the same size (cleanest D1 control). val/test are NEVER partitioned - they stay whole and shared (frozen, leakage-safe, identical to Stage-2).",
+    "zone_size": "auto",
+    "seed": 42,
+    "endpoints": {
+      "H0":   {"label": "homogeneous",           "attacker_fractions": [0.50, 0.50, 0.50, 0.50]},
+      "Hmax": {"label": "maximally_heterogeneous","attacker_fractions": [0.10, 0.30, 0.50, 0.70]}
+    }
+  },
+
+  "overhead": {
+    "_note": "Eq 3.71 uses bf16 -> 2 bytes/param. Measured bytes are recorded separately per round in communication.json.",
+    "bytes_per_param": 2
+  },
+
+  "eval": {
+    "_note": "Per-round evaluation runs the SAME Stage-2 consensus (omega uniform 1/3, theta frozen) on the FROZEN shared val set. theta is frozen (not recalibrated per round) so the D1 comparison is not confounded by moving calibration.",
+    "omega": {"a1": 0.3333333333333333, "a2": 0.3333333333333333, "a3": 0.3333333333333333},
+    "theta_consensus": 0.6667,
+    "val_limit": 4000,
+    "test_limit": 0,
+    "gen_batch": 16,
+    "max_new_tokens": 128
+  }
+}

@@ -73,6 +73,9 @@ static std::string metricsLatencyCsv    = "sybil-attack/outputs/metrics_M2_Laten
 static std::string metricsAttractionCsv = "sybil-attack/outputs/metrics_M3_PacketAttraction.csv";
 static std::string metricsCongestionCsv = "sybil-attack/outputs/metrics_M4_Congestion.csv";
 static std::string metricsTierSummaryCsv = "sybil-attack/outputs/metrics_tier_summary.csv";
+// Base dir for the M1-M4 + summary CSVs; rebased by SecurityEvaluationMetrics::SetOutputDir
+// so --outputDir redirects every metrics file together with the per-run logs.
+static std::string g_metricsOutDir = "sybil-attack/outputs";
 
 // =============================================================================
 // M1–M4  Cumulative counters
@@ -567,6 +570,23 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
     }
 
     // Call once, AFTER routing_test and N_RSUs adjustments.
+    // Redirect every metrics CSV (M1-M10 + summary) under `dir`. Call BEFORE Initialize,
+    // which writes the headers. Keeps --outputDir consistent across logs + metrics.
+    void SetOutputDir(const std::string& dir)
+    {
+        g_metricsOutDir       = dir;
+        metricsPdrCsv         = dir + "/metrics_M1_PDR.csv";
+        metricsLatencyCsv     = dir + "/metrics_M2_Latency.csv";
+        metricsAttractionCsv  = dir + "/metrics_M3_PacketAttraction.csv";
+        metricsCongestionCsv  = dir + "/metrics_M4_Congestion.csv";
+        metricsTierSummaryCsv = dir + "/metrics_tier_summary.csv";
+        csvM5M6 = dir + "/metrics_M5_M6_detection_quality.csv";
+        csvM7   = dir + "/metrics_M7_revocation_latency.csv";
+        csvM8   = dir + "/metrics_M8_comm_overhead.csv";
+        csvM9   = dir + "/metrics_M9_fl_convergence.csv";
+        csvM10  = dir + "/metrics_M10_complexity.csv";
+    }
+
     void Initialize(uint32_t nVehicles,
                     uint32_t nRsus,
                     uint32_t proposedMethod,
@@ -1593,7 +1613,7 @@ ScheduleMetricsFlush()
 static inline void
 WriteFinalSummary()
 {
-    std::string summaryPath = "sybil-attack/outputs/metrics_summary.csv";
+    std::string summaryPath = g_metricsOutDir + "/metrics_summary.csv";
     std::ofstream out(summaryPath.c_str(), std::ios::out);
 
     double finalPDR =
