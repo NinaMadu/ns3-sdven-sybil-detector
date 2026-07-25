@@ -39,8 +39,21 @@ const uint16_t VEHICLE_PORT    = 9000;   ///< V2V beacon / RSU→Vehicle command
 const uint16_t RSU_PORT        = 9100;   ///< V2RSU report port
 const uint16_t CONTROLLER_PORT = 9200;   ///< RSU↔Controller backhaul port
 static const uint32_t MAX_V2RSU_NEIGHBOR_OBSERVATIONS = 4;
-static const uint32_t KYBER768_PUBLIC_KEY_BYTES = 1184;
-static const uint32_t KYBER768_CIPHERTEXT_BYTES = 1088;
+// PQC parameter sizes — all NIST Level 5.
+// ML-KEM-1024 (Kyber-1024, FIPS 203): session key encapsulation.
+static const uint32_t MLKEM1024_PUBLIC_KEY_BYTES = 1568;
+static const uint32_t MLKEM1024_CIPHERTEXT_BYTES = 1568;
+// FN-DSA-1024 (Falcon-1024, FIPS 206): per-beacon V2V signatures.
+// Padded variant → constant 1280-byte signature, so the tag stays fixed-size.
+static const uint32_t FNDSA1024_PUB_BYTES = 1793;
+static const uint32_t FNDSA1024_SEC_BYTES = 2305;
+static const uint32_t FNDSA1024_SIG_BYTES = 1280;
+
+// Window-aligned batch verification (methodology Eq. batch_verify).
+// W is the detection sliding-window length in beacons; the batch flush fires
+// every kBatchWindowSeconds so verification cadence matches detection cadence.
+static const uint32_t kBatchWindowBeacons = 10;   ///< W = 10
+static const double   kBatchWindowSeconds = 1.0;  ///< window duration (s)
 
 // ---------------------------------------------------------------------------
 // Message type taxonomy — extended with SYBIL_INJECTION for attack traffic
@@ -137,7 +150,12 @@ enum SdvenSuspicionFlags
     SUSPICION_UNCORROBORATED_RSU_APPROVAL = 1u << 7,
     SUSPICION_RSSI_DISTANCE_MISMATCH      = 1u << 8,  ///< Claimed BSM position inconsistent with RSSI-estimated distance
     SUSPICION_INVALID_V2V_SIGNATURE       = 1u << 9,  ///< V2V beacon ECDSA signature failed verification
-    SUSPICION_UNVERIFIED_RSU_WITNESS_PROVENANCE = 1u << 10 ///< RSU claims witnesses without physical/RSSI proof
+    SUSPICION_UNVERIFIED_RSU_WITNESS_PROVENANCE = 1u << 10, ///< RSU claims witnesses without physical/RSSI proof
+    ///< RSU asserts an identity for which the controller never issued a token
+    ///< commitment (tau_v not in T_valid, Alg. 3 line 6 applied at the control
+    ///< plane).  Observable from the controller's own issuance ledger only —
+    ///< it never consults real node ids or claimed-id ranges.
+    SUSPICION_UNATTESTED_IDENTITY_APPROVAL = 1u << 11
 };
 
 // RSSI-based position verification result stored per neighbor observation.
@@ -375,16 +393,17 @@ SerializeBsmForSigning(const BsmCoreData& bsm)
 // ---------------------------------------------------------------------------
 // V2VSignatureTag — attached to every V2V beacon.
 //
-// Carries the sender's ECDSA P-256 public key (64 bytes: x||y) and the
-// signature (64 bytes: r||s) over SHA-256(serialized BSM fields).
+// Carries the sender's FN-DSA-1024 (Falcon-1024, FIPS 206) public key
+// (1793 bytes) and the signature (1280 bytes, padded variant → constant size)
+// over SHA3-256(serialized BSM fields), per methodology Eq. beacon_sign.
 // Receivers use the embedded public key to verify without prior key lookup.
 // ---------------------------------------------------------------------------
 
 class V2VSignatureTag : public Tag
 {
   public:
-    static constexpr uint32_t KEY_BYTES = 64;  // P-256 uncompressed x||y
-    static constexpr uint32_t SIG_BYTES = 64;  // ECDSA raw r||s
+    static constexpr uint32_t KEY_BYTES = FNDSA1024_PUB_BYTES;  // FN-DSA-1024 public key
+    static constexpr uint32_t SIG_BYTES = FNDSA1024_SIG_BYTES;  // FN-DSA-1024 signature
 
     V2VSignatureTag()
     {
@@ -436,7 +455,7 @@ class ChanHelloTag : public Tag
 
     uint32_t vehicleId = 0;
     uint8_t  ecdhPub[ECDH_BYTES]   = {};
-    uint8_t  kyberPublicKey[KYBER768_PUBLIC_KEY_BYTES] = {};
+    uint8_t  kyberPublicKey[MLKEM1024_PUBLIC_KEY_BYTES] = {};
     uint8_t  nonceV [NONCE_BYTES]  = {};
 
     static TypeId GetTypeId()
@@ -447,20 +466,20 @@ class ChanHelloTag : public Tag
         return tid;
     }
     TypeId   GetInstanceTypeId() const override { return ChanHelloTag::GetTypeId(); }
-    uint32_t GetSerializedSize()  const override { return 4 + ECDH_BYTES + KYBER768_PUBLIC_KEY_BYTES + NONCE_BYTES; }
+    uint32_t GetSerializedSize()  const override { return 4 + ECDH_BYTES + MLKEM1024_PUBLIC_KEY_BYTES + NONCE_BYTES; }
 
     void Serialize(TagBuffer i) const override
     {
         i.WriteU32(vehicleId);
         i.Write(ecdhPub, ECDH_BYTES);
-        i.Write(kyberPublicKey, KYBER768_PUBLIC_KEY_BYTES);
+        i.Write(kyberPublicKey, MLKEM1024_PUBLIC_KEY_BYTES);
         i.Write(nonceV,  NONCE_BYTES);
     }
     void Deserialize(TagBuffer i) override
     {
         vehicleId = i.ReadU32();
         i.Read(ecdhPub, ECDH_BYTES);
-        i.Read(kyberPublicKey, KYBER768_PUBLIC_KEY_BYTES);
+        i.Read(kyberPublicKey, MLKEM1024_PUBLIC_KEY_BYTES);
         i.Read(nonceV,  NONCE_BYTES);
     }
     void Print(std::ostream& os) const override
@@ -492,7 +511,7 @@ class ChanAckTag : public Tag
 
     uint32_t rsuId = 0;
     uint8_t  ecdhPub      [ECDH_BYTES]  = {};  // RSU ephemeral pub
-    uint8_t  kyberCiphertext[KYBER768_CIPHERTEXT_BYTES] = {};
+    uint8_t  kyberCiphertext[MLKEM1024_CIPHERTEXT_BYTES] = {};
     uint8_t  nonceR       [NONCE_BYTES] = {};  // RSU nonce
     uint8_t  rsuLtPub     [ECDH_BYTES]  = {};  // RSU long-term pub (from cert)
     uint8_t  certSig      [SIG_BYTES]   = {};  // CA sig over (rsu_id||rsuLtPub)
@@ -508,14 +527,14 @@ class ChanAckTag : public Tag
     TypeId   GetInstanceTypeId() const override { return ChanAckTag::GetTypeId(); }
     uint32_t GetSerializedSize()  const override
     {
-        return 4 + ECDH_BYTES + KYBER768_CIPHERTEXT_BYTES + NONCE_BYTES + ECDH_BYTES + SIG_BYTES + SIG_BYTES;
+        return 4 + ECDH_BYTES + MLKEM1024_CIPHERTEXT_BYTES + NONCE_BYTES + ECDH_BYTES + SIG_BYTES + SIG_BYTES;
     }
 
     void Serialize(TagBuffer i) const override
     {
         i.WriteU32(rsuId);
         i.Write(ecdhPub,      ECDH_BYTES);
-        i.Write(kyberCiphertext, KYBER768_CIPHERTEXT_BYTES);
+        i.Write(kyberCiphertext, MLKEM1024_CIPHERTEXT_BYTES);
         i.Write(nonceR,       NONCE_BYTES);
         i.Write(rsuLtPub,     ECDH_BYTES);
         i.Write(certSig,      SIG_BYTES);
@@ -525,7 +544,7 @@ class ChanAckTag : public Tag
     {
         rsuId = i.ReadU32();
         i.Read(ecdhPub,      ECDH_BYTES);
-        i.Read(kyberCiphertext, KYBER768_CIPHERTEXT_BYTES);
+        i.Read(kyberCiphertext, MLKEM1024_CIPHERTEXT_BYTES);
         i.Read(nonceR,       NONCE_BYTES);
         i.Read(rsuLtPub,     ECDH_BYTES);
         i.Read(certSig,      SIG_BYTES);
@@ -942,7 +961,7 @@ class V2CtrlHelloTag : public Tag
     uint8_t  vehicleLtPub  [ECDH_BYTES]  = {};
     uint8_t  vehicleCertSig[SIG_BYTES]   = {};
     uint8_t  ecdhPubV      [ECDH_BYTES]  = {};
-    uint8_t  kyberPublicKey[KYBER768_PUBLIC_KEY_BYTES] = {};
+    uint8_t  kyberPublicKey[MLKEM1024_PUBLIC_KEY_BYTES] = {};
     uint8_t  nonceV        [NONCE_BYTES] = {};
     uint8_t  handshakeSig  [SIG_BYTES]   = {};
 
@@ -956,7 +975,7 @@ class V2CtrlHelloTag : public Tag
     TypeId   GetInstanceTypeId() const override { return V2CtrlHelloTag::GetTypeId(); }
     uint32_t GetSerializedSize()  const override
     {
-        return 4 + ECDH_BYTES + SIG_BYTES + ECDH_BYTES + KYBER768_PUBLIC_KEY_BYTES + NONCE_BYTES + SIG_BYTES;
+        return 4 + ECDH_BYTES + SIG_BYTES + ECDH_BYTES + MLKEM1024_PUBLIC_KEY_BYTES + NONCE_BYTES + SIG_BYTES;
     }
     void Serialize(TagBuffer i) const override
     {
@@ -964,7 +983,7 @@ class V2CtrlHelloTag : public Tag
         i.Write(vehicleLtPub,   ECDH_BYTES);
         i.Write(vehicleCertSig, SIG_BYTES);
         i.Write(ecdhPubV,       ECDH_BYTES);
-        i.Write(kyberPublicKey, KYBER768_PUBLIC_KEY_BYTES);
+        i.Write(kyberPublicKey, MLKEM1024_PUBLIC_KEY_BYTES);
         i.Write(nonceV,         NONCE_BYTES);
         i.Write(handshakeSig,   SIG_BYTES);
     }
@@ -974,7 +993,7 @@ class V2CtrlHelloTag : public Tag
         i.Read(vehicleLtPub,   ECDH_BYTES);
         i.Read(vehicleCertSig, SIG_BYTES);
         i.Read(ecdhPubV,       ECDH_BYTES);
-        i.Read(kyberPublicKey, KYBER768_PUBLIC_KEY_BYTES);
+        i.Read(kyberPublicKey, MLKEM1024_PUBLIC_KEY_BYTES);
         i.Read(nonceV,         NONCE_BYTES);
         i.Read(handshakeSig,   SIG_BYTES);
     }
@@ -1015,7 +1034,7 @@ class Ctrl2VehicleAckTag : public Tag
     uint8_t  ctrlLtPub    [ECDH_BYTES]  = {};
     uint8_t  ctrlCertSig  [SIG_BYTES]   = {};
     uint8_t  ecdhPubC     [ECDH_BYTES]  = {};
-    uint8_t  kyberCiphertext[KYBER768_CIPHERTEXT_BYTES] = {};
+    uint8_t  kyberCiphertext[MLKEM1024_CIPHERTEXT_BYTES] = {};
     uint8_t  nonceC       [NONCE_BYTES] = {};
     uint8_t  handshakeSig [SIG_BYTES]   = {};
 
@@ -1029,14 +1048,14 @@ class Ctrl2VehicleAckTag : public Tag
     TypeId   GetInstanceTypeId() const override { return Ctrl2VehicleAckTag::GetTypeId(); }
     uint32_t GetSerializedSize()  const override
     {
-        return ECDH_BYTES + SIG_BYTES + ECDH_BYTES + KYBER768_CIPHERTEXT_BYTES + NONCE_BYTES + SIG_BYTES;
+        return ECDH_BYTES + SIG_BYTES + ECDH_BYTES + MLKEM1024_CIPHERTEXT_BYTES + NONCE_BYTES + SIG_BYTES;
     }
     void Serialize(TagBuffer i) const override
     {
         i.Write(ctrlLtPub,    ECDH_BYTES);
         i.Write(ctrlCertSig,  SIG_BYTES);
         i.Write(ecdhPubC,     ECDH_BYTES);
-        i.Write(kyberCiphertext, KYBER768_CIPHERTEXT_BYTES);
+        i.Write(kyberCiphertext, MLKEM1024_CIPHERTEXT_BYTES);
         i.Write(nonceC,       NONCE_BYTES);
         i.Write(handshakeSig, SIG_BYTES);
     }
@@ -1045,7 +1064,7 @@ class Ctrl2VehicleAckTag : public Tag
         i.Read(ctrlLtPub,    ECDH_BYTES);
         i.Read(ctrlCertSig,  SIG_BYTES);
         i.Read(ecdhPubC,     ECDH_BYTES);
-        i.Read(kyberCiphertext, KYBER768_CIPHERTEXT_BYTES);
+        i.Read(kyberCiphertext, MLKEM1024_CIPHERTEXT_BYTES);
         i.Read(nonceC,       NONCE_BYTES);
         i.Read(handshakeSig, SIG_BYTES);
     }
@@ -1518,6 +1537,10 @@ FullCryptoMechanismActive()
 extern std::vector<std::vector<uint8_t>> g_vehiclePrivKeys;  // 32 bytes each
 extern std::vector<std::vector<uint8_t>> g_vehiclePubKeys;   // 64 bytes each
 
+// Vehicle FN-DSA-1024 beacon key material (Eq. beacon_sign).
+extern std::vector<std::vector<uint8_t>> g_vehicleBeaconPrivKeys;  // 2305 bytes each
+extern std::vector<std::vector<uint8_t>> g_vehicleBeaconPubKeys;   // 1793 bytes each
+
 // RSU ECDSA key material + CA-signed certificates.
 // Populated by LoadCaAndRsuKeys() before Simulator::Run().
 extern std::vector<std::vector<uint8_t>> g_rsuPrivKeys;    // 32 bytes each
@@ -1661,24 +1684,31 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
         }
         packet->AddPacketTag(BsmCoreDataTag(bsm));
 
-        // --- V2V Signature ---
+        // --- V2V Signature — FN-DSA-1024, methodology Eq. beacon_sign ---
+        //   sigma_b(v_i, t_j) = FN-DSA-1024.Sign( sk_{v_i}, H(m_b(v_i, t_j)) )
+        // where H is SHA3-256 over the serialized BSM core fields.
         uint32_t senderIdx = tx->realNodeId;
         if (CryptoMechanismActive() &&
-            senderIdx < g_vehiclePrivKeys.size() && !g_vehiclePrivKeys[senderIdx].empty())
+            senderIdx < g_vehicleBeaconPrivKeys.size() &&
+            !g_vehicleBeaconPrivKeys[senderIdx].empty())
         {
             std::vector<uint8_t> payload  = SerializeBsmForSigning(bsm);
-            std::vector<uint8_t> hash     = CryptoSha256(payload);
+            std::vector<uint8_t> hash     = CryptoSha3_256(payload);
             auto __t0 = std::chrono::high_resolution_clock::now();
-            std::vector<uint8_t> sigBytes = CryptoEcdsaSign(g_vehiclePrivKeys[senderIdx], hash);
+            std::vector<uint8_t> sigBytes =
+                CryptoFnDsa1024Sign(g_vehicleBeaconPrivKeys[senderIdx], hash);
             auto __t1 = std::chrono::high_resolution_clock::now();
             double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
             std::cout << "[Latency] V2V_BEACON  vehicle/" << senderIdx
                       << "  sign  " << __ms << "\n";
-            if (!sigBytes.empty())
+            if (sigBytes.size() == V2VSignatureTag::SIG_BYTES &&
+                g_vehicleBeaconPubKeys[senderIdx].size() == V2VSignatureTag::KEY_BYTES)
             {
                 V2VSignatureTag sigTag;
-                std::memcpy(sigTag.pub_key, g_vehiclePubKeys[senderIdx].data(), 64);
-                std::memcpy(sigTag.sig,     sigBytes.data(),                     64);
+                std::memcpy(sigTag.pub_key, g_vehicleBeaconPubKeys[senderIdx].data(),
+                            V2VSignatureTag::KEY_BYTES);
+                std::memcpy(sigTag.sig,     sigBytes.data(),
+                            V2VSignatureTag::SIG_BYTES);
                 packet->AddPacketTag(sigTag);
             }
         }

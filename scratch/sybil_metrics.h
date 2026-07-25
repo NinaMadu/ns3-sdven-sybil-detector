@@ -269,9 +269,9 @@ struct ConfusionMatrix
 //   multihash header.  DHT announce costs ~500 bytes per publication
 //   (provider record broadcast to k=20 peers × 25-byte peer ID).
 //
-// Threshold Dilithium3 coordination (t-of-n):
-//   n partial signatures (2420 B each) + 1 aggregated signature (2420 B)
-//   + commitment vector (32 B × n) + Kyber768 session key (1088 B).
+// Threshold ML-DSA-87 coordination (t-of-n):
+//   n partial signatures (4627 B each) + 1 aggregated signature (4627 B)
+//   + commitment vector (32 B × n) + ML-KEM-1024 session key (1568 B).
 //
 // Per-tier breakdown: OBU→RSU hop and RSU→Controller hop recorded separately.
 // =============================================================================
@@ -279,8 +279,9 @@ struct ConfusionMatrix
 static const uint32_t IPFS_CID_HEADER_BYTES     =  34;
 static const uint32_t IPFS_CHUNK_SIZE_BYTES      = 262144;
 static const uint32_t IPFS_DHT_ANNOUNCE_BYTES    = 500;
-static const uint32_t KYBER768_SESSION_BYTES     = 1088;
-static const uint32_t DILITHIUM3_SIG_BYTES       = 2420;
+static const uint32_t MLKEM1024_SESSION_BYTES    = 1568;  // ML-KEM-1024 ciphertext
+static const uint32_t MLDSA87_SIG_BYTES          = 4627;  // ML-DSA-87 signature
+static const uint32_t FNDSA1024_BEACON_SIG_BYTES = 1280;  // FN-DSA-1024 beacon signature
 static const uint32_t THRESHOLD_COMMITMENT_BYTES =  32;
 
 inline uint32_t ComputeIPFSPublicationBytes(uint32_t payloadBytes)
@@ -292,9 +293,9 @@ inline uint32_t ComputeIPFSPublicationBytes(uint32_t payloadBytes)
 
 inline uint32_t ComputeThresholdSigBytes(uint32_t n, uint32_t /*t*/)
 {
-    return (n + 1) * DILITHIUM3_SIG_BYTES
+    return (n + 1) * MLDSA87_SIG_BYTES
            + n * THRESHOLD_COMMITMENT_BYTES
-           + KYBER768_SESSION_BYTES;
+           + MLKEM1024_SESSION_BYTES;
 }
 
 struct TierOverhead
@@ -446,10 +447,11 @@ struct ComplexityModel
 // =============================================================================
 // M7  Revocation latency tracker
 //
-// Crypto benchmarks (NIST PQC Round 3):
-//   Dilithium3: sign=1.7ms, verify=0.5ms  → 2.2ms
-//   Kyber768:   encap=0.6ms, decap=0.5ms  → 1.1ms
-//   Total CRYPTO_LATENCY_MS = 3.3ms
+// Crypto benchmarks (liboqs 0.11.0, AVX2, measured on the simulation host):
+//   ML-DSA-87:   sign=0.076ms, verify=0.038ms
+//   ML-KEM-1024: encap=0.6ms,  decap=0.5ms
+//   FN-DSA-1024 beacon path is timed live at the call sites
+//   ([Latency] V2V_BEACON sign / V2V_BATCH batch_verify), not modelled here.
 //
 // Mode-dependent inference overhead (ms):
 //   MF rule evaluation  = 0.02 ms
@@ -457,14 +459,14 @@ struct ComplexityModel
 //   FL global model     = 1.80 ms
 // =============================================================================
 
-static const double DILITHIUM3_SIGN_MS        = 1.7;
-static const double DILITHIUM3_VERIFY_MS      = 0.5;
-static const double KYBER768_ENCAP_MS         = 0.6;
-static const double KYBER768_DECAP_MS         = 0.5;
-static const double CRYPTO_LATENCY_MS         = DILITHIUM3_SIGN_MS
-                                                + DILITHIUM3_VERIFY_MS
-                                                + KYBER768_ENCAP_MS
-                                                + KYBER768_DECAP_MS; // 3.3 ms
+static const double MLDSA87_SIGN_MS           = 0.076;
+static const double MLDSA87_VERIFY_MS         = 0.038;
+static const double MLKEM1024_ENCAP_MS        = 0.6;
+static const double MLKEM1024_DECAP_MS        = 0.5;
+static const double CRYPTO_LATENCY_MS         = MLDSA87_SIGN_MS
+                                                + MLDSA87_VERIFY_MS
+                                                + MLKEM1024_ENCAP_MS
+                                                + MLKEM1024_DECAP_MS; // 1.214 ms
 static const double ML_INFERENCE_OVERHEAD_MS  = 0.80;
 static const double FL_INFERENCE_OVERHEAD_MS  = 1.80;
 static const double MF_INFERENCE_OVERHEAD_MS  = 0.02;
@@ -997,7 +999,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         }
         std::string scheme = std::to_string(m_thresholdT) + "-of-"
                              + std::to_string(m_thresholdN)
-                             + "_Dilithium3+Kyber768";
+                             + "_FN-DSA-1024+ML-DSA-87+ML-KEM-1024";
         WriteM7Row(revTimeSec, claimedId, wasSybil, scheme,
                    latencyMs, ModeLabel(m_proposedMethod));
     }

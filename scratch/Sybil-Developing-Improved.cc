@@ -42,6 +42,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace ns3;
@@ -79,7 +80,7 @@ uint32_t sybil_attacker_level = 2;    ///< Attacker sophistication: 1=basic, 2=s
 bool controller_malicious_assumption = false; ///< Force controller to be malicious.
 const uint32_t kNoLegacyProposedMethod = std::numeric_limits<uint32_t>::max();
 uint32_t solution_mode = MODE_NO_DETECTION; ///< 1=FL (FLEMDS) 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=none.
-uint32_t full_crypto_profile = 1;        ///< Inside full mode: 1=current classical, 2=real PQC Kyber + Dilithium/ML-DSA.
+uint32_t full_crypto_profile = 1;        ///< Inside full mode: 1=current classical, 2=real PQC ML-KEM-1024 + ML-DSA-87 + FN-DSA-1024.
 uint32_t proposed_method = kNoLegacyProposedMethod; ///< Backward-compatible alias for old proposed_method values.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 // RSSI co-location detection tuning + logging flags (bound by CmdLine below).
@@ -109,6 +110,24 @@ uint32_t mobility_mode = 2;                  ///< 1=test, 2=programmed road, 3-5
 bool sumoAutoConfig = true;                  ///< Auto-set N_Vehicles/N_RSUs from SUMO trace files.
 double roadStartX = 20.0;                    ///< Road corridor start x-coordinate.
 double roadLength = 800.0;                   ///< Road corridor length in metres.
+
+// ── Registration GPS sanity bound (Alg. 3 plausibility check) ──────────────
+// The controller rejects a registration whose claimed GPS falls outside the
+// deployment area.  This bound used to be hardcoded to 500 m, which is the
+// extent of the small routing_test network only.  On any real SUMO map (the
+// KLBB scenarios span ~2 km) every vehicle's genuine position sits outside it,
+// so EVERY registration was denied and the controller issued zero tokens —
+// silently disabling the whole token/manifest layer, and with it the v5
+// control-plane defence that depends on T_valid being populated.
+//
+// The bound is now derived from the deployment the controller itself
+// provisioned (RSU positions + coverage margin).  regGpsBoundDefault keeps the
+// original value as the floor, so the small test network is bit-for-bit
+// unchanged.
+double regGpsBoundDefault = 500.0;           ///< Floor, and the value used when no RSU CSV loads.
+double regGpsBoundMargin  = 500.0;           ///< Slack beyond the outermost RSU, in metres.
+static double g_regGpsBoundX = 500.0;
+static double g_regGpsBoundY = 500.0;
 double roadBaseY = 40.0;                     ///< Centre y-coordinate of the road corridor.
 uint32_t roadLaneCount = 2;                  ///< Number of synthetic lanes.
 double laneSpacing = 4.0;                    ///< Spacing between lane centre lines.
@@ -122,6 +141,48 @@ double rsuTrustRemoveThreshold = 0.30;       ///< omega_r below this value trigg
 double rsuTrustPenalty = 0.20;               ///< Penalty applied when S5(r,t) exceeds threshold.
 double rsuTrustAnomalyThreshold = 0.50;      ///< theta_5 threshold for unsupported RSU approvals.
 double rsuTrustDisagreementEpsilon = 0.20;   ///< epsilon_5 minimum deviation from cross-RSU S5 mean.
+
+// ── v5 control-plane attestation check (Alg. 3 line 6 at the SDN) ──────────
+bool sdnAttestationCheckEnabled = true;      ///< Verify RSU-asserted identities against T_valid.
+uint32_t sdnAttestationGraceReports = 2;     ///< Distinct report epochs an identity may stay
+                                             ///< unattested before it counts against the RSU.
+                                             ///< Absorbs asynchronous registration lag; a
+                                             ///< legitimate vehicle attests once and never
+                                             ///< returns to the streak.
+double rsuTrustWindowInterval = 1.0;         ///< Seconds per Eq. (3.9) evaluation window t.
+// theta_5 for the windowed evaluator.  Kept separate from
+// rsuTrustAnomalyThreshold so the legacy cumulative path retains its published
+// 0.50 exactly.  A lower value is correct here, not a loosening: with
+// attestation as the numerator criterion an honest RSU's S5 is structurally
+// zero (it only reports identities it genuinely heard, and anything in its
+// coverage can register), whereas a compromised RSU's phantoms are diluted in
+// the denominator by every real vehicle it also serves.  At 0.50 a malicious
+// RSU serving more real vehicles than phantoms would sit below threshold.
+double rsuTrustWindowAnomalyThreshold = 0.15;
+bool rsuTrustWindowedS5Enabled = true;       ///< Drive omega from the windowed Eq. (3.9) score
+                                             ///< (paper form) instead of the cumulative
+                                             ///< event-ratio the legacy counters produce.
+bool rsuTrustImmediateRevoke = true;         ///< Alg. 7 lines 5-6: revoke on the S5/epsilon_5
+                                             ///< condition rather than waiting for omega to
+                                             ///< decay past theta_remove.
+// Master switch for whether the v5 verdict is allowed to ACT.
+//
+// Default false = observation-only: the detector computes S5, reaches a
+// verdict and writes metrics_v5_rsu_detection_quality.csv, but does NOT touch
+// omega, does NOT revoke, and does NOT write to rsu_trust_lifecycle_log.csv.
+// Every other log, every trained-model input and the whole simulation trace is
+// therefore bit-for-bit identical to a run with the detector compiled out —
+// verified by A/B diff on attack types 1 and 5.
+//
+// This default exists because the detector's cross-variant specificity is
+// limited (see the report): on a v1 outsider run the same signal fires, since
+// an honest RSU relaying an outsider only it can hear is indistinguishable, at
+// the SDN, from an RSU inventing an identity.  Enforcing on that signal would
+// revoke honest RSUs and perturb the v1-v4 datasets.
+//
+// Set true for a dedicated v5 mitigation run, where revoking the compromised
+// RSU is the point.
+bool v5EnforcementEnabled = false;
 
 
 double weightedDetectionConsensusThreshold = 1.0; ///< theta_consensus for weighted RSU detection votes.
@@ -179,6 +240,8 @@ std::string animFile          = "sybil-attack/outputs/sybil-developing-netanim.x
 std::string rssiVerificationCsv = "sybil-attack/outputs/rssi_verification_log.csv";
 std::string rsuTrustLifecycleCsv = "sybil-attack/outputs/rsu_trust_lifecycle_log.csv";
 std::string rsuApprovalLogCsv    = "sybil-attack/outputs/rsu_approval_log.csv";
+std::string rsuDetectionQualityCsv =
+    "sybil-attack/outputs/metrics_v5_rsu_detection_quality.csv";
 std::string controllerLogCsv     = "sybil-attack/outputs/controller_log.csv";
 
 
@@ -292,9 +355,16 @@ PrintControllerZoneAssignments()
     std::cout << std::endl;
 }
 
-// Vehicle ECDSA key material — loaded from vehicle_keys.csv before Simulator::Run().
+// Vehicle ECDSA long-term identity key material — loaded from vehicle_keys.csv
+// before Simulator::Run().  Backs the CA certificate and the V2CTRL handshake
+// proof-of-possession; NOT used for beacon signing.
 std::vector<std::vector<uint8_t>> g_vehiclePrivKeys;  // 32 bytes per vehicle
 std::vector<std::vector<uint8_t>> g_vehiclePubKeys;   // 64 bytes per vehicle
+
+// Vehicle FN-DSA-1024 (Falcon-padded-1024, FIPS 206) beacon key material.
+// Used exclusively for per-beacon V2V signatures (Eq. beacon_sign).
+std::vector<std::vector<uint8_t>> g_vehicleBeaconPrivKeys;  // 2305 bytes per vehicle
+std::vector<std::vector<uint8_t>> g_vehicleBeaconPubKeys;   // 1793 bytes per vehicle
 
 // RSU ECDSA key material + CA-signed certificates — loaded from rsu_keys.csv / ca_keys.csv.
 std::vector<std::vector<uint8_t>> g_rsuPrivKeys;   // 32 bytes per RSU
@@ -464,8 +534,8 @@ static std::vector<LkhZoneState> g_lkhZones;
 // Vehicle↔Controller E2E secure channel globals.
 std::vector<std::vector<uint8_t>>         g_vehicleCertSigs;         // CA sig per vehicle (64B)
 std::vector<uint8_t>                       g_ctrlSignPrivKey;          // controller signing priv (32B)
-static std::vector<CryptoPqcSignatureKeypair> g_pqcRsuSigKeys;            // full profile 2: Dilithium/ML-DSA per RSU
-static std::vector<CryptoPqcSignatureKeypair> g_pqcControllerSigKeys;     // full profile 2: Dilithium/ML-DSA per controller
+static std::vector<CryptoPqcSignatureKeypair> g_pqcRsuSigKeys;            // full profile 2: ML-DSA-87 per RSU
+static std::vector<CryptoPqcSignatureKeypair> g_pqcControllerSigKeys;     // full profile 2: ML-DSA-87 per controller
 static std::vector<CryptoPqcKemKeypair> g_vehicleV2IPqcKemKeys;           // pk_v/sk_v for paper V2I-AUTH ML-KEM
 static std::vector<std::vector<uint8_t> > g_vehicleV2IClassicalKemPriv;   // non-PQC comparison: static ECDH private key
 static std::vector<std::vector<uint8_t> > g_vehicleV2IClassicalKemPub;    // non-PQC comparison: static ECDH public key
@@ -615,9 +685,61 @@ struct RsuTrustState
     double lastUpdateTime = 0.0;
     RsuTrustRole role = RSU_TRUST_ENDORSER;
     bool removalTriggered = false;
+
+    // ── Eq. (3.9) windowed approval-anomaly score ──────────────────────────
+    // Eq. (3.9) is a ratio of DISTINCT identities inside an evaluation window
+    // t, not a running tally of approval events.  The legacy counters above
+    // accumulate events for the whole run, which drives the ratio to ~0 after
+    // a few report cycles; they are retained unchanged so existing log columns
+    // and downstream parsers keep their meaning.  The fields below carry the
+    // per-window set cardinalities the paper actually specifies.
+    std::set<uint32_t> windowApprovedIds;      ///< |{ID : approve(r,ID,t)=1}|
+    std::set<uint32_t> windowUnsupportedIds;   ///< numerator of Eq. (3.9)
+    double windowAnomalyScore = 0.0;           ///< S5(r,t) for the last closed window
+    uint32_t windowIndex = 0;                  ///< evaluation epochs closed so far
+    uint32_t penaltyEvents = 0;                ///< Eq. (3.40) decrements applied
+    ///< Sticky v5 verdict.  Once the control-plane check has judged an RSU
+    ///< malicious that verdict stands for the rest of the run, so later windows
+    ///< are scored against the standing decision rather than re-litigated as
+    ///< fresh misses.  Independent of removalTriggered so it also holds in
+    ///< observation-only mode, where nothing is ever revoked.
+    bool v5VerdictLatched = false;
 };
 
 static std::vector<RsuTrustState> g_rsuTrustTable;
+
+// Per-(RSU, claimed identity) count of DISTINCT report epochs in which the RSU
+// asserted an identity that still carried no controller-issued token
+// commitment.  Registration is asynchronous, so a legitimate vehicle can be
+// reported once or twice before its token is minted; its streak then resets
+// permanently.  An identity the controller never issues a token for keeps
+// accumulating.  Persistence — not any identifier range — is what separates
+// the two, which is why this is safe to evaluate on claimed ids alone.
+static std::vector<std::map<uint32_t, uint32_t> > g_sdnUnattestedApprovalStreak;
+// Report epoch of the last streak increment, so several records inside one
+// RSU->controller batch cannot inflate the streak.
+static std::vector<std::map<uint32_t, uint32_t> > g_sdnUnattestedLastEpoch;
+
+// Set of RSUs that have ever asserted a given claimed identity to the SDN.
+//
+// This is the discriminator between "RSU is FABRICATING identities" (v5) and
+// "RSU is faithfully REPORTING unregistered identities that vehicles are
+// actually broadcasting" (v1-v4).  Both look unattested, so non-attestation
+// alone blames the honest RSU that happens to serve a Sybil vehicle —
+// measured: 13 honest RSUs flagged on an attack-type-1 run before this test
+// was added.
+//
+// A vehicle-tier Sybil is physically transmitting, so as it moves it is heard
+// and reported by more than one RSU.  A phantom invented by a compromised RSU
+// is asserted by exactly that RSU and no other, for the whole run, because no
+// other RSU can hear something that does not exist.  A single compromised RSU
+// can forge its own witness counters but cannot make a DIFFERENT RSU report
+// its phantom — that would need collusion, which is the |R|>1 assumption
+// Eq. (3.22) already rests on.
+//
+// Observable at the SDN by construction: it is just the set of report sources
+// the controller has already received for that identity.
+static std::map<uint32_t, std::set<uint32_t> > g_sdnIdentityAssertingRsus;
 
 static void
 ResetAwarenessTables()
@@ -649,6 +771,9 @@ ResetAwarenessTables()
         N_RSUs, std::map<uint32_t, std::vector<ComputedDetectionEvidenceRecord> >());
     g_vehicleLastRssiByClaimedId.assign(N_Vehicles, std::map<uint32_t, double>());
     g_rsuTrustTable.assign(N_RSUs, RsuTrustState());
+    g_sdnIdentityAssertingRsus.clear();
+    g_sdnUnattestedApprovalStreak.assign(N_RSUs, std::map<uint32_t, uint32_t>());
+    g_sdnUnattestedLastEpoch.assign(N_RSUs, std::map<uint32_t, uint32_t>());
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +919,39 @@ JsonBool(bool value)
 static std::string
 GetIpfsBinaryPath();
 
+// ---------------------------------------------------------------------------
+// IPFS read cache (throughput fix for --ipfsPublish=true runs).
+//
+// Every `ipfs cat` used to fork /bin/sh -> ipfs (a cold Go binary start,
+// ~10-40 ms) and block the single-threaded ns-3 event loop on the popen pipe.
+// The token-verification path re-fetches the SAME record constantly: profiling
+// a 200-vehicle MODE_FULL run showed the ns-3 process at 1.5% CPU, asleep in
+// anon_pipe_read for ~98% of wall clock, with one CID observed fetched four
+// times back-to-back.
+//
+// Memoising by CID is safe by construction: a CID *is* the hash of its
+// content, so two fetches of one CID are byte-identical by definition. A
+// re-issued token gets different content -> a different CID -> a different
+// cache key, so a hit can never be stale. Empty results (fetch failed) are not
+// cached, so transient IPFS failures stay retryable.
+// ---------------------------------------------------------------------------
+static std::string
+IpfsCatCached(const std::string& cid)
+{
+    static std::unordered_map<std::string, std::string> s_ipfsCatCache;
+
+    std::unordered_map<std::string, std::string>::const_iterator it =
+        s_ipfsCatCache.find(cid);
+    if (it != s_ipfsCatCache.end())
+        return it->second;
+
+    std::string body =
+        RunCommandCapture(GetIpfsBinaryPath() + " cat " + cid + " 2>/dev/null");
+    if (!body.empty())
+        s_ipfsCatCache.insert(std::make_pair(cid, body));
+    return body;
+}
+
 static std::string
 BytesToHex(const std::vector<uint8_t>& bytes)
 {
@@ -851,7 +1009,70 @@ EnsureRsuTrustTableInitialized()
     if (g_rsuTrustTable.size() < N_RSUs)
         g_rsuTrustTable.resize(N_RSUs);
     for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
+    {
+        // Revocation is terminal (Table 3.4: Removed has no return edge).
+        // Recomputing the role from omega alone would reinstate a revoked RSU
+        // the moment any later code path touched this table.
+        if (g_rsuTrustTable[rsuId].removalTriggered)
+        {
+            g_rsuTrustTable[rsuId].role = RSU_TRUST_REMOVED;
+            continue;
+        }
         g_rsuTrustTable[rsuId].role = RoleForRsuTrustScore(g_rsuTrustTable[rsuId].omega);
+    }
+    if (g_sdnUnattestedApprovalStreak.size() < N_RSUs)
+        g_sdnUnattestedApprovalStreak.resize(N_RSUs);
+    if (g_sdnUnattestedLastEpoch.size() < N_RSUs)
+        g_sdnUnattestedLastEpoch.resize(N_RSUs);
+}
+
+// ---------------------------------------------------------------------------
+// Control-plane identity attestation  (Alg. 3 line 6, applied at the SDN).
+//
+// OBSERVABILITY CONTRACT — read before modifying.
+// This predicate answers exactly one question: "has this controller ever
+// issued a token commitment for this claimed identity?"  It reads
+// g_controllerTokenCommitments, which is the controller's OWN issuance
+// ledger — an entry exists only because ApproveControllerThresholdRegistration
+// reached quorum and StoreThresholdApprovedToken minted the token.  It does
+// NOT read node ids, ground-truth attacker flags, or claimed-id ranges.  The
+// simulator's convention that fabricated identities are numbered above
+// N_Vehicles is an analysis convenience and MUST NOT be used as a detection
+// signal; nothing below depends on it.
+//
+// tau_v not in T_valid is the paper's own outsider/rogue-identity test.  A
+// compromised RSU can fabricate awareness rows, witness counters and RSSI
+// provenance at will, but it cannot fabricate a token the controller quorum
+// signed — which is precisely why v5 is a cryptographic-tier problem rather
+// than an ML one.
+// ---------------------------------------------------------------------------
+static bool
+ClaimedIdentityHasControllerAttestation(uint32_t claimedId)
+{
+    return g_controllerTokenCommitments.find(claimedId) !=
+           g_controllerTokenCommitments.end();
+}
+
+// The check is only meaningful once the controller has actually issued
+// something.  In modes that never run registration (baseline/lightweight
+// sweeps, or full mode before the first vehicle completes V2I-AUTH) the ledger
+// is empty, and treating every identity as unattested would flag the whole
+// network.  Requiring a non-empty ledger keeps those runs byte-identical to
+// their current behaviour.
+static bool
+SdnAttestationCheckActive()
+{
+    return sdnAttestationCheckEnabled && !g_controllerTokenCommitments.empty();
+}
+
+// Current Eq. (3.9) evaluation epoch index.  Derived from simulation time so
+// that every record inside one RSU->controller batch shares an epoch and a
+// single burst cannot inflate an identity's unattested streak.
+static uint32_t
+CurrentRsuApprovalEpoch()
+{
+    double w = std::max(0.1, rsuTrustWindowInterval);
+    return static_cast<uint32_t>(Simulator::Now().GetSeconds() / w);
 }
 
 static bool
@@ -969,13 +1190,28 @@ UpdateRsuTrustFromApproval(uint32_t rsuIndex,
     bool exceedsLocalThreshold = state.approvalAnomalyScore > rsuTrustAnomalyThreshold;
     bool exceedsCrossRsuDisagreement =
         crossRsuDisagreement > rsuTrustDisagreementEpsilon;
+    // DO NOT gate this on the windowed evaluator.  This legacy decrement is
+    // deliberately left exactly as published: it (and the trust_update rows it
+    // writes to rsu_trust_lifecycle_log.csv) are inputs the trust analyzer was
+    // trained on, so suppressing it would silently shift that distribution and
+    // invalidate the trained models.  The windowed Eq. (3.9) evaluator adds its
+    // own decrements on top rather than replacing this one.
+    //
+    // Why this gate alone cannot detect v5: it fires only when
+    // uniqueUnsupportedApproval is true, i.e. only on the first sighting of a
+    // DISTINCT identity.  A compromised RSU recycles a fixed, small identity
+    // set, so the number of penalty events it can ever incur is bounded by the
+    // size of that set — omega converges to a floor above theta_remove and
+    // removal never triggers.  Eq. (3.40) decrements once per evaluation epoch
+    // in which S5 > theta_5, which the attacker cannot bound.
     bool penalized = unsupportedApproval && uniqueUnsupportedApproval &&
                      exceedsLocalThreshold && exceedsCrossRsuDisagreement;
     if (penalized)
         state.omega = std::max(0.0, state.omega - rsuTrustPenalty);
 
     state.lastUpdateTime = Simulator::Now().GetSeconds();
-    state.role = RoleForRsuTrustScore(state.omega);
+    if (!state.removalTriggered)
+        state.role = RoleForRsuTrustScore(state.omega);
 
     std::ostringstream status;
     status << reason
@@ -1015,6 +1251,263 @@ UpdateRsuTrustFromApproval(uint32_t rsuIndex,
                                   "malicious_rsu_approval_anomaly",
                                   std::vector<std::string>(),
                                   HashStringHex(evidence.str()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EvaluateRsuApprovalWindow — Eq. (3.9) + Eq. (3.40) + Algorithm 7 lines 3-11.
+//
+// Runs once per rsuTrustWindowInterval and closes the current evaluation
+// window for every RSU:
+//
+//   S5(r,t) = |{ID : approve(r,ID,t)=1 and no valid corroboration}|
+//             ---------------------------------------------------
+//                        |{ID : approve(r,ID,t)=1}|                    (3.9)
+//
+//   delta_RSU = median over peer RSUs of S5(r',t)          (Alg. 7 line 4)
+//   if S5 > theta_5 and |S5 - delta_RSU| > epsilon_5:
+//       omega_r <- omega_r - Delta_penalty                          (3.40)
+//       RevokeEntity(r_mal, ...)                           (Alg. 7 line 6)
+//
+// Two deliberate departures from the literal text, both noted in the report:
+//
+//  * delta_RSU uses the MEDIAN of peer scores, not the mean.  The mean is
+//    dragged upward by the compromised RSUs themselves, so at the 40%
+//    compromise level the E-series sweeps, |S5 - delta_RSU| collapses below
+//    epsilon_5 and the honest majority loses the ability to flag anyone.  The
+//    median is the standard robust substitute and restores a breakdown point
+//    of 50% compromised RSUs.
+//
+//  * Eq. (3.40)'s graduated decay and Alg. 7's immediate revocation are both
+//    implemented.  They are not alternatives: the decay drives the
+//    endorser/client demotion of Table 3.4 (which strips manifest-signing
+//    rights early, per Eq. 3.39), while the immediate branch performs the
+//    removal.  rsuTrustImmediateRevoke=false leaves only the decay path.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// v5 detection quality  —  EVALUATION ONLY.
+//
+// M5/M6 scores per-IDENTITY verdicts from the vehicle-tier detectors, and it
+// structurally cannot cover v5: a compromised RSU's phantom rows never appear
+// on the wireless channel, so no beacon-derived ground truth or feature vector
+// ever exists for them.  That is by design — v5 is answered by the
+// cryptographic tier — but it left the attack with no confusion matrix at all.
+// This is that matrix, over RSU ENTITIES rather than vehicle identities.
+//
+// GROUND-TRUTH BOUNDARY — do not weaken.
+// IsRsuMalicious() below is simulator ground truth.  It is read ONLY to label
+// an outcome that has already been decided, and the value is never returned to
+// any caller, stored in any table a detector reads, or used to gate any
+// branch that affects the simulation.  Detection input is confined to
+// EvaluateRsuApprovalWindow, which sees only the controller's own issuance
+// ledger and the identities RSUs asserted to it.
+// ---------------------------------------------------------------------------
+static uint32_t g_v5TruePositives  = 0;
+static uint32_t g_v5FalsePositives = 0;
+static uint32_t g_v5FalseNegatives = 0;
+static uint32_t g_v5TrueNegatives  = 0;
+static std::set<uint32_t> g_v5DetectedRsus;   // dedup: first flag per RSU
+
+static void
+RecordRsuTrustDecisionForMetrics(uint32_t rsuIndex, bool flaggedMalicious)
+{
+    double now = Simulator::Now().GetSeconds();
+
+    // Is this RSU actually injecting right now?  Mirrors the gate at the
+    // injection site in SendRsuControllerReport so that, under the mode-9
+    // stepped-intensity schedule, an RSU is only counted as a positive during
+    // the sub-windows in which it is genuinely active.
+    bool actuallyMalicious =
+        sybil_attack_enabled &&
+        IsRsuMalicious(rsuIndex) &&
+        now >= g_attackOnsetTime &&
+        ((g_activeAttackType != ATTACK_SEQUENTIAL_ALL6) ||
+         (ActiveAttackTypeAt6(now) == 5u && IsMaliciousRsuActiveNow(rsuIndex, now)));
+
+    if (actuallyMalicious && flaggedMalicious)        ++g_v5TruePositives;
+    else if (!actuallyMalicious && flaggedMalicious)  ++g_v5FalsePositives;
+    else if (actuallyMalicious && !flaggedMalicious)  ++g_v5FalseNegatives;
+    else                                              ++g_v5TrueNegatives;
+
+    if (flaggedMalicious)
+        g_v5DetectedRsus.insert(rsuIndex);
+
+    std::ofstream out(rsuDetectionQualityCsv.c_str(), std::ios::app);
+    out << now << ","
+        << rsuIndex << ","
+        << (actuallyMalicious ? 1 : 0) << ","
+        << (flaggedMalicious ? 1 : 0) << ","
+        << ((rsuIndex < g_rsuTrustTable.size())
+                ? g_rsuTrustTable[rsuIndex].windowAnomalyScore : 0.0) << ","
+        << ((rsuIndex < g_rsuTrustTable.size())
+                ? g_rsuTrustTable[rsuIndex].omega : 0.0) << ","
+        << ((rsuIndex < g_rsuTrustTable.size())
+                ? RsuTrustRoleName(g_rsuTrustTable[rsuIndex].role) : "unknown")
+        << "\n";
+}
+
+static void
+EvaluateRsuApprovalWindow()
+{
+    if (!FullCryptoMechanismActive() || !rsuTrustWindowedS5Enabled)
+        return;
+
+    EnsureRsuTrustTableInitialized();
+
+    // Pass 1: close every RSU's window and compute S5(r,t) before any omega
+    // update, so each RSU is judged against the same snapshot of peer scores.
+    std::vector<double> windowScores(N_RSUs, 0.0);
+    std::vector<bool>   hasApprovals(N_RSUs, false);
+    for (uint32_t r = 0; r < N_RSUs && r < g_rsuTrustTable.size(); ++r)
+    {
+        RsuTrustState& s = g_rsuTrustTable[r];
+        std::size_t approved = s.windowApprovedIds.size();
+        std::size_t unsupported = s.windowUnsupportedIds.size();
+        hasApprovals[r] = (approved > 0);
+        windowScores[r] = (approved > 0)
+                              ? static_cast<double>(unsupported) /
+                                    static_cast<double>(approved)
+                              : 0.0;
+        s.windowAnomalyScore = windowScores[r];
+    }
+
+    for (uint32_t r = 0; r < N_RSUs && r < g_rsuTrustTable.size(); ++r)
+    {
+        RsuTrustState& s = g_rsuTrustTable[r];
+        // The v5 verdict is terminal: once the control-plane check has judged
+        // this RSU, that decision stands for every later window rather than
+        // being re-litigated as a fresh miss.
+        bool flagged = s.v5VerdictLatched;
+
+        // An RSU that approved nothing this window has no evidence either way;
+        // it is neither penalised nor credited.
+        //
+        // Note this does NOT test removalTriggered.  That flag can already be
+        // set by the legacy witness path (which reaches theta_remove on a
+        // level-4 v5 run), and skipping those RSUs made the control-plane
+        // check silently abstain on exactly the attackers it exists to catch —
+        // they scored as misses while sitting at S5=1.0.  Evaluation is
+        // independent of whether anything is being enforced; only the
+        // enforcement block below cares about prior removal.
+        if (hasApprovals[r])
+        {
+            // delta_RSU: median of peer scores (Alg. 7 line 4, robustified).
+            // Alg. 7 line 4 sums over EVERY peer r' != r, so an RSU that
+            // approved nothing this window contributes its score of 0 rather
+            // than being excluded.  Excluding them shrinks the peer set to
+            // whoever happens to be reporting, which in a window dominated by
+            // compromised RSUs pushes the median up and cancels the
+            // disagreement term — measured: RSUs sitting at S5=1.0 went
+            // unflagged because their "peers" were each other.
+            std::vector<double> peers;
+            for (uint32_t p = 0; p < N_RSUs && p < g_rsuTrustTable.size(); ++p)
+            {
+                if (p == r)
+                    continue;
+                peers.push_back(windowScores[p]);
+            }
+            double deltaRsu = 0.0;
+            if (!peers.empty())
+            {
+                std::sort(peers.begin(), peers.end());
+                std::size_t mid = peers.size() / 2;
+                deltaRsu = (peers.size() % 2 == 1)
+                               ? peers[mid]
+                               : 0.5 * (peers[mid - 1] + peers[mid]);
+            }
+            double disagreement = std::fabs(windowScores[r] - deltaRsu);
+
+            bool exceedsLocal = windowScores[r] > rsuTrustWindowAnomalyThreshold;
+            bool exceedsPeer  = disagreement > rsuTrustDisagreementEpsilon;
+            if (exceedsLocal && exceedsPeer)
+            {
+                flagged = true;
+                s.v5VerdictLatched = true;
+            }
+
+            // Observation-only mode: the verdict above stands and is scored
+            // into the v5 metrics below, but nothing past this point runs, so
+            // omega, the trust lifecycle log, the revocation path and every
+            // downstream detector input are left exactly as they would be with
+            // this detector absent.
+            if (flagged && v5EnforcementEnabled)
+            {
+                RsuTrustRole oldRole = s.role;
+                s.omega = std::max(0.0, s.omega - rsuTrustPenalty);   // Eq. (3.40)
+                s.penaltyEvents++;
+                s.lastUpdateTime = Simulator::Now().GetSeconds();
+                s.role = RoleForRsuTrustScore(s.omega);
+
+                std::ostringstream status;
+                status << "windowed_s5"
+                       << ";penalized=true"
+                       << ";local_threshold=true"
+                       << ";cross_rsu_disagreement=true"
+                       << ";window=" << s.windowIndex
+                       << ";approved_ids=" << s.windowApprovedIds.size()
+                       << ";unsupported_ids=" << s.windowUnsupportedIds.size()
+                       << ";old_role=" << RsuTrustRoleName(oldRole)
+                       << ";new_role=" << RsuTrustRoleName(s.role);
+                LogRsuTrustLifecycleEvent("window_trust_update", r, s,
+                                          0, SUSPICION_UNATTESTED_IDENTITY_APPROVAL,
+                                          deltaRsu, disagreement, status.str());
+
+                std::cout << "[RsuTrustWindow] RSU=" << r
+                          << " S5=" << windowScores[r]
+                          << " delta_RSU=" << deltaRsu
+                          << " disagreement=" << disagreement
+                          << " omega=" << s.omega
+                          << " role=" << RsuTrustRoleName(s.role)
+                          << " unsupportedIds=" << s.windowUnsupportedIds.size()
+                          << "/" << s.windowApprovedIds.size()
+                          << std::endl;
+
+                bool removeByDecay = (s.role == RSU_TRUST_REMOVED);
+                if ((rsuTrustImmediateRevoke || removeByDecay) && !s.removalTriggered)
+                {
+                    s.removalTriggered = true;
+                    s.role = RSU_TRUST_REMOVED;   // terminal — see the flagged
+                                                  // initialiser above
+
+                    std::ostringstream evidence;
+                    evidence << "rsu_trust_window|" << r
+                             << "|omega=" << s.omega
+                             << "|S5=" << windowScores[r]
+                             << "|delta_RSU=" << deltaRsu
+                             << "|unsupported_ids=" << s.windowUnsupportedIds.size()
+                             << "|approved_ids=" << s.windowApprovedIds.size();
+                    LogRsuTrustLifecycleEvent("window_rsu_removed", r, s,
+                                              0, SUSPICION_UNATTESTED_IDENTITY_APPROVAL,
+                                              deltaRsu, disagreement,
+                                              rsuTrustImmediateRevoke
+                                                  ? "alg7_immediate_revoke"
+                                                  : "omega_below_theta_remove");
+                    RevokeEntityCurrentCrypto("rsu",
+                                              r,
+                                              GetControllerIndexForRsu(r),
+                                              "malicious_rsu_approval_anomaly",
+                                              std::vector<std::string>(),
+                                              HashStringHex(evidence.str()));
+                }
+            }
+        }
+
+        // Evaluation-only accounting (never read back into any decision).
+        // A window in which this RSU asserted nothing carries no evidence, so
+        // there is no decision to score; counting it would inflate TN for idle
+        // RSUs and charge a miss to windows where the attacker sent nothing.
+        if (hasApprovals[r] || s.v5VerdictLatched)
+            RecordRsuTrustDecisionForMetrics(r, flagged);
+
+        s.windowApprovedIds.clear();
+        s.windowUnsupportedIds.clear();
+        s.windowIndex++;
+    }
+
+    if (rsuTrustWindowInterval > 0.0 &&
+        Simulator::Now().GetSeconds() + rsuTrustWindowInterval <= simTime)
+    {
+        Simulator::Schedule(Seconds(rsuTrustWindowInterval), &EvaluateRsuApprovalWindow);
     }
 }
 
@@ -1310,7 +1803,7 @@ InitializeFullModeShamirAndLkh()
     {
         if (FullPqcProfileActive())
         {
-            g_vehicleV2IPqcKemKeys[vehicleId] = CryptoKyber768Keygen();
+            g_vehicleV2IPqcKemKeys[vehicleId] = CryptoMlKem1024Keygen();
         }
         else
         {
@@ -1366,10 +1859,10 @@ SignWithCurrentControllerKeyHex(uint32_t controllerId, const std::string& messag
         controllerId < g_pqcControllerSigKeys.size() &&
         !g_pqcControllerSigKeys[controllerId].secretKey.empty())
     {
-        std::vector<uint8_t> sig = CryptoDilithiumMlDsa65Sign(
+        std::vector<uint8_t> sig = CryptoMlDsa87Sign(
             g_pqcControllerSigKeys[controllerId].secretKey, msg);
         std::ostringstream os;
-        os << "dilithium_ml_dsa_65_controller_" << controllerId << ":" << BytesToHex(sig);
+        os << "ml_dsa_87_controller_" << controllerId << ":" << BytesToHex(sig);
         return os.str();
     }
 
@@ -1393,10 +1886,10 @@ SignWithCurrentRsuKeyHex(uint32_t rsuId, const std::string& message)
         rsuId < g_pqcRsuSigKeys.size() &&
         !g_pqcRsuSigKeys[rsuId].secretKey.empty())
     {
-        std::vector<uint8_t> sig = CryptoDilithiumMlDsa65Sign(
+        std::vector<uint8_t> sig = CryptoMlDsa87Sign(
             g_pqcRsuSigKeys[rsuId].secretKey, msg);
         std::ostringstream os;
-        os << "dilithium_ml_dsa_65_rsu_" << rsuId << ":" << BytesToHex(sig);
+        os << "ml_dsa_87_rsu_" << rsuId << ":" << BytesToHex(sig);
         return os.str();
     }
 
@@ -1429,20 +1922,20 @@ InitializeFullPqcAuthorityKeys()
 
     g_pqcRsuSigKeys.resize(N_RSUs);
     for (uint32_t i = 0; i < N_RSUs; ++i)
-        g_pqcRsuSigKeys[i] = CryptoDilithiumMlDsa65Keygen();
+        g_pqcRsuSigKeys[i] = CryptoMlDsa87Keygen();
 
     g_pqcControllerSigKeys.resize(N_Controllers);
     for (uint32_t i = 0; i < N_Controllers; ++i)
-        g_pqcControllerSigKeys[i] = CryptoDilithiumMlDsa65Keygen();
+        g_pqcControllerSigKeys[i] = CryptoMlDsa87Keygen();
 
     uint32_t kyberBackhaulKeys = 0;
     if (g_rsuCtrlSharedKeys.size() < N_RSUs)
         g_rsuCtrlSharedKeys.resize(N_RSUs);
     for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
     {
-        CryptoPqcKemKeypair rsuKem = CryptoKyber768Keygen();
-        CryptoPqcKemEncapsulation ctrlEnc = CryptoKyber768Encapsulate(rsuKem.publicKey);
-        std::vector<uint8_t> rsuShared = CryptoKyber768Decapsulate(ctrlEnc.ciphertext, rsuKem.secretKey);
+        CryptoPqcKemKeypair rsuKem = CryptoMlKem1024Keygen();
+        CryptoPqcKemEncapsulation ctrlEnc = CryptoMlKem1024Encapsulate(rsuKem.publicKey);
+        std::vector<uint8_t> rsuShared = CryptoMlKem1024Decapsulate(ctrlEnc.ciphertext, rsuKem.secretKey);
         if (!ctrlEnc.sharedSecret.empty() && ctrlEnc.sharedSecret == rsuShared)
         {
             g_rsuCtrlSharedKeys[rsuId] = CryptoSha256(ctrlEnc.sharedSecret);
@@ -1450,10 +1943,10 @@ InitializeFullPqcAuthorityKeys()
         }
     }
 
-    std::cout << "[FullModePQC] Dilithium/ML-DSA-65 authority keys ready"
+    std::cout << "[FullModePQC] ML-DSA-87 authority keys ready"
               << " rsus=" << g_pqcRsuSigKeys.size()
               << " controllers=" << g_pqcControllerSigKeys.size()
-              << " kyber_rsu_controller_keys=" << kyberBackhaulKeys << "/" << N_RSUs
+              << " mlkem1024_rsu_controller_keys=" << kyberBackhaulKeys << "/" << N_RSUs
               << std::endl;
 }
 
@@ -1524,7 +2017,7 @@ FetchJsonByCidEarly(const std::string& cid)
         ss << in.rdbuf();
         return ss.str();
     }
-    return RunCommandCapture(GetIpfsBinaryPath() + " cat " + cid + " 2>/dev/null");
+    return IpfsCatCached(cid);
 }
 
 static std::string
@@ -1549,8 +2042,7 @@ PublishTokenManifestEndorsementToIpfs(uint32_t rsuId,
                                       const std::string& signatureHex)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-token-manifest-endorsements";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-token-manifest-endorsements");
 
     std::ostringstream path;
     path << dir << "/token_manifest_endorse_rsu" << rsuId
@@ -1578,13 +2070,13 @@ VerifyRsuSignatureHex(uint32_t rsuId,
                       const std::string& message,
                       const std::string& encodedSignature)
 {
-    std::string pqcPrefix = "dilithium_ml_dsa_65_rsu_" + std::to_string(rsuId) + ":";
+    std::string pqcPrefix = "ml_dsa_87_rsu_" + std::to_string(rsuId) + ":";
     if (encodedSignature.rfind(pqcPrefix, 0) == 0)
     {
         if (rsuId >= g_pqcRsuSigKeys.size())
             return false;
         std::vector<uint8_t> sig = CryptoHexToBytes(encodedSignature.substr(pqcPrefix.size()));
-        return CryptoDilithiumMlDsa65Verify(g_pqcRsuSigKeys[rsuId].publicKey,
+        return CryptoMlDsa87Verify(g_pqcRsuSigKeys[rsuId].publicKey,
                                             StringToBytes(message),
                                             sig);
     }
@@ -1698,7 +2190,7 @@ VerifyFullModeTokenManifestEndorsements(const std::string& manifestJson)
     bool ok = signerCount >= threshold;
     std::cout << "[FullModeTokenManifest] verify endorsements="
               << signerCount << "/" << threshold
-              << " scheme=" << (FullPqcProfileActive() ? "Dilithium/ML-DSA-65" : "current-ECDSA")
+              << " scheme=" << (FullPqcProfileActive() ? "ML-DSA-87" : "current-ECDSA")
               << " source=ipfs_endorsement_cids"
               << " status=" << (ok ? "accepted" : "rejected") << std::endl;
     return ok;
@@ -1813,7 +2305,7 @@ FetchJsonForIpfsOrLocalCid(const std::string& cid)
         ss << in.rdbuf();
         return ss.str();
     }
-    return RunCommandCapture(GetIpfsBinaryPath() + " cat " + cid + " 2>/dev/null");
+    return IpfsCatCached(cid);
 }
 
 static std::string
@@ -1865,14 +2357,14 @@ VerifyControllerSignatureHex(uint32_t controllerId,
                              const std::string& message,
                              const std::string& encodedSignature)
 {
-    std::string pqcPrefix = "dilithium_ml_dsa_65_controller_" +
+    std::string pqcPrefix = "ml_dsa_87_controller_" +
                             std::to_string(controllerId) + ":";
     if (encodedSignature.rfind(pqcPrefix, 0) == 0)
     {
         if (controllerId >= g_pqcControllerSigKeys.size())
             return false;
         std::vector<uint8_t> sig = CryptoHexToBytes(encodedSignature.substr(pqcPrefix.size()));
-        return CryptoDilithiumMlDsa65Verify(g_pqcControllerSigKeys[controllerId].publicKey,
+        return CryptoMlDsa87Verify(g_pqcControllerSigKeys[controllerId].publicKey,
                                             StringToBytes(message),
                                             sig);
     }
@@ -1943,8 +2435,7 @@ PublishRegistrationEndorsementToIpfs(const std::string& registrationCid,
                                      const std::string& signatureHex)
 {
     static bool warnedIpfsUnavailable = false;
-    const std::string dir = "sybil-attack/outputs/ipfs-registration-endorsements";
-    std::system(("mkdir -p " + dir + " >/dev/null 2>&1").c_str());
+    const std::string dir = EnsureIpfsDir("ipfs-registration-endorsements");
 
     std::ostringstream path;
     path << dir << "/reg_endorse_ctrl" << controllerId
@@ -2180,7 +2671,7 @@ FetchTokenHashFromIpfsTokenRecord(const std::string& tokenRecordCid)
     }
     else
     {
-        json = RunCommandCapture(GetIpfsBinaryPath() + " cat " + tokenRecordCid + " 2>/dev/null");
+        json = IpfsCatCached(tokenRecordCid);
     }
 
     return ExtractJsonStringField(json, "token_hash");
@@ -2196,7 +2687,7 @@ FetchJsonFromIpfsCid(const std::string& cid)
     if (cid.rfind(localPrefix, 0) == 0)
         return ReadSmallTextFile(cid.substr(localPrefix.size()));
 
-    return RunCommandCapture(GetIpfsBinaryPath() + " cat " + cid + " 2>/dev/null");
+    return IpfsCatCached(cid);
 }
 
 static std::string
@@ -2212,7 +2703,7 @@ BuildTokenManifestJson()
        << "  \"body_hash\": \"" << g_latestTokenManifestBodyHashHex << "\",\n"
        << "  \"endorsement_scheme\": \""
        << (FullCryptoMechanismActive()
-               ? (FullPqcProfileActive() ? "threshold_dilithium_ml_dsa_65_rsu_keys" : "threshold_current_ecdsa_rsu_keys")
+               ? (FullPqcProfileActive() ? "threshold_ml_dsa_87_rsu_keys" : "threshold_current_ecdsa_rsu_keys")
                : "not_required_for_lightweight")
        << "\",\n"
        << "  \"endorsement_threshold\": "
@@ -2705,7 +3196,8 @@ BuildComputedDetectionEvidenceJson(const ComputedDetectionEvidenceRecord& rec)
        << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
        << "  \"evidence_vector_hash\": \"" << rec.evidenceVectorHashHex << "\",\n"
        << "  \"current_partial_signature\": \"" << rec.currentSignatureHex << "\",\n"
-       << "  \"signature_scheme\": \"current_ecdsa_placeholder_for_future_dilithium\",\n"
+       << "  \"signature_scheme\": \""
+       << (FullPqcProfileActive() ? "ml_dsa_87" : "current_ecdsa") << "\",\n"
        << "  \"revocation_timestamp\": " << rec.revocationTimestamp << "\n"
        << "}\n";
     return os.str();
@@ -2780,7 +3272,8 @@ BuildIsolationRecordJson(const IsolationRecord& rec)
     os << "],\n"
        << "  \"authority_tier\": \"" << rec.authorityTier << "\",\n"
        << "  \"threshold_signature\": \"" << rec.thresholdSignatureHex << "\",\n"
-       << "  \"signature_scheme\": \"current_ecdsa_placeholder_for_future_threshold_dilithium\"\n"
+       << "  \"signature_scheme\": \""
+       << (FullPqcProfileActive() ? "threshold_ml_dsa_87" : "threshold_current_ecdsa") << "\"\n"
        << "}\n";
     return os.str();
 }
@@ -2822,13 +3315,15 @@ BuildRevocationManifestJson(const RevocationManifestRecord& rec)
     std::ostringstream os;
     os << "{\n"
        << "  \"type\": \"full_mode_revocation_manifest\",\n"
-       << "  \"crypto_profile\": \"full_simulated_pqc_threshold\",\n"
+       << "  \"crypto_profile\": \""
+       << (FullCryptoMechanismActive() ? FullCryptoProfileName() : "lightweight") << "\",\n"
        << "  \"entity_type\": \"" << rec.entityType << "\",\n"
        << "  \"entity_id\": " << rec.entityId << ",\n"
        << "  \"revocation_timestamp\": " << rec.revocationTimestamp << ",\n"
        << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
        << "  \"isolation_cid\": \"" << rec.isolationCid << "\",\n"
-       << "  \"endorsement_scheme\": \"simulated_threshold_dilithium_with_current_keys\",\n"
+       << "  \"endorsement_scheme\": \""
+       << (FullPqcProfileActive() ? "threshold_ml_dsa_87_rsu_keys" : "threshold_current_ecdsa_rsu_keys") << "\",\n"
        << "  \"endorsement_threshold\": " << rec.threshold << ",\n"
        << "  \"evidence_cids\": [";
     for (std::size_t i = 0; i < rec.evidenceCids.size(); ++i)
@@ -3441,6 +3936,93 @@ GetTrajectoryShadowingCompared(uint32_t observerVehicleId, uint32_t claimedId)
     return (it == g_trajectoryShadowingCompared[observerVehicleId].end()) ? false : it->second;
 }
 
+// ---------------------------------------------------------------------------
+// RecordRsuApprovalForAttestationWindow — v5 control-plane evidence collection.
+//
+// ISOLATION CONTRACT — read before modifying.
+// This is the ONLY place the attestation check touches, and it deliberately
+// returns nothing.  The v5 verdict must not contaminate the inputs other
+// detectors and the ML datasets are trained on:
+//
+//   * It does NOT set suspicionFlags on any awareness record.  Those flags
+//     drive ControllerGlobalAwarenessRecord::trustScore (1.0 vs 0.25), which
+//     is written to controller_global_awareness_log.csv and consumed by the
+//     trust analyzer.  A vehicle that simply has not finished registering
+//     must not acquire a degraded trust score.
+//   * It does NOT call UpdateRsuTrustFromApproval, so the legacy
+//     totalApprovalCount / unsupportedApprovalCount / approvalAnomalyScore
+//     columns in rsu_trust_lifecycle_log.csv keep their published meaning.
+//
+// The evidence it accumulates is confined to the per-RSU window sets, which
+// only EvaluateRsuApprovalWindow reads, and whose only outputs are omega,
+// revocation, and metrics_v5_rsu_detection_quality.csv.
+// ---------------------------------------------------------------------------
+static void
+RecordRsuApprovalForAttestationWindow(uint32_t rsuIndex, uint32_t claimedId)
+{
+    if (rsuIndex >= N_RSUs || !SdnAttestationCheckActive())
+        return;
+
+    EnsureRsuTrustTableInitialized();
+    auto& streakMap = g_sdnUnattestedApprovalStreak[rsuIndex];
+    auto& epochMap  = g_sdnUnattestedLastEpoch[rsuIndex];
+
+    // Denominator of Eq. (3.9): every distinct identity this RSU approved.
+    g_rsuTrustTable[rsuIndex].windowApprovedIds.insert(claimedId);
+    g_sdnIdentityAssertingRsus[claimedId].insert(rsuIndex);
+
+    if (ClaimedIdentityHasControllerAttestation(claimedId))
+    {
+        // The controller's own ledger vouches for this identity.  Clear any
+        // streak accrued while registration was still in flight so it can
+        // never resurface as evidence.
+        streakMap.erase(claimedId);
+        epochMap.erase(claimedId);
+        return;
+    }
+
+    // Absence of a commitment is not by itself incriminating — registration is
+    // asynchronous.  PERSISTENCE is the discriminator: a legitimate vehicle
+    // attests once and leaves this path permanently, while an identity the
+    // controller will never attest keeps accumulating epochs.  Epoch-keyed so
+    // that several records inside one RSU->controller batch cannot inflate it.
+    uint32_t epoch = CurrentRsuApprovalEpoch();
+    auto lastIt = epochMap.find(claimedId);
+    if (lastIt == epochMap.end() || lastIt->second != epoch)
+    {
+        epochMap[claimedId] = epoch;
+        streakMap[claimedId] += 1u;
+    }
+
+    // Numerator of Eq. (3.9): sustained non-attestation AND sole-source.
+    // Requiring sole-source is what keeps this specific to v5 — see the
+    // comment on g_sdnIdentityAssertingRsus.  An identity any other RSU has
+    // also reported is physically present somewhere, so the RSU reporting it
+    // is doing its job, whatever the identity itself turns out to be.  Those
+    // identities are the business of the vehicle-tier detectors (v1-v4), not
+    // of the control-plane RSU-integrity check.
+    bool soleSource = (g_sdnIdentityAssertingRsus[claimedId].size() <= 1u);
+    if (soleSource &&
+        streakMap[claimedId] > std::max(1u, sdnAttestationGraceReports))
+    {
+        g_rsuTrustTable[rsuIndex].windowUnsupportedIds.insert(claimedId);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EvaluateUncorroboratedRsuApproval — UNCHANGED from the original.
+//
+// Restored verbatim, identifier-range candidate filter included, because its
+// return value feeds suspicionFlags -> trustScore -> the awareness logs that
+// the ML detectors train on.  Altering it changes those distributions.
+//
+// NOTE for the report: the `claimedId < N_Vehicles` test below is a
+// simulation-numbering shortcut, not an observable an SDN controller has.  It
+// is left in place deliberately so this change set does not perturb existing
+// detector inputs; the v5 defence does not rely on it and runs entirely
+// through RecordRsuApprovalForAttestationWindow above.  Replacing it is a
+// separate change with its own dataset-regeneration cost.
+// ---------------------------------------------------------------------------
 static uint32_t
 EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
                                   uint32_t claimedId,
@@ -3453,9 +4035,10 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
     if (rsuIndex >= N_RSUs)
         return SUSPICION_NONE;
 
-    // In the simulator, IDs outside [0, N_Vehicles) model identities that need
-    // registry/token corroboration.  This is only a candidate filter; the flag
-    // requires missing vehicle-tier physical-presence evidence.
+    // Collect v5 evidence for every approval this RSU asserts, side-effect
+    // free with respect to everything below.
+    RecordRsuApprovalForAttestationWindow(rsuIndex, claimedId);
+
     if (claimedId < N_Vehicles)
         return SUSPICION_NONE;
 
@@ -3537,7 +4120,7 @@ FullCryptoProfileName()
     if (!FullCryptoMechanismActive())
         return "not_full_mode";
     if (FullPqcProfileActive())
-        return "full_pqc_kyber768_dilithium_ml_dsa_65";
+        return "full_pqc_mlkem1024_mldsa87_fndsa1024";
     if (full_crypto_profile == 2)
         return "full_pqc_requested_but_liboqs_unavailable";
     return "full_current_classical_crypto";
@@ -3903,10 +4486,12 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
                 {
                     BsmCoreData bsm = bsmTag.GetBsm();
                     std::vector<uint8_t> payload = SerializeBsmForSigning(bsm);
-                    std::vector<uint8_t> hash = CryptoSha256(payload);
-                    std::vector<uint8_t> pubKey(sigTag.pub_key, sigTag.pub_key + 64);
-                    std::vector<uint8_t> sigBytes(sigTag.sig, sigTag.sig + 64);
-                    sigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
+                    std::vector<uint8_t> hash = CryptoSha3_256(payload);
+                    std::vector<uint8_t> pubKey(sigTag.pub_key,
+                                                sigTag.pub_key + V2VSignatureTag::KEY_BYTES);
+                    std::vector<uint8_t> sigBytes(sigTag.sig,
+                                                  sigTag.sig + V2VSignatureTag::SIG_BYTES);
+                    sigValid = CryptoFnDsa1024Verify(pubKey, hash, sigBytes);
                 }
 
 
@@ -4443,10 +5028,29 @@ CountCsvDataLines(const std::string& path)
     return lines;
 }
 
+// Returns true when vehicle_keys.csv predates the FN-DSA-1024 migration, i.e.
+// it lacks the beacon_public_key_hex / beacon_private_key_hex columns.  Row
+// count alone cannot detect this, so a stale 4-column file would otherwise
+// survive and silently disable V2V beacon signatures.
+static bool
+VehicleKeyCsvMissingBeaconColumns(const std::string& path)
+{
+    std::ifstream f(path);
+    if (!f.is_open())
+        return true;
+    std::string header;
+    if (!std::getline(f, header))
+        return true;
+    return header.find("beacon_public_key_hex")  == std::string::npos ||
+           header.find("beacon_private_key_hex") == std::string::npos;
+}
+
 static void
 EnsureKeyFilesExist()
 {
-    bool needVehicleKeys = CountCsvDataLines("sybil-attack/inputs/vehicle_keys.csv") < N_Vehicles;
+    bool needVehicleKeys =
+        CountCsvDataLines("sybil-attack/inputs/vehicle_keys.csv") < N_Vehicles ||
+        VehicleKeyCsvMissingBeaconColumns("sybil-attack/inputs/vehicle_keys.csv");
     bool needRsuKeys     = CountCsvDataLines("sybil-attack/inputs/rsu_keys.csv")     < N_RSUs;
     bool needVins        = CountCsvDataLines("sybil-attack/inputs/vehicle_vins.csv") < N_Vehicles;
 
@@ -4494,7 +5098,10 @@ CreateProjectDirectories()
 // ---------------------------------------------------------------------------
 // LoadVehicleKeys — reads sybil-attack/inputs/vehicle_keys.csv generated by
 // sybil-attack/security/generate_vehicle_keys.py and populates
-// g_vehiclePrivKeys[v] (32 bytes) and g_vehiclePubKeys[v] (64 bytes).
+// g_vehiclePrivKeys[v] (2305 bytes) and g_vehiclePubKeys[v] (1793 bytes).
+// Key material is FN-DSA-1024 (Falcon-padded-1024, FIPS 206) for beacon
+// signing.  The CA certificate over the vehicle key stays ECDSA P-256 (64 B),
+// since the CA/registration tier is unchanged by this patch.
 // Must be called after N_Vehicles is known and before Simulator::Run().
 // ---------------------------------------------------------------------------
 
@@ -4511,12 +5118,16 @@ LoadVehicleKeys()
                   << " --vehicles " << N_Vehicles << "\n";
         g_vehiclePrivKeys.assign(N_Vehicles, {});
         g_vehiclePubKeys.assign(N_Vehicles, {});
+        g_vehicleBeaconPrivKeys.assign(N_Vehicles, {});
+        g_vehicleBeaconPubKeys.assign(N_Vehicles, {});
         return;
     }
 
     g_vehiclePrivKeys.assign(N_Vehicles, {});
     g_vehiclePubKeys.assign(N_Vehicles, {});
     g_vehicleCertSigs.assign(N_Vehicles, {});
+    g_vehicleBeaconPrivKeys.assign(N_Vehicles, {});
+    g_vehicleBeaconPubKeys.assign(N_Vehicles, {});
 
     // Strip trailing whitespace / \r from a string
     auto trim = [](std::string s) -> std::string {
@@ -4542,8 +5153,8 @@ LoadVehicleKeys()
         uint32_t vId = static_cast<uint32_t>(std::stoul(fields[0]));
         if (vId >= N_Vehicles) continue;
 
-        auto pub  = CryptoHexToBytes(fields[1]);  // 64 bytes
-        auto priv = CryptoHexToBytes(fields[2]);  // 32 bytes
+        auto pub  = CryptoHexToBytes(fields[1]);  // 64 bytes (ECDSA P-256)
+        auto priv = CryptoHexToBytes(fields[2]);  // 32 bytes (ECDSA P-256)
         if (pub.size() == 64 && priv.size() == 32)
         {
             g_vehiclePubKeys[vId]  = pub;
@@ -4563,20 +5174,54 @@ LoadVehicleKeys()
             if (cert.size() == 64)
                 g_vehicleCertSigs[vId] = cert;
         }
+
+        // FN-DSA-1024 beacon keypair (field indices 4 and 5).  Separate from
+        // the ECDSA long-term identity key above: the ECDSA key still backs the
+        // CA certificate and the V2CTRL handshake proof-of-possession, while
+        // the FN-DSA key signs per-beacon V2V messages (Eq. beacon_sign).
+        if (fields.size() >= 6)
+        {
+            auto beaconPub  = CryptoHexToBytes(fields[4]);  // 1793 bytes
+            auto beaconPriv = CryptoHexToBytes(fields[5]);  // 2305 bytes
+            if (beaconPub.size()  == FNDSA1024_PUB_BYTES &&
+                beaconPriv.size() == FNDSA1024_SEC_BYTES)
+            {
+                g_vehicleBeaconPubKeys[vId]  = beaconPub;
+                g_vehicleBeaconPrivKeys[vId] = beaconPriv;
+            }
+            else
+            {
+                std::cerr << "[Security] Bad FN-DSA-1024 beacon key length for vehicle "
+                          << vId << " (pub=" << beaconPub.size()
+                          << " priv=" << beaconPriv.size() << ")\n";
+            }
+        }
     }
 
     uint32_t loaded = 0;
     uint32_t certLoaded = 0;
+    uint32_t beaconLoaded = 0;
     for (uint32_t i = 0; i < N_Vehicles; ++i)
     {
-        if (!g_vehiclePrivKeys[i].empty())  ++loaded;
-        if (!g_vehicleCertSigs[i].empty())  ++certLoaded;
+        if (!g_vehiclePrivKeys[i].empty())        ++loaded;
+        if (!g_vehicleCertSigs[i].empty())        ++certLoaded;
+        if (!g_vehicleBeaconPrivKeys[i].empty())  ++beaconLoaded;
     }
 
-    std::cout << "[Security] Loaded ECDSA keys for " << loaded
+    std::cout << "[Security] Loaded ECDSA identity keys for " << loaded
               << "/" << N_Vehicles << " vehicles.\n";
     std::cout << "[Security] Loaded CA-signed vehicle certs for " << certLoaded
               << "/" << N_Vehicles << " vehicles.\n";
+    std::cout << "[Security] Loaded FN-DSA-1024 beacon keys for " << beaconLoaded
+              << "/" << N_Vehicles << " vehicles.\n";
+    if (beaconLoaded == 0)
+    {
+        std::cerr << "[Security] WARNING: no FN-DSA-1024 beacon keys found in "
+                  << csvPath << ".  V2V beacon signatures will be disabled.\n"
+                  << "  Regenerate with: python3 "
+                     "sybil-attack/security/generate_vehicle_keys.py --vehicles "
+                  << N_Vehicles << "\n";
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5019,9 +5664,57 @@ static void
 InitializeRsuTrustLifecycleCsv()
 {
     std::ofstream out(rsuTrustLifecycleCsv.c_str(), std::ios::out);
+    // NOTE: cross_rsu_mean_anomaly and cross_rsu_disagreement were missing from
+    // this header while LogRsuTrustLifecycleEvent has always written them, so
+    // every column from s5_score onward was mislabelled by one/two positions in
+    // any parser that trusted the header.  Fixed to match the writer's 13 fields.
     out << "time,event,rsu_id,claimed_vehicle_id,omega,s5_score,"
+        << "cross_rsu_mean_anomaly,cross_rsu_disagreement,"
         << "unsupported_approval_count,total_approval_count,role,"
         << "suspicion_flags,status\n";
+}
+
+static void
+InitializeRsuDetectionQualityCsv()
+{
+    std::ofstream out(rsuDetectionQualityCsv.c_str(), std::ios::out);
+    out << "time,rsu_id,actually_malicious,flagged_malicious,"
+        << "s5_window_score,omega,role\n";
+}
+
+// Cumulative v5 confusion matrix, written once at the end of the run.
+static void
+WriteV5DetectionSummary()
+{
+    double tp = g_v5TruePositives;
+    double fp = g_v5FalsePositives;
+    double fn = g_v5FalseNegatives;
+    double tn = g_v5TrueNegatives;
+
+    double precision = (tp + fp > 0.0) ? tp / (tp + fp) : 0.0;
+    double recall    = (tp + fn > 0.0) ? tp / (tp + fn) : 0.0;
+    double fpr       = (fp + tn > 0.0) ? fp / (fp + tn) : 0.0;
+    double mccDenom  = std::sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn));
+    double mcc       = (mccDenom > 0.0) ? ((tp * tn) - (fp * fn)) / mccDenom : 0.0;
+
+    std::ofstream out(rsuDetectionQualityCsv.c_str(), std::ios::app);
+    out << "CUMULATIVE," << g_v5DetectedRsus.size() << ","
+        << g_v5TruePositives << "," << g_v5FalsePositives << ","
+        << g_v5FalseNegatives << "," << g_v5TrueNegatives << ","
+        << mcc << "\n";
+
+    std::cout << "\n[v5 RSU detection quality]  (RSU-entity confusion matrix,"
+              << " one decision per RSU per evaluation window)\n"
+              << "  TP=" << g_v5TruePositives
+              << "  FP=" << g_v5FalsePositives
+              << "  FN=" << g_v5FalseNegatives
+              << "  TN=" << g_v5TrueNegatives << "\n"
+              << "  Precision=" << precision
+              << "  Recall=" << recall
+              << "  FPR=" << fpr
+              << "  MCC=" << mcc << "\n"
+              << "  distinct RSUs flagged=" << g_v5DetectedRsus.size() << "\n"
+              << "  -> " << rsuDetectionQualityCsv << "\n";
 }
 
 static void
@@ -5866,6 +6559,22 @@ LoadRsuPositionsFromCsv(const std::string& path)
     {
         std::cout << "[Mobility] Loaded " << loaded
                   << " RSU positions from " << path << "\n";
+
+        // Widen the registration plausibility bound to the deployment the
+        // controller actually provisioned.  Without this the hardcoded 500 m
+        // box denies every registration on a full-size map.
+        double maxX = 0.0;
+        double maxY = 0.0;
+        for (uint32_t i = 0; i < g_rsuNodes.GetN(); ++i)
+        {
+            Vector p = g_rsuNodes.Get(i)->GetObject<MobilityModel>()->GetPosition();
+            maxX = std::max(maxX, p.x);
+            maxY = std::max(maxY, p.y);
+        }
+        g_regGpsBoundX = std::max(regGpsBoundDefault, maxX + regGpsBoundMargin);
+        g_regGpsBoundY = std::max(regGpsBoundDefault, maxY + regGpsBoundMargin);
+        std::cout << "[Reg] GPS plausibility bound set from RSU deployment: "
+                  << g_regGpsBoundX << " x " << g_regGpsBoundY << " m\n";
         return true;
     }
     return false;
@@ -7218,10 +7927,10 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     CryptoPqcKemKeypair kyberKeys;
     if (FullPqcProfileActive())
     {
-        kyberKeys = CryptoKyber768Keygen();
+        kyberKeys = CryptoMlKem1024Keygen();
         if (kyberKeys.publicKey.empty() || kyberKeys.secretKey.empty())
         {
-            std::cerr << "[FullModePQC] V-Ctrl Kyber768 keygen failed vehicle=" << vehicleIndex << "\n";
+            std::cerr << "[FullModePQC] V-Ctrl ML-KEM-1024 keygen failed vehicle=" << vehicleIndex << "\n";
             return;
         }
     }
@@ -7306,7 +8015,7 @@ SendV2CtrlHello(uint32_t vehicleIndex, uint32_t rsuIndex)
               << "Vehicle=" << vehicleIndex
               << " -> RSU=" << rsuIndex
               << " (V-Ctrl E2E channel initiation, kex="
-              << (FullPqcProfileActive() ? "Kyber768" : "ECDH-P256") << ")" << std::endl;
+              << (FullPqcProfileActive() ? "ML-KEM-1024" : "ECDH-P256") << ")" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -8106,7 +8815,7 @@ SendV2IAuthChallenge(uint32_t rsuIndex, uint32_t vehicleIndex, const std::vector
             return;
         }
         CryptoPqcKemEncapsulation enc =
-            CryptoKyber768Encapsulate(g_vehicleV2IPqcKemKeys[vehicleIndex].publicKey);
+            CryptoMlKem1024Encapsulate(g_vehicleV2IPqcKemKeys[vehicleIndex].publicKey);
         ctSess = enc.ciphertext;
         kemSharedSecret = enc.sharedSecret;
     }
@@ -8152,7 +8861,7 @@ SendV2IAuthChallenge(uint32_t rsuIndex, uint32_t vehicleIndex, const std::vector
         std::cout << "[V2I-AUTH] phase2 challenge rsu=" << rsuIndex
                   << " vehicle=" << vehicleIndex
                   << " ct_sess=yes kex="
-                  << (FullPqcProfileActive() ? "ML-KEM/Kyber768" : "classical-ECDH-encapsulation")
+                  << (FullPqcProfileActive() ? "ML-KEM-1024" : "classical-ECDH-encapsulation")
                   << std::endl;
 }
 
@@ -8236,7 +8945,7 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
     proofData.push_back( vehicleId        & 0xFF);
     if (FullPqcProfileActive())
         proofData.insert(proofData.end(), helloTag.kyberPublicKey,
-                         helloTag.kyberPublicKey + KYBER768_PUBLIC_KEY_BYTES);
+                         helloTag.kyberPublicKey + MLKEM1024_PUBLIC_KEY_BYTES);
     else
         proofData.insert(proofData.end(), helloTag.ecdhPubV, helloTag.ecdhPubV + 64);
     proofData.insert(proofData.end(), helloTag.nonceV,   helloTag.nonceV   + 32);
@@ -8250,7 +8959,7 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
         return;
     }
 
-    // Step 2/3: Derive V-Ctrl session key using Kyber768 in PQC profile or ECDH otherwise.
+    // Step 2/3: Derive V-Ctrl session key using ML-KEM-1024 in PQC profile or ECDH otherwise.
     auto [ctrlEphPriv, ctrlEphPub] = CryptoEcdhKeygen();
     std::vector<uint8_t> nonceC = CryptoRandBytes(32);
     std::vector<uint8_t> vehicleEcdhPub(helloTag.ecdhPubV, helloTag.ecdhPubV + 64);
@@ -8260,11 +8969,11 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
     if (FullPqcProfileActive())
     {
         std::vector<uint8_t> kyberPubV(helloTag.kyberPublicKey,
-                                       helloTag.kyberPublicKey + KYBER768_PUBLIC_KEY_BYTES);
-        CryptoPqcKemEncapsulation enc = CryptoKyber768Encapsulate(kyberPubV);
+                                       helloTag.kyberPublicKey + MLKEM1024_PUBLIC_KEY_BYTES);
+        CryptoPqcKemEncapsulation enc = CryptoMlKem1024Encapsulate(kyberPubV);
         if (enc.sharedSecret.empty() || enc.ciphertext.empty())
         {
-            std::cerr << "[FullModePQC] Controller: V-Ctrl Kyber768 encapsulation failed vehicle="
+            std::cerr << "[FullModePQC] Controller: V-Ctrl ML-KEM-1024 encapsulation failed vehicle="
                       << vehicleId << "\n";
             return;
         }
@@ -8299,7 +9008,7 @@ HandleRelayedV2CtrlHello(uint32_t rsuIndex, uint32_t vehicleId,
     if (FullPqcProfileActive())
     {
         sigData.insert(sigData.end(), helloTag.kyberPublicKey,
-                       helloTag.kyberPublicKey + KYBER768_PUBLIC_KEY_BYTES);
+                       helloTag.kyberPublicKey + MLKEM1024_PUBLIC_KEY_BYTES);
         sigData.insert(sigData.end(), kyberCiphertext.begin(), kyberCiphertext.end());
     }
     else
@@ -8421,10 +9130,10 @@ HandleCtrl2VehicleAck(uint32_t vehicleIndex, uint32_t rsuIndex, const Ctrl2Vehic
     if (FullPqcProfileActive())
     {
         std::vector<uint8_t> ciphertext(ackTag.kyberCiphertext,
-                                        ackTag.kyberCiphertext + KYBER768_CIPHERTEXT_BYTES);
+                                        ackTag.kyberCiphertext + MLKEM1024_CIPHERTEXT_BYTES);
         sigData.insert(sigData.end(), pending.kyberPublicKey.begin(), pending.kyberPublicKey.end());
         sigData.insert(sigData.end(), ciphertext.begin(), ciphertext.end());
-        shared = CryptoKyber768Decapsulate(ciphertext, pending.kyberSecretKey);
+        shared = CryptoMlKem1024Decapsulate(ciphertext, pending.kyberSecretKey);
     }
     else
     {
@@ -8623,12 +9332,27 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 incoming.observerCount    = p.observerCount;
                 incoming.rsuReportCount   = p.reportCount;
                 incoming.suspicionFlags   = p.suspicionFlags;
+                // The batch record carries RSSI provenance and this path used to
+                // drop all four fields, so full-crypto mode — the only mode where
+                // the v5 defence runs at all — evaluated the approval on zeroed
+                // provenance and stored globally-visible records with zeroed
+                // counters.  Brought to parity with the plaintext path below.
+                incoming.rssiVerifiedCount       = p.rssiVerifiedCount;
+                incoming.rssiMismatchCount       = p.rssiMismatchCount;
+                incoming.rssiUnverifiedCount     = p.rssiUnverifiedCount;
+                incoming.rssiVerifiedProbability = p.rssiVerifiedProbability;
                 incoming.suspicionFlags  |= EvaluateTemporalBurstSignature(
                     p.servingRsuId, p.claimedVehicleId, p.lastSeenTime,
                     p.lastBsm.positionX, p.lastBsm.positionY,
                     g_sdnFirstSeenClaimedIdsByRsu, g_sdnTemporalNewIdEventsByRsu, "SDN");
                 incoming.suspicionFlags  |= EvaluateUncorroboratedRsuApproval(
-                    p.servingRsuId, p.claimedVehicleId, p.observerCount, p.reportCount);
+                    p.servingRsuId,
+                    p.claimedVehicleId,
+                    p.observerCount,
+                    p.reportCount,
+                    p.rssiVerifiedCount,
+                    p.rssiMismatchCount,
+                    p.rssiUnverifiedCount);
                 incoming.trustScore = (incoming.suspicionFlags == SUSPICION_NONE) ? 1.0 : 0.25;
 
                 auto existing = g_controllerGlobalAwarenessTable.find(incoming.claimedVehicleId);
@@ -9055,8 +9779,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                 return;
             }
             // Verify GPS bounds.
-            if (reqTag.gpsX < 0.0 || reqTag.gpsX > 500.0 ||
-                reqTag.gpsY < 0.0 || reqTag.gpsY > 500.0)
+            if (reqTag.gpsX < 0.0 || reqTag.gpsX > g_regGpsBoundX ||
+                reqTag.gpsY < 0.0 || reqTag.gpsY > g_regGpsBoundY)
             {
                 std::cout << "[Reg] Controller: REG_FORWARD nested vehicle=" << vId
                           << " GPS out of bounds — denied\n";
@@ -9154,8 +9878,8 @@ HandleRsuControllerRecordPayload(const std::string& receiverRole,
                           << " VIN NOT in whitelist — registration denied\n";
                 return;
             }
-            if (fwdTag.gpsX < 0.0 || fwdTag.gpsX > 500.0 ||
-                fwdTag.gpsY < 0.0 || fwdTag.gpsY > 500.0)
+            if (fwdTag.gpsX < 0.0 || fwdTag.gpsX > g_regGpsBoundX ||
+                fwdTag.gpsY < 0.0 || fwdTag.gpsY > g_regGpsBoundY)
             {
                 std::cout << "[Reg] Controller: REG_FORWARD vehicle=" << vId
                           << " GPS out of bounds — registration denied\n";
@@ -9691,11 +10415,11 @@ HandleChanHello(uint32_t rsuIndex, const ChanHelloTag& hello)
     if (FullPqcProfileActive())
     {
         std::vector<uint8_t> kyberPubV(hello.kyberPublicKey,
-                                       hello.kyberPublicKey + KYBER768_PUBLIC_KEY_BYTES);
-        CryptoPqcKemEncapsulation enc = CryptoKyber768Encapsulate(kyberPubV);
+                                       hello.kyberPublicKey + MLKEM1024_PUBLIC_KEY_BYTES);
+        CryptoPqcKemEncapsulation enc = CryptoMlKem1024Encapsulate(kyberPubV);
         if (enc.sharedSecret.empty() || enc.ciphertext.empty())
         {
-            std::cerr << "[FullModePQC] Kyber768 encapsulation failed RSU=" << rsuIndex
+            std::cerr << "[FullModePQC] ML-KEM-1024 encapsulation failed RSU=" << rsuIndex
                       << " vehicle=" << vehicleId << "\n";
             return;
         }
@@ -9703,7 +10427,7 @@ HandleChanHello(uint32_t rsuIndex, const ChanHelloTag& hello)
         std::memcpy(ackTag.kyberCiphertext, enc.ciphertext.data(), enc.ciphertext.size());
         sigData.insert(sigData.end(), kyberPubV.begin(), kyberPubV.end());
         sigData.insert(sigData.end(), enc.ciphertext.begin(), enc.ciphertext.end());
-        std::cout << "[FullModePQC] V-RSU Kyber768 encapsulated RSU=" << rsuIndex
+        std::cout << "[FullModePQC] V-RSU ML-KEM-1024 encapsulated RSU=" << rsuIndex
                   << " vehicle=" << vehicleId << " ct_bytes=" << enc.ciphertext.size() << "\n";
     }
     else
@@ -9806,10 +10530,10 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
     if (FullPqcProfileActive())
     {
         std::vector<uint8_t> ciphertext(ack.kyberCiphertext,
-                                        ack.kyberCiphertext + KYBER768_CIPHERTEXT_BYTES);
+                                        ack.kyberCiphertext + MLKEM1024_CIPHERTEXT_BYTES);
         sigData.insert(sigData.end(), hs.kyberPublicKey.begin(), hs.kyberPublicKey.end());
         sigData.insert(sigData.end(), ciphertext.begin(), ciphertext.end());
-        shared = CryptoKyber768Decapsulate(ciphertext, hs.kyberSecretKey);
+        shared = CryptoMlKem1024Decapsulate(ciphertext, hs.kyberSecretKey);
     }
     else
     {
@@ -9848,7 +10572,7 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
               << "  Vehicle=" << vehicleIndex
               << "  RSU=" << rsuId
               << "  (cert OK, sig OK, kex="
-              << (FullPqcProfileActive() ? "Kyber768" : "ECDH-P256") << ")" << std::endl;
+              << (FullPqcProfileActive() ? "ML-KEM-1024" : "ECDH-P256") << ")" << std::endl;
 
     // ── Decide next step based on registration/V-Ctrl status ─────────────
     bool hasToken = (vehicleIndex < g_vehicleTokens.size() &&
@@ -9921,10 +10645,10 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
     CryptoPqcKemKeypair kyberKeys;
     if (FullPqcProfileActive())
     {
-        kyberKeys = CryptoKyber768Keygen();
+        kyberKeys = CryptoMlKem1024Keygen();
         if (kyberKeys.publicKey.empty() || kyberKeys.secretKey.empty())
         {
-            std::cerr << "[FullModePQC] Kyber768 keygen failed Vehicle=" << vehicleIndex
+            std::cerr << "[FullModePQC] ML-KEM-1024 keygen failed Vehicle=" << vehicleIndex
                       << " RSU=" << rsuIndex << "\n";
             return;
         }
@@ -9962,7 +10686,7 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
               << "[SEND] [CHAN_HELLO]                "
               << "Vehicle=" << vehicleIndex
               << " -> RSU=" << rsuIndex
-              << (FullPqcProfileActive() ? " kex=Kyber768" : " kex=ECDH-P256")
+              << (FullPqcProfileActive() ? " kex=ML-KEM-1024" : " kex=ECDH-P256")
               << std::endl;
 
     sock->SendTo(pkt, 0,
@@ -9985,7 +10709,9 @@ StartCryptoVehicleRsuSession(uint32_t vehicleIndex, uint32_t rsuIndex)
         break;
 
     case CRYPTO_MECHANISM_FULL:
-        std::cout << "[FullModeAuth] starting Kyber768/ML-KEM-profile V-RSU handshake"
+        std::cout << "[FullModeAuth] starting "
+                  << (FullPqcProfileActive() ? "ML-KEM-1024" : "ECDH-P256-classical")
+                  << "-profile V-RSU handshake"
                   << " Vehicle=" << vehicleIndex
                   << " RSU=" << rsuIndex << "\n";
         SendChanHello(vehicleIndex, rsuIndex);
@@ -10032,6 +10758,252 @@ EnsureVehicleRsuSession(uint32_t vehicleIndex, uint32_t rsuIndex, const std::str
               << " — starting CHAN_HELLO on demand\n";
     Simulator::ScheduleNow(&StartCryptoVehicleRsuSession, vehicleIndex, rsuIndex);
     return false;
+}
+
+// ===========================================================================
+// Window-aligned batch verification of V2V beacons
+// (methodology Eqs. beacon_sign / batch_verify)
+//
+// Protocol.  A receiving vehicle does NOT verify a beacon on arrival.  It
+// buffers each beacon under the claimed sender identity for the duration of
+// the detection window W.  At the window boundary a single batch verification
+// runs per (observer, claimed identity) pair; only beacons that pass are
+// released to the detection pipeline.  Beacons that fail are dropped and
+// counted, and the batch rejection rate is reported as a metric.
+//
+// Security.  The exposure window during buffering equals the detection window
+// W exactly.  No detection decision for a claimed identity is made before the
+// window containing its beacons closes, so deferring verification to that same
+// boundary adds no attack surface: a forged beacon sitting in the buffer is
+// rejected by the batch check before the detection pipeline ever sees it.
+// ===========================================================================
+
+/// One buffered beacon awaiting window-boundary verification.
+struct BufferedBeacon
+{
+    SybilPacketTag       tag;
+    BsmCoreData          bsm;
+    std::vector<uint8_t> digest;      ///< SHA3-256 over the serialized BSM
+    std::vector<uint8_t> signature;   ///< FN-DSA-1024 signature
+    std::vector<uint8_t> senderPubKey;///< embedded FN-DSA-1024 public key
+    bool                 hasSignature = false;
+    uint32_t             triggerSeq = 0;
+};
+
+/// g_beaconWindowBuffer[observerVehicleId][claimedSenderId] → buffered beacons
+static std::vector<std::map<uint32_t, std::vector<BufferedBeacon>>> g_beaconWindowBuffer;
+
+// Batch verification counters, reported at end of run.
+static uint64_t g_batchWindowsExecuted   = 0;  ///< batch verify calls made
+static uint64_t g_batchBeaconsSubmitted  = 0;  ///< beacons entering batch verification
+static uint64_t g_batchBeaconsAccepted   = 0;  ///< beacons released to detection
+static uint64_t g_batchBeaconsRejected   = 0;  ///< beacons dropped as invalid
+static uint64_t g_batchWindowsRejected   = 0;  ///< windows with >=1 failing member
+
+static void
+InitializeBeaconWindowBuffers()
+{
+    g_beaconWindowBuffer.assign(N_Vehicles, {});
+}
+
+// ---------------------------------------------------------------------------
+// BufferBeaconForWindowVerification — replaces verify-on-receive.
+// Called from LogReceivedPacket for every V2V beacon arriving at a vehicle.
+// ---------------------------------------------------------------------------
+static void
+BufferBeaconForWindowVerification(uint32_t observerVehicleId,
+                                  const SybilPacketTag& tag,
+                                  const BsmCoreData& bsm,
+                                  Ptr<const Packet> packet,
+                                  uint32_t triggerSeq)
+{
+    if (observerVehicleId >= g_beaconWindowBuffer.size())
+        return;
+
+    BufferedBeacon entry;
+    entry.tag        = tag;
+    entry.bsm        = bsm;
+    entry.triggerSeq = triggerSeq;
+
+    V2VSignatureTag sigTag;
+    if (packet->PeekPacketTag(sigTag))
+    {
+        entry.hasSignature = true;
+        entry.digest    = CryptoSha3_256(SerializeBsmForSigning(bsm));
+        entry.senderPubKey.assign(sigTag.pub_key,
+                                  sigTag.pub_key + V2VSignatureTag::KEY_BYTES);
+        entry.signature.assign(sigTag.sig,
+                               sigTag.sig + V2VSignatureTag::SIG_BYTES);
+    }
+
+    g_beaconWindowBuffer[observerVehicleId][tag.GetClaimedNodeId()]
+        .push_back(std::move(entry));
+}
+
+// ---------------------------------------------------------------------------
+// DeliverVerifiedBeacon — the detection pipeline entry point.  Reached only
+// after the beacon's window has passed batch verification.
+// ---------------------------------------------------------------------------
+static void
+DeliverVerifiedBeacon(uint32_t receiverId, const BufferedBeacon& b)
+{
+    const SybilPacketTag& tag = b.tag;
+    const BsmCoreData&    bsm = b.bsm;
+    UpdateVehicleNeighborRecord(receiverId, tag, bsm, b.triggerSeq);
+
+    // ── FL Sybil Detection (MODE_BASELINE_FL = solution_mode 1) ──────────
+    // Run inference at the vehicle tier on every batch-verified V2V beacon,
+    // matching the paper's Algorithm 2 (lines 23–29): "Whenever a safety
+    // beacon reaches a vehicle, FLEMDS is utilized to verify whether the
+    // message belongs to normal flow or abnormal flow."
+    //
+    // Features are sourced from observable V2V neighbor-table state only.
+    // Ground truth IDs are used below only for metrics labels, not as model
+    // inputs.
+    // ─────────────────────────────────────────────────────────────────────
+    if (FLSolutionModeActive() && g_secMetrics)
+    {
+        uint32_t claimedId       = tag.GetClaimedNodeId();
+        bool     isActuallySybil = (tag.GetRealNodeId() != claimedId);
+        double   now            = Simulator::Now().GetSeconds();
+
+        double feat[FLSybilDetector::kNumFeatures] = {};
+
+        if (receiverId < g_vehicleNeighborTables.size() &&
+            g_vehicleNeighborTables[receiverId].count(claimedId))
+        {
+            const NeighborAwarenessRecord& rec =
+                g_vehicleNeighborTables[receiverId].at(claimedId);
+
+            auto clamp01 = [](double value) {
+                return std::max(0.0, std::min(1.0, value));
+            };
+
+            const double neighborAge =
+                std::max(0.0, rec.lastSeenTime - rec.firstSeenTime);
+            const double beaconCount =
+                std::max(1.0, static_cast<double>(rec.receivedBeaconCount));
+            const double meanBeaconInterval = neighborAge / beaconCount;
+            const double reportStaleness =
+                (rec.lastReportedToRsuTime >= 0.0)
+                    ? std::max(0.0, now - rec.lastReportedToRsuTime)
+                    : 30.0;
+            const double headingRad =
+                rec.lastBsm.heading * 3.14159265358979323846 / 180.0;
+            const double positionRadius =
+                std::sqrt(rec.lastBsm.positionX * rec.lastBsm.positionX +
+                          rec.lastBsm.positionY * rec.lastBsm.positionY);
+
+            feat[0] = clamp01(rec.lastBsm.speed / 50.0);
+            feat[1] = clamp01(rec.claimedDistance / 300.0);
+            feat[2] = clamp01(static_cast<double>(rec.receivedBeaconCount) / 20.0);
+            feat[3] = clamp01(static_cast<double>(
+                                  g_vehicleNeighborTables[receiverId].size()) / 80.0);
+            feat[4] = clamp01(neighborAge / 60.0);
+            feat[5] = clamp01(meanBeaconInterval / 5.0);
+            feat[6] = std::sin(headingRad);
+            feat[7] = std::cos(headingRad);
+            feat[8] = clamp01(reportStaleness / 30.0);
+            feat[9] = clamp01(positionRadius / 5000.0);
+        }
+
+        double pred           = FLSybilDetector::RunInference(feat);
+        bool   predictedSybil = (pred >= 0.5);
+
+        g_secMetrics->RecordFLPacketDecision(
+            claimedId, isActuallySybil, predictedSybil, "vehicle", now);
+    }
+    // ─────────────────────────────────────────────────────────────────────
+}
+
+// ---------------------------------------------------------------------------
+// FlushBeaconVerificationWindow — fires every kBatchWindowSeconds.
+// Runs one batch verification per (observer, claimed identity) pair over all
+// beacons buffered during the window, then releases the accepted ones.
+// ---------------------------------------------------------------------------
+static void
+FlushBeaconVerificationWindow()
+{
+    double now = Simulator::Now().GetSeconds();
+
+    for (uint32_t observerId = 0; observerId < g_beaconWindowBuffer.size(); ++observerId)
+    {
+        for (auto& senderEntry : g_beaconWindowBuffer[observerId])
+        {
+            uint32_t claimedId = senderEntry.first;
+            std::vector<BufferedBeacon>& beacons = senderEntry.second;
+            if (beacons.empty())
+                continue;
+
+            // Beacons carrying no signature tag (plain-network mode, or keys
+            // not loaded) bypass the batch check exactly as verify-on-receive
+            // used to accept them.
+            std::vector<std::vector<uint8_t>> digests;
+            std::vector<std::vector<uint8_t>> signatures;
+            std::vector<uint8_t> senderPubKey;
+            for (const BufferedBeacon& b : beacons)
+            {
+                if (!b.hasSignature)
+                    continue;
+                if (senderPubKey.empty())
+                    senderPubKey = b.senderPubKey;
+                digests.push_back(b.digest);
+                signatures.push_back(b.signature);
+            }
+
+            bool     batchOk     = true;
+            uint32_t failedCount = 0;
+            if (!digests.empty() && CryptoMechanismActive())
+            {
+                auto __t0 = std::chrono::high_resolution_clock::now();
+                batchOk = CryptoFnDsa1024BatchVerify(senderPubKey, digests,
+                                                     signatures, failedCount);
+                auto __t1 = std::chrono::high_resolution_clock::now();
+                double __ms =
+                    std::chrono::duration<double, std::milli>(__t1 - __t0).count();
+                std::cout << "[Latency] V2V_BATCH  vehicle/" << observerId
+                          << "  claimed=" << claimedId
+                          << "  n=" << digests.size()
+                          << "  batch_verify  " << __ms << "\n";
+
+                ++g_batchWindowsExecuted;
+                g_batchBeaconsSubmitted += digests.size();
+                g_batchBeaconsRejected  += failedCount;
+                g_batchBeaconsAccepted  += (digests.size() - failedCount);
+                if (!batchOk)
+                    ++g_batchWindowsRejected;
+            }
+
+            if (batchOk)
+            {
+                std::cout << "[t=" << now << "] "
+                          << "[Security] V2V batch VALID"
+                          << "  Observer=vehicle/" << observerId
+                          << "  Claimed=" << claimedId
+                          << "  Beacons=" << beacons.size()
+                          << std::endl;
+                for (const BufferedBeacon& b : beacons)
+                    DeliverVerifiedBeacon(observerId, b);
+            }
+            else
+            {
+                // Batch failed: the window from this claimed identity is
+                // rejected wholesale and never reaches detection.
+                std::cout << "[t=" << now << "] "
+                          << "[Security] V2V batch INVALID *** DROP WINDOW ***"
+                          << "  Observer=vehicle/" << observerId
+                          << "  Claimed=" << claimedId
+                          << "  Beacons=" << beacons.size()
+                          << "  Failed="  << failedCount
+                          << std::endl;
+            }
+
+            beacons.clear();
+        }
+    }
+
+    Simulator::Schedule(Seconds(kBatchWindowSeconds),
+                        &FlushBeaconVerificationWindow);
 }
 
 // ---------------------------------------------------------------------------
@@ -10350,7 +11322,7 @@ LogReceivedPacket(const std::string& receiverRole,
                             if (FullPqcProfileActive())
                             {
                                 if (vId < g_vehicleV2IPqcKemKeys.size())
-                                    kemSharedSecret = CryptoKyber768Decapsulate(ctSess, g_vehicleV2IPqcKemKeys[vId].secretKey);
+                                    kemSharedSecret = CryptoMlKem1024Decapsulate(ctSess, g_vehicleV2IPqcKemKeys[vId].secretKey);
                             }
                             else if (vId < g_vehicleV2IClassicalKemPriv.size())
                             {
@@ -10953,27 +11925,47 @@ LogReceivedPacket(const std::string& receiverRole,
     bool hasRsuCtrlAwareness = packet->PeekPacketTag(rsuCtrlTag);
     ControllerGlobalAwarenessRecord rsuCtrlRecord;
     if (hasRsuCtrlAwareness) rsuCtrlRecord = rsuCtrlTag.ToGlobalRecord();
-    // --- V2V Signature Verification ---
-    // Verify the ECDSA signature on every incoming V2V beacon before accepting
-    // it into the neighbor table.  The sender's public key is embedded in the
-    // V2VSignatureTag so no prior key lookup is needed.
+    // --- V2V beacon reception: window-aligned batch verification ---
+    // Beacons are no longer verified on receive.  Each receiving vehicle
+    // buffers incoming beacons per claimed sender identity for the duration of
+    // the detection window W, and a single batch verification runs at the
+    // window boundary (FlushBeaconVerificationWindow) before any beacon is
+    // handed to the detection pipeline.  See methodology Eq. batch_verify.
+    //
+    // Security property: the exposure window during buffering equals the
+    // detection window exactly, so no detection decision is reached any earlier
+    // than it would have been under verify-on-receive.
+    if (hasTag &&
+        hasBsm &&
+        receiverRole == "vehicle" &&
+        messageType == static_cast<uint32_t>(V2V_BEACON) &&
+        receiverId != tag.GetRealNodeId())
+    {
+        BufferBeaconForWindowVerification(receiverId, tag, bsm, packet, triggerSeq);
+    }
+
+    // RSU-side beacons keep immediate verification: the RSU evidence path
+    // (RecordComputedDetectionEvidence, reached via WifiMonitorSnifferRx) is
+    // not window-batched, so its signature result must be available on receive.
     bool v2vSigValid = true;  // default: accept if no signature tag (keys not loaded yet)
     if (hasTag &&
         hasBsm &&
-        (receiverRole == "vehicle" || receiverRole == "rsu_edge") &&
+        receiverRole == "rsu_edge" &&
         messageType == static_cast<uint32_t>(V2V_BEACON))
     {
         V2VSignatureTag sigTag;
         if (packet->PeekPacketTag(sigTag))
         {
             std::vector<uint8_t> payload  = SerializeBsmForSigning(bsm);
-            std::vector<uint8_t> hash     = CryptoSha256(payload);
-            std::vector<uint8_t> pubKey(sigTag.pub_key, sigTag.pub_key + 64);
-            std::vector<uint8_t> sigBytes(sigTag.sig,   sigTag.sig     + 64);
+            std::vector<uint8_t> hash     = CryptoSha3_256(payload);
+            std::vector<uint8_t> pubKey(sigTag.pub_key,
+                                        sigTag.pub_key + V2VSignatureTag::KEY_BYTES);
+            std::vector<uint8_t> sigBytes(sigTag.sig,
+                                          sigTag.sig   + V2VSignatureTag::SIG_BYTES);
             if (CryptoMechanismActive())
             {
                 auto __t0 = std::chrono::high_resolution_clock::now();
-                v2vSigValid = CryptoEcdsaVerify(pubKey, hash, sigBytes);
+                v2vSigValid = CryptoFnDsa1024Verify(pubKey, hash, sigBytes);
                 auto __t1 = std::chrono::high_resolution_clock::now();
                 double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
                 std::cout << "[Latency] V2V_BEACON  " << receiverRole << "/" << receiverId
@@ -11012,80 +12004,6 @@ LogReceivedPacket(const std::string& receiverRole,
             std::cout << "[Latency] V2V_BEACON  " << receiverRole << "/" << receiverId
                       << "  verify  0.000\n";
         }
-    }
-
-    if (hasTag &&
-        hasBsm &&
-        receiverRole == "vehicle" &&
-        messageType == static_cast<uint32_t>(V2V_BEACON) &&
-        receiverId != tag.GetRealNodeId() &&
-        v2vSigValid)
-    {
-        UpdateVehicleNeighborRecord(receiverId, tag, bsm, triggerSeq);
-
-        // ── FL Sybil Detection (MODE_BASELINE_FL = solution_mode 1) ──────────
-        // Run inference at the vehicle tier on every received V2V beacon,
-        // matching the paper's Algorithm 2 (lines 23–29): "Whenever a safety
-        // beacon reaches a vehicle, FLEMDS is utilized to verify whether the
-        // message belongs to normal flow or abnormal flow."
-        //
-        // Features are sourced from observable V2V neighbor-table state only.
-        // Ground truth IDs are used below only for metrics labels, not as model
-        // inputs.
-        // ─────────────────────────────────────────────────────────────────────
-        if (FLSolutionModeActive() && g_secMetrics)
-        {
-            uint32_t claimedId       = tag.GetClaimedNodeId();
-            bool     isActuallySybil = (tag.GetRealNodeId() != claimedId);
-            double   now            = Simulator::Now().GetSeconds();
-
-            double feat[FLSybilDetector::kNumFeatures] = {};
-
-            if (receiverId < g_vehicleNeighborTables.size() &&
-                g_vehicleNeighborTables[receiverId].count(claimedId))
-            {
-                const NeighborAwarenessRecord& rec =
-                    g_vehicleNeighborTables[receiverId].at(claimedId);
-
-                auto clamp01 = [](double value) {
-                    return std::max(0.0, std::min(1.0, value));
-                };
-
-                const double neighborAge =
-                    std::max(0.0, rec.lastSeenTime - rec.firstSeenTime);
-                const double beaconCount =
-                    std::max(1.0, static_cast<double>(rec.receivedBeaconCount));
-                const double meanBeaconInterval = neighborAge / beaconCount;
-                const double reportStaleness =
-                    (rec.lastReportedToRsuTime >= 0.0)
-                        ? std::max(0.0, now - rec.lastReportedToRsuTime)
-                        : 30.0;
-                const double headingRad =
-                    rec.lastBsm.heading * 3.14159265358979323846 / 180.0;
-                const double positionRadius =
-                    std::sqrt(rec.lastBsm.positionX * rec.lastBsm.positionX +
-                              rec.lastBsm.positionY * rec.lastBsm.positionY);
-
-                feat[0] = clamp01(rec.lastBsm.speed / 50.0);
-                feat[1] = clamp01(rec.claimedDistance / 300.0);
-                feat[2] = clamp01(static_cast<double>(rec.receivedBeaconCount) / 20.0);
-                feat[3] = clamp01(static_cast<double>(
-                                      g_vehicleNeighborTables[receiverId].size()) / 80.0);
-                feat[4] = clamp01(neighborAge / 60.0);
-                feat[5] = clamp01(meanBeaconInterval / 5.0);
-                feat[6] = std::sin(headingRad);
-                feat[7] = std::cos(headingRad);
-                feat[8] = clamp01(reportStaleness / 30.0);
-                feat[9] = clamp01(positionRadius / 5000.0);
-            }
-
-            double pred           = FLSybilDetector::RunInference(feat);
-            bool   predictedSybil = (pred >= 0.5);
-
-            g_secMetrics->RecordFLPacketDecision(
-                claimedId, isActuallySybil, predictedSybil, "vehicle", now);
-        }
-        // ─────────────────────────────────────────────────────────────────────
     }
     out << Simulator::Now().GetSeconds() << ","
         << MessageTypeToString(messageType) << ","
@@ -12456,7 +13374,7 @@ main(int argc, char* argv[])
     cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
     cmd.AddValue("solution_mode",              "Solution mode: 1=FLEMDS FL 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=no detection",solution_mode);
-    cmd.AddValue("full_crypto_profile",       "Inside solution_mode=5: 1=current classical full, 2=real PQC Kyber768 + Dilithium/ML-DSA-65", full_crypto_profile);
+    cmd.AddValue("full_crypto_profile",       "Inside solution_mode=5: 1=current classical full, 2=real PQC ML-KEM-1024 + ML-DSA-87 + FN-DSA-1024 beacons", full_crypto_profile);
     cmd.AddValue("proposed_method",            "Legacy alias: 0=none 1=old rule/lightweight 2=old ML 3=old FL 4=old hybrid/full",proposed_method);
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
     cmd.AddValue("v2vReliableRange",           "Reliable local V2V beacon evaluation radius in metres", v2vReliableRange);
@@ -12488,6 +13406,13 @@ main(int argc, char* argv[])
     cmd.AddValue("rsuTrustPenalty",            "Trust penalty applied when S5 exceeds theta_5", rsuTrustPenalty);
     cmd.AddValue("rsuTrustAnomalyThreshold",   "S5 approval-anomaly threshold for RSU trust demotion", rsuTrustAnomalyThreshold);
     cmd.AddValue("rsuTrustDisagreementEpsilon", "epsilon_5 deviation from cross-RSU mean S5 required before RSU trust penalty", rsuTrustDisagreementEpsilon);
+    cmd.AddValue("sdnAttestationCheckEnabled", "SDN verifies RSU-asserted identities against its own token-issuance ledger (T_valid)", sdnAttestationCheckEnabled);
+    cmd.AddValue("sdnAttestationGraceReports", "Report epochs an identity may stay unattested before counting against the RSU", sdnAttestationGraceReports);
+    cmd.AddValue("rsuTrustWindowInterval", "Seconds per Eq. 3.9 RSU approval-anomaly evaluation window", rsuTrustWindowInterval);
+    cmd.AddValue("rsuTrustWindowAnomalyThreshold", "theta_5 for the windowed Eq. 3.9 score (attestation-based numerator)", rsuTrustWindowAnomalyThreshold);
+    cmd.AddValue("rsuTrustWindowedS5Enabled", "Drive omega from the windowed Eq. 3.9 score instead of the legacy cumulative event ratio", rsuTrustWindowedS5Enabled);
+    cmd.AddValue("rsuTrustImmediateRevoke", "Alg. 7 lines 5-6: revoke on the S5/epsilon_5 condition without waiting for omega decay", rsuTrustImmediateRevoke);
+    cmd.AddValue("v5EnforcementEnabled", "Allow the v5 verdict to act (penalise omega + revoke). false = observation-only, leaves every other log and the trace untouched", v5EnforcementEnabled);
     cmd.AddValue("weightedDetectionConsensusThreshold", "theta_consensus for weighted RSU detection votes in full mode", weightedDetectionConsensusThreshold);
     cmd.AddValue("llmRevokeMinWindows", "Full-mode FP safety: distinct score windows a REAL id (< N_Vehicles) must be flagged in before the LLM detector revokes it (fake ids revoke on window 1; 1 disables the filter)", llmRevokeMinWindows);
     cmd.AddValue("llmEnsembleGate", "Full-mode throughput: ŷ_ens threshold to send an identity to the 3-agent LLM (below = ensemble-cleared legit, no LLM call)", llmEnsembleGate);
@@ -12553,6 +13478,8 @@ main(int argc, char* argv[])
         // dataset run folders hold communication/table CSV logs only.
         rsuApprovalLogCsv = outputDir + "/rsu_approval_log.csv";
         controllerLogCsv  = outputDir + "/controller_log.csv";
+        rsuTrustLifecycleCsv   = outputDir + "/rsu_trust_lifecycle_log.csv";
+        rsuDetectionQualityCsv = outputDir + "/metrics_v5_rsu_detection_quality.csv";
         // Make sure the run folder (and the revocation-manifest subdir) exist — the flag
         // says "must exist", but a fresh datasets/<run> folder usually won't yet.
         std::system(("mkdir -p " + outputDir + "/ipfs-revocation-manifests").c_str());
@@ -12683,9 +13610,15 @@ main(int argc, char* argv[])
     // Auto-generate key/VIN CSV files if missing or if node counts changed.
     EnsureKeyFilesExist();
 
-    // Load ECDSA vehicle keys from CSV (generated by generate_vehicle_keys.py).
-    // Must run after N_Vehicles is finalised.
+    // Load FN-DSA-1024 vehicle keys from CSV (generated by
+    // generate_vehicle_keys.py).  Must run after N_Vehicles is finalised.
     LoadVehicleKeys();
+
+    // Window-aligned batch verification: allocate the per-vehicle beacon
+    // buffers and arm the periodic window-boundary flush.
+    InitializeBeaconWindowBuffers();
+    Simulator::Schedule(Seconds(kBatchWindowSeconds),
+                        &FlushBeaconVerificationWindow);
     // Load CA public key and RSU keypairs + certificates.
     // Must run after N_Vehicles and N_RSUs are finalised.
     LoadCaAndRsuKeys();
@@ -12818,6 +13751,7 @@ main(int argc, char* argv[])
     InitializeControllerGlobalAwarenessCsv();
     InitializeRssiVerificationCsv();
     InitializeRsuTrustLifecycleCsv();
+    InitializeRsuDetectionQualityCsv();
 
     if (!g_datasetMode.empty())
     {
@@ -13340,7 +14274,7 @@ main(int argc, char* argv[])
         std::cout << "[LLMRealtime] full-mode detection ARMED"
                   << " crypto=" << (FullCryptoMechanismActive() ? FullCryptoProfileName()
                                                                 : "INACTIVE(g_secEnabled off)")
-                  << " signatures=" << (FullPqcProfileActive() ? "Dilithium/ML-DSA-65+Kyber768"
+                  << " signatures=" << (FullPqcProfileActive() ? "FN-DSA-1024+ML-DSA-87+ML-KEM-1024"
                                                                : "current-ECDSA")
                   << " consensus_theta=" << weightedDetectionConsensusThreshold
                   << " real_id_min_windows=" << llmRevokeMinWindows
@@ -13368,10 +14302,60 @@ main(int argc, char* argv[])
             LLMRealtimeDetector::Init(10.0);
         }
     }
+
+    // v5 control-plane detector: close the first Eq. (3.9) evaluation window
+    // one interval after the attack can first inject, then self-reschedule.
+    if (FullCryptoMechanismActive() && rsuTrustWindowedS5Enabled)
+    {
+        Simulator::Schedule(Seconds(std::max(0.1, rsuTrustWindowInterval)),
+                            &EvaluateRsuApprovalWindow);
+    }
+
     Simulator::Run();
     Simulator::Destroy();
     if (FullSolutionModeActive() && p4SelfTestRealId == 0)
         LLMRealtimeDetector::FinalizeAndReport();
+    if (FullCryptoMechanismActive() && rsuTrustWindowedS5Enabled)
+        WriteV5DetectionSummary();
+
+    // --- Window-aligned batch verification summary (Eq. batch_verify) ---
+    {
+        double beaconRejectRate =
+            (g_batchBeaconsSubmitted > 0)
+                ? static_cast<double>(g_batchBeaconsRejected) /
+                      static_cast<double>(g_batchBeaconsSubmitted)
+                : 0.0;
+        double windowRejectRate =
+            (g_batchWindowsExecuted > 0)
+                ? static_cast<double>(g_batchWindowsRejected) /
+                      static_cast<double>(g_batchWindowsExecuted)
+                : 0.0;
+        double meanBatchSize =
+            (g_batchWindowsExecuted > 0)
+                ? static_cast<double>(g_batchBeaconsSubmitted) /
+                      static_cast<double>(g_batchWindowsExecuted)
+                : 0.0;
+
+        std::cout << "\n[BatchVerify] === Window-aligned batch verification ===\n"
+                  << "[BatchVerify] windows_executed      = " << g_batchWindowsExecuted << "\n"
+                  << "[BatchVerify] beacons_submitted     = " << g_batchBeaconsSubmitted << "\n"
+                  << "[BatchVerify] beacons_accepted      = " << g_batchBeaconsAccepted << "\n"
+                  << "[BatchVerify] beacons_rejected      = " << g_batchBeaconsRejected << "\n"
+                  << "[BatchVerify] mean_batch_size       = " << meanBatchSize << "\n"
+                  << "[BatchVerify] beacon_rejection_rate = " << beaconRejectRate << "\n"
+                  << "[BatchVerify] window_rejection_rate = " << windowRejectRate << "\n"
+                  << std::endl;
+
+        std::ofstream bv("sybil-attack/outputs/batch_verification_summary.csv",
+                         std::ios::out);
+        bv << "run_id,windows_executed,beacons_submitted,beacons_accepted,"
+              "beacons_rejected,mean_batch_size,beacon_rejection_rate,"
+              "window_rejection_rate\n"
+           << g_runId << "," << g_batchWindowsExecuted << ","
+           << g_batchBeaconsSubmitted << "," << g_batchBeaconsAccepted << ","
+           << g_batchBeaconsRejected << "," << meanBatchSize << ","
+           << beaconRejectRate << "," << windowRejectRate << "\n";
+    }
 
     WriteMetricsRow(simTime);
     WriteFinalSummary();

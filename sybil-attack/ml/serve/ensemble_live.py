@@ -26,6 +26,14 @@ DEFAULT_LAMBDAS = os.path.join(FUSION_OUT, "ensemble_lambdas.json")
 
 TERMS = ["y_hat_i_fused", "p_bar_temp", "p_bar_rssi"]   # ŷ_i, p̄_temp, p̄_rssi
 
+# ── ablation hooks (default off; used only by the B1/B2 in-sim ablations) ──
+# B1: which vehicle-tier φ-block to zero out of the Eq 3.18 head → prefix in phi_cols.
+_ABLATE_BLOCK_PREFIX = {"rssi": "phi_rssi_", "temp": "phi_temp_", "trust": "phi_trust_"}
+# B2: pin the Eq 3.20 λ to a single evidence stream (renorm makes it that term alone).
+STREAM_LAMBDAS = {"fl_only":   [1.0, 0.0, 0.0],   # ŷ_i only
+                  "temp_only": [0.0, 1.0, 0.0],   # p̄_temp only
+                  "rssi_only": [0.0, 0.0, 1.0]}   # p̄_rssi only
+
 
 class FusionHeadLive:
     """Eq 3.18 linear head applied to live φ (weights loaded, never refit)."""
@@ -40,6 +48,26 @@ class FusionHeadLive:
     def load(cls, path=DEFAULT_WEIGHTS):
         d = json.loads(open(path).read())
         return cls(d["phi_cols"], d["weight"], d["bias"], d["impute_fill"])
+
+    def ablate_block(self, block):
+        """B1 leave-one-out: zero the named φ-block's weights, then renormalize the
+        surviving weights so ‖w‖ is preserved (identical to the offline
+        ablation/ml_layer/b1_vehicle_tier_contrib.ablate_weights). block ∈
+        {rssi,temp,trust}; None/'none'/'' is a no-op. Returns self for chaining."""
+        if not block or block == "none":
+            return self
+        if block not in _ABLATE_BLOCK_PREFIX:
+            raise ValueError(f"ablate_block: unknown block {block!r} "
+                             f"(expected {list(_ABLATE_BLOCK_PREFIX)})")
+        prefix = _ABLATE_BLOCK_PREFIX[block]
+        mask = np.array([c.startswith(prefix) for c in self.phi_cols])
+        full_norm = np.linalg.norm(self.w)
+        self.w = self.w.copy()
+        self.w[mask] = 0.0
+        surv_norm = np.linalg.norm(self.w)
+        if surv_norm > 0:                       # renormalize survivors to full magnitude
+            self.w *= full_norm / surv_norm
+        return self
 
     def apply(self, df):
         """Add `y_hat_i_fused` = σ(w·φ+b) per row; absent φ blocks mean-imputed."""
