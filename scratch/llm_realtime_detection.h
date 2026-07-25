@@ -62,7 +62,11 @@ struct Verdict
 static double      g_interval = 10.0;   // sim-seconds between SCORE requests
 static double      g_detectLatency = 0.0;  // modeled detection latency (verdict applied at t+L)
 static double      g_ensembleGate = 0.5;   // ŷ_ens threshold to send an id to the LLM (pre-filter A)
-static int         g_maxLlmCandidates = 48;// top-K by ŷ_ens adjudicated by the 3 agents/window (B)
+static int         g_maxLlmCandidates = 2000;// top-K by ŷ_ens adjudicated by the 3 agents/window (B).
+                                            // Effectively uncapped at this scale (measured <=~490
+                                            // above-gate candidates/window); a low cap silently
+                                            // throttles recall (cap=48 gave in-sim recall 0.19 vs
+                                            // 0.96 uncapped). Lower it to trade recall for runtime.
 static int         g_maxIdentities = 0;    // hard ceiling on rows/window (0 = none)
 static std::string g_sock   = "/tmp/sybil_rt_detect.sock";       // MUST be < 108 chars
 static std::string g_runDir = "sybil-attack/outputs";            // where the sim writes logs

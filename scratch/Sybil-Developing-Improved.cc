@@ -133,8 +133,10 @@ uint32_t llmRevokeMinWindows = 2;            ///< Phase-4 FP safety: a REAL id (
 double   llmEnsembleGate = 0.5;              ///< Full-mode throughput: ŷ_ens threshold to send an id
                                              ///< to the 3-agent LLM; below it the ensemble clears it
                                              ///< as legit with no LLM call (pre-filter A).
-uint32_t llmMaxCandidates = 48;              ///< Top-K identities/window (by ŷ_ens) adjudicated by
-                                             ///< the LLM; raise for dense-attack runs (pre-filter B).
+uint32_t llmMaxCandidates = 2000;            ///< Top-K identities/window (by ŷ_ens) adjudicated by
+                                             ///< the LLM (pre-filter B). Effectively uncapped at this
+                                             ///< scale; a low cap throttles recall (cap=48 → in-sim
+                                             ///< recall 0.19 vs 0.96 uncapped). Lower = less runtime.
 uint32_t llmMaxIdentities = 0;               ///< Hard ceiling on identities considered/window (0=none).
 uint32_t p4SelfTestRealId = 0;               ///< >0: run the P4 FP-safety self-test on this REAL
                                              ///< vehicle id instead of the daemon (proves the

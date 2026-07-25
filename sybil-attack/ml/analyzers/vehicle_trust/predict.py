@@ -53,13 +53,15 @@ EVIDENCE_COLS = ["rssi_mismatch_frac", "identity_lifetime",
                  "rsu_report_count", "rsu_verified_prob", "ctrl_trust"]
 
 
-def build_windows_live(run_dir, hp, t=None, run_id="live", window_w=10, nrows=None, rows=None):
+def build_windows_live(run_dir, hp, t=None, run_id="live", window_w=10, nrows=None, rows=None,
+                       rssi_rows=None):
     """Causal, label-free twin of trust_v2_lib.build_run_windows.
 
     Reads the neighbor(+rssi+consensus) logs of `run_dir` up to time t (inclusive),
     keeps ALL identities, and returns the enriched per-(observer, claimed, window)
     trust table. `rows`: pre-read neighbor DataFrame already filtered to <= t (daemon
-    LogCache fast path). `nrows` bounds the raw CSV read (earliest rows) for quick tests.
+    LogCache fast path). `rssi_rows`: likewise for the RSSI log — see the merge below.
+    `nrows` bounds the raw CSV read (earliest rows) for quick tests.
     """
     run_dir = Path(run_dir)
     if rows is not None:
@@ -91,12 +93,21 @@ def build_windows_live(run_dir, hp, t=None, run_id="live", window_w=10, nrows=No
     ).astype(int)
 
     # ── RSSI verification as-of merge (per observer+claimed) — verbatim logic ──
+    # `rssi_rows`: pre-read RSSI slice from the daemon's LogCache (fast path). The merge
+    # below is as-of on time with a 0.5 s tolerance, so any slice that covers the neighbor
+    # rows' span padded past that tolerance yields IDENTICAL matches to the full-history
+    # read it replaces — without re-parsing a several-hundred-MB CSV on every window.
     rssi_path = run_dir / T.RSSI_LOG
-    if rssi_path.exists() and rssi_path.stat().st_size > 100:
+    if rssi_rows is not None:
+        rssi = rssi_rows
+    elif rssi_path.exists() and rssi_path.stat().st_size > 100:
         rssi = pd.read_csv(rssi_path, usecols=lambda c: c in T.RSSI_COLS, nrows=nrows)
+    else:
+        rssi = None
+    if rssi is not None and len(rssi):
         if t is not None:
             rssi = rssi[rssi["time"] <= float(t)]
-        rssi = rssi.dropna(subset=["time", "observer_vehicle_id", "observed_claimed_id"])
+        rssi = rssi.dropna(subset=["time", "observer_vehicle_id", "observed_claimed_id"]).copy()
         rssi["observer_vehicle_id"] = rssi["observer_vehicle_id"].astype("int64")
         rssi["observed_claimed_id"] = rssi["observed_claimed_id"].astype("int64")
         rssi["rssi_dbm"] = rssi["rssi_dbm"].astype("float32")
@@ -198,10 +209,12 @@ class TrustPredictor:
                 agg[c] = "mean"
         return out.groupby(key, as_index=False).agg(agg)
 
-    def score_logs(self, run_dir, t=None, run_id="live", window_w=10, nrows=None, rows=None):
+    def score_logs(self, run_dir, t=None, run_id="live", window_w=10, nrows=None, rows=None,
+                   rssi_rows=None):
         """Score a run's logs up to time t; returns pooled spine-schema DataFrame."""
         w = build_windows_live(run_dir, self.hp, t=t, run_id=run_id,
-                               window_w=window_w, nrows=nrows, rows=rows)
+                               window_w=window_w, nrows=nrows, rows=rows,
+                               rssi_rows=rssi_rows)
         if w is None or w.empty:
             return pd.DataFrame()
         return self.score_windows(w)

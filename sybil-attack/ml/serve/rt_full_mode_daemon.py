@@ -47,6 +47,13 @@ import agents as A                       # noqa: E402
 import constants as C                    # noqa: E402
 
 
+# Lower-bound pad on the trust analyzer's rssi slice. Its as-of merge tolerance is 0.5 s
+# (vehicle_trust/predict.py); padding wider than that guarantees a neighbor row sitting
+# exactly at `lo` still sees an rssi row just below it, so the cached slice reproduces the
+# full-history read exactly. -inf - pad is still -inf, so the uncapped path is unaffected.
+RSSI_ASOF_TOL = 1.0
+
+
 def _load_predictor(name, relpath):
     spec = importlib.util.spec_from_file_location(name, os.path.join(_HERE, "..", relpath))
     m = importlib.util.module_from_spec(spec)
@@ -64,8 +71,8 @@ def _confidence(d_row, dg):
 
 class Daemon:
     def __init__(self, run_dir, cap=None, carry_forward=True, tol=20.0,
-                 batch=16, max_new=128, agent_device=0, max_identities=None,
-                 window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=48):
+                 batch=64, max_new=128, agent_device=0, max_identities=None,
+                 window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=2000):
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
@@ -113,7 +120,10 @@ class Daemon:
         _comm_cols = set(txgb.USE_COLS) | set(ML.MOBILITY_COLS)
         self.comm_cache = LC.LogCache(os.path.join(rd, "communication_log.csv"),
                                       (lambda c: c in _comm_cols), "receive_time", nrows=cap)
-        _rssi_cols = set(rssi.RSSI_USE) | set(rxgb.RSSI_USE)   # CNN needs 5, XGB needs 7
+        # CNN needs 5, XGB needs 7, and the trust analyzer's RSSI as-of merge needs
+        # T.RSSI_COLS — folding the union in here lets trust read the SAME cache instead
+        # of re-parsing the (several-hundred-MB) rssi CSV from disk on every window.
+        _rssi_cols = set(rssi.RSSI_USE) | set(rxgb.RSSI_USE) | set(trust.T.RSSI_COLS)
         self.rssi_cache = LC.LogCache(os.path.join(rd, "rssi_verification_log.csv"),
                                       (lambda c: c in _rssi_cols), "time", nrows=cap)
         self.nb_cache = LC.LogCache(os.path.join(rd, trust.T.NEIGHBOR_LOG),
@@ -151,10 +161,14 @@ class Daemon:
         if len(t_df) == 0:
             return []
         r_df = self.rssi.score_logs(self.run_dir, t=t, run_id=self.run_id, rows=rssi_recent)
-        # trust neighbor read cached (rows=); its internal rssi/consensus merges still
-        # read from disk (capped) — a secondary follow-up to cache too.
+        # trust reads BOTH its logs from cache now (neighbor via rows=, rssi via
+        # rssi_rows=). The rssi slice is padded below `lo` by RSSI_ASOF_TOL so the 0.5 s
+        # as-of merge sees every match the old full-history disk read would have — the
+        # bounded slice is exactly equivalent, not an approximation. Only the tiny
+        # (~200 KB) consensus logs are still read from disk per window.
+        rssi_trust = self.rssi_cache.between(lo - RSSI_ASOF_TOL, t)
         u_df = self.trust.score_logs(self.run_dir, t=t, run_id=self.run_id,
-                                     nrows=self.cap, rows=nb_recent)
+                                     nrows=self.cap, rows=nb_recent, rssi_rows=rssi_trust)
         # RSU-tier XGBs (Eq 3.19): p̄_temp from the comm log, p̄_rssi from the rssi log.
         # Both are now BOUNDED-incremental like the vehicle-tier models. rssi-XGB features are
         # all window-local → the recent slice suffices. temporal-XGB has two cumulative features
@@ -339,14 +353,18 @@ def main():
     ap.add_argument("--tol", type=float, default=20.0)
     ap.add_argument("--window-margin", type=float, default=30.0,
                     help="bounded incremental windowing lookback (s) for GRU/CNN/trust")
-    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--batch", type=int, default=64,
+                    help="LLM generation batch size (measured sweet spot on RTX 5090; "
+                         "16->64 ~1.9x throughput, 64->96 only +11%)")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--once", type=float, default=None, help="score once at t and print (no socket)")
     ap.add_argument("--max-identities", type=int, default=None, help="hard ceiling on rows/window")
     ap.add_argument("--ensemble-gate", type=float, default=0.5,
                     help="ŷ_ens threshold to send an identity to the LLM (below = ensemble-cleared d=0)")
-    ap.add_argument("--max-llm-candidates", type=int, default=48,
-                    help="max identities/window adjudicated by the 3 agents (top-K by ŷ_ens)")
+    ap.add_argument("--max-llm-candidates", type=int, default=2000,
+                    help="max identities/window adjudicated by the 3 agents (top-K by ŷ_ens); "
+                         "effectively uncapped at this scale — a low cap throttles recall "
+                         "(cap=48 gave in-sim recall 0.19 vs 0.96 uncapped)")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
 

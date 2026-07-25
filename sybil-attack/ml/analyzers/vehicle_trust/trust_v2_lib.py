@@ -50,7 +50,12 @@ DATA_ROOT = (_HERE / ".." / ".." / "datasets").resolve()
 # ── Shared fusion spine (single source of truth for identity subsample + split +
 #    2 s export grid). Makes trust align with RSSI & GRU so the phi tables join. ──
 import sys as _sys
-_sys.path.insert(0, str(_HERE.parent / "fusion"))
+# fusion package lives at ml/fusion (= _HERE.parents[1]/"fusion"); the pre-reorg
+# _HERE.parent/"fusion" (ml/analyzers/fusion) no longer exists. Try the correct
+# location first, keep the old one as a fallback for any un-migrated checkout.
+for _fdir in (_HERE.parents[1] / "fusion", _HERE.parent / "fusion"):
+    if (_fdir / "identity_manifest.py").exists():
+        _sys.path.insert(0, str(_fdir)); break
 import identity_manifest as IDM
 ARTIFACTS_DIR = IDM.ARTIFACTS_DIR
 _MAN = None
@@ -315,60 +320,179 @@ def _first_mode(s):
     return m.iloc[0] if len(m) else np.nan
 
 
+def _mode_by(d, key, col, idx):
+    """Per-group equivalent of `_first_mode` (= Series.mode().iloc[0]): the most
+    frequent value, ties broken by the SMALLEST value (mode() returns them sorted).
+    Groups whose values are all-NaN drop out of the count and come back as NaN,
+    matching `_first_mode`'s empty-mode -> np.nan."""
+    vc = d.groupby(key + [col], sort=False).size().rename("_n").reset_index()
+    vc = vc.sort_values(key + ["_n", col],
+                        ascending=[True] * len(key) + [False, True], kind="stable")
+    return vc.groupby(key, sort=True)[col].first().reindex(idx)
+
+
 def _aggregate_windows(df: pd.DataFrame, window: int) -> pd.DataFrame:
     """Tumbling W-beacon windows per (run_id, observer, claimed_id). window_start
-    is in SECONDS (data contract). Aggregates the enriched signals."""
-    rows = []
+    is in SECONDS (data contract). Aggregates the enriched signals.
+
+    Vectorised: one pass of groupby aggregations keyed on (group, chunk) rather than
+    building a dict per window in Python. The loop this replaces cost ~20 ms per output
+    window (~30 pandas scalar ops over a ~10-row slice each) and measured 95% of the
+    whole trust analyzer. Output is row-for-row identical to the loop, including the
+    mode tie-break, the nan-with-default fallbacks and the iat-entropy edge cases.
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
     min_dur = 0.5 / R_NOM_DEFAULT
     gcols = ["run_id", "observer_vehicle_id", "observed_claimed_id"]
     has_life = {"first_seen_time", "last_seen_time"}.issubset(df.columns)
-    for key, g in df.groupby(gcols, sort=False):
-        g = g.sort_values("time")
-        n = len(g)
-        for start in range(0, n, window):
-            c = g.iloc[start:start + window]
-            if len(c) < 1:
-                continue
-            dur = max(c["time"].iloc[-1] - c["time"].iloc[0], min_dur)
-            brate = (len(c) - 1) / dur if len(c) > 1 else 0.0
-            traj = c.loc[c["traj_shadow_compared"] == 1, "traj_shadow_score"]
-            life = (float(c["last_seen_time"].max() - c["first_seen_time"].min())
-                    if has_life else np.nan)
-            rows.append({
-                "run_id": key[0], "observer_vehicle_id": key[1], "observed_claimed_id": key[2],
-                "observed_real_id": _first_mode(c["observed_real_id"]),
-                "window_start": float(c["time"].iloc[0]), "window_end": float(c["time"].iloc[-1]),
-                "n_beacons": len(c), "n_beacons_norm": len(c) / window, "beacon_rate": brate,
-                "rssi_mean": c["rssi_dbm"].mean(),
-                # enriched RSSI verification
-                "rssi_mismatch_frac": float(c["rssi_mismatch_flag"].mean()),
-                "mismatch_m_mean": float(np.nanmean(c["mismatch_m"])) if c["mismatch_m"].notna().any() else 0.0,
-                # enriched persistence
-                "identity_lifetime": life if np.isfinite(life) else 0.0,
-                "beacon_count_mean": float(c["received_beacon_count"].mean()),
-                # enriched cross-tier consensus (nan-safe means)
-                "rsu_observer_count": float(np.nanmean(c["rsu_observer_count"])) if "rsu_observer_count" in c and c["rsu_observer_count"].notna().any() else 0.0,
-                "rsu_report_count": float(np.nanmean(c["rsu_report_count"])) if "rsu_report_count" in c and c["rsu_report_count"].notna().any() else 0.0,
-                "rsu_verified_prob": float(np.nanmean(c["rsu_verified_prob"])) if "rsu_verified_prob" in c and c["rsu_verified_prob"].notna().any() else 0.5,
-                "rsu_false_decision": float(np.nanmax(c["rsu_false_decision"])) if "rsu_false_decision" in c and c["rsu_false_decision"].notna().any() else 0.0,
-                "ctrl_trust": float(np.nanmean(c["ctrl_trust"])) if "ctrl_trust" in c and c["ctrl_trust"].notna().any() else 1.0,
-                "ctrl_observer_count": float(np.nanmean(c["ctrl_observer_count"])) if "ctrl_observer_count" in c and c["ctrl_observer_count"].notna().any() else 0.0,
-                # signatures / flags
-                "token_valid": int(_first_mode(c["token_valid"])),
-                "any_suspicion": int((c["suspicion_flags"].astype(int) != 0).any()),
-                "range_anomaly": int(c["range_anomaly"].any()),
-                "rssi_distance_mismatch": int(c["rssi_distance_mismatch"].any()),
-                "rssi_colocation": int(c["rssi_colocation"].any()),
-                "trajectory_shadowing": int(c["trajectory_shadowing"].any()),
-                "traj_shadow_score": float(traj.mean()) if len(traj) else 0.0,
-                "traj_shadow_compared": int(c["traj_shadow_compared"].any()),
-                "iat_entropy": iat_entropy(c["time"].to_numpy()),
-                "label": int(c["is_sybil"].max()),
-                "attack_type": int(c["attack_type"].iloc[0]) if int(c["is_sybil"].max()) else 0,
-                "rsu_id": int(_first_mode(c["rsu_id"])), "controller_id": 0,
-                "attack_percentage": int(c["attack_percentage"].iloc[0]),
-            })
-    return pd.DataFrame(rows)
+
+    # Reproduce the loop's row order EXACTLY. It took groups in FIRST-APPEARANCE order
+    # (groupby sort=False) and ran `sort_values("time")` INSIDE each group. That sort is
+    # numpy quicksort, which is UNSTABLE, so equal timestamps get a group-local permutation
+    # a single global sort does not reproduce — and because tumbling chunks are positional,
+    # a different tie order puts different beacons in different windows (measurably shifts
+    # beacon_count_mean). So: make groups contiguous with a stable sort, which preserves
+    # input order within a group, then quicksort each group's times exactly as pandas did.
+    d = df.copy()
+    d["_g"] = d.groupby(gcols, sort=False).ngroup()
+    d = d[d["_g"] >= 0]                       # ngroup marks NaN-key rows -1; groupby drops them
+    if d.empty:
+        return pd.DataFrame()
+    d = d.sort_values("_g", kind="stable")
+    gv, tv0 = d["_g"].to_numpy(), d["time"].to_numpy()
+    starts = np.flatnonzero(np.r_[True, gv[1:] != gv[:-1]])
+    ends = np.r_[starts[1:], len(gv)]
+    order = np.empty(len(gv), dtype=np.int64)
+    for s, e in zip(starts, ends):           # one argsort per group, not per window
+        order[s:e] = s + np.argsort(tv0[s:e], kind="quicksort")
+    d = d.take(order).reset_index(drop=True)
+    d["_c"] = d.groupby("_g", sort=False).cumcount() // window
+    key = ["_g", "_c"]
+    G = d.groupby(key, sort=True)             # sorted (_g,_c) == the loop's emission order
+    size = G.size()
+    idx, nb, K = size.index, size.to_numpy(), len(size)
+    codes = d.groupby(key, sort=False).ngroup().to_numpy()   # d is sorted -> 0..K-1
+
+    # time is NaN-free (LogCache coerces/drops), and rows are sorted ascending within a
+    # chunk, so min/max are exactly the loop's iloc[0]/iloc[-1].
+    t_first, t_last = G["time"].min().to_numpy(), G["time"].max().to_numpy()
+    dur = np.maximum(t_last - t_first, min_dur)
+    brate = np.where(nb > 1, (nb - 1) / dur, 0.0)
+
+    def f64(col):
+        """Numeric view of a column, PRESERVING its float width. The loop reduced via
+        Series.mean / np.nanmean, which accumulate in the column's own dtype — so a
+        float32 column must stay float32 here or the result drifts by ~1e-7 relative.
+        Object columns (produced by the consensus merge_asof) are coerced to numeric,
+        which is also what puts them on pandas' fast Cython aggregation path."""
+        s = d[col]
+        return s if pd.api.types.is_numeric_dtype(s) else pd.to_numeric(s, errors="coerce")
+
+    def gb(s):
+        return s.groupby([d["_g"], d["_c"]], sort=True)
+
+    def mean_default(col, default):
+        """groupby-mean skips NaN and yields NaN for an all-NaN group -> the loop's
+        `nanmean(...) if notna().any() else default`."""
+        if col not in d.columns:
+            return np.full(K, float(default))
+        return gb(f64(col)).mean().reindex(idx).fillna(default).to_numpy()
+
+    def max_default(col, default):
+        if col not in d.columns:
+            return np.full(K, float(default))
+        return gb(f64(col)).max().reindex(idx).fillna(default).to_numpy()
+
+    def any_nonzero(vals):
+        """`Series.any()` over numerics: nonzero is truthy, and NaN != 0 is True, so
+        NaN counts as truthy exactly as it does in the loop."""
+        return (np.bincount(codes, weights=(vals != 0).astype("float64"),
+                            minlength=K) > 0).astype(int)
+
+    # ── inter-arrival entropy, vectorised over all chunks at once ───────────────
+    # Within a chunk the times are already sorted, so np.diff(np.sort(t)) == the intra-
+    # chunk diffs (all >= 0, so the `iat >= 0` filter is a no-op). A chunk's first row
+    # has no predecessor -> excluded. len(times) < 3 <=> len(iat) < 2 -> NaN.
+    tv = d["time"].to_numpy(dtype="float64")
+    cont = np.empty(len(d), dtype=bool)                 # row continues the same chunk
+    cont[0] = False
+    cont[1:] = codes[1:] == codes[:-1]
+    iat = np.empty(len(d), dtype="float64")
+    iat[0] = np.nan
+    iat[1:] = tv[1:] - tv[:-1]
+    ok = cont & np.isfinite(iat)
+    edges = np.linspace(0.0, 3.0 / R_NOM_DEFAULT, IAT_ENTROPY_BINS + 1)
+    edges[-1] = np.inf
+    b = np.clip(np.searchsorted(edges, iat[ok], side="right") - 1, 0, IAT_ENTROPY_BINS - 1)
+    cnt = np.bincount(codes[ok] * IAT_ENTROPY_BINS + b,
+                      minlength=K * IAT_ENTROPY_BINS).reshape(K, IAT_ENTROPY_BINS).astype("float64")
+    tot = cnt.sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = cnt / np.where(tot > 0, tot, 1.0)[:, None]
+        ent = -np.where(p > 0, p * np.log2(p), 0.0).sum(axis=1)
+    ent[(nb < 3) | (tot == 0)] = np.nan
+
+    # traj_shadow_score: mean over compared rows; 0.0 only when NO compared row exists
+    # (a compared-but-all-NaN chunk keeps NaN, as `float(traj.mean())` would).
+    tsc_m = (d["traj_shadow_compared"].to_numpy() == 1)
+    tsc_n = np.bincount(codes, weights=tsc_m.astype("float64"), minlength=K)
+    tsc_mean = gb(f64("traj_shadow_score").where(pd.Series(tsc_m, index=d.index))) \
+        .mean().reindex(idx).to_numpy()
+    traj_score = np.where(tsc_n > 0, tsc_mean, 0.0)
+
+    if has_life:
+        # float32 max/min then subtract, exactly as the loop did, before widening
+        life = (G["last_seen_time"].max() - G["first_seen_time"].min()).to_numpy()
+        life = np.where(np.isfinite(life), life, 0.0).astype("float64")
+    else:
+        life = np.zeros(K)
+
+    keys = G[gcols].first()
+    label = G["is_sybil"].max().reindex(idx).to_numpy()
+    at_first = G["attack_type"].first().reindex(idx).to_numpy()
+
+    out = pd.DataFrame({
+        "run_id": keys["run_id"].to_numpy(),
+        "observer_vehicle_id": keys["observer_vehicle_id"].to_numpy(),
+        "observed_claimed_id": keys["observed_claimed_id"].to_numpy(),
+        "observed_real_id": _mode_by(d, key, "observed_real_id", idx).to_numpy(),
+        "window_start": t_first.astype("float64"), "window_end": t_last.astype("float64"),
+        "n_beacons": nb.astype("int64"), "n_beacons_norm": nb / window, "beacon_rate": brate,
+        "rssi_mean": gb(f64("rssi_dbm")).mean().reindex(idx).to_numpy(),
+        # enriched RSSI verification
+        "rssi_mismatch_frac": gb(f64("rssi_mismatch_flag")).mean().reindex(idx).to_numpy(),
+        "mismatch_m_mean": mean_default("mismatch_m", 0.0),
+        # enriched persistence
+        "identity_lifetime": life,
+        "beacon_count_mean": gb(f64("received_beacon_count")).mean().reindex(idx).to_numpy(),
+        # enriched cross-tier consensus (nan-safe means)
+        "rsu_observer_count": mean_default("rsu_observer_count", 0.0),
+        "rsu_report_count": mean_default("rsu_report_count", 0.0),
+        "rsu_verified_prob": mean_default("rsu_verified_prob", 0.5),
+        "rsu_false_decision": max_default("rsu_false_decision", 0.0),
+        "ctrl_trust": mean_default("ctrl_trust", 1.0),
+        "ctrl_observer_count": mean_default("ctrl_observer_count", 0.0),
+        # signatures / flags
+        "token_valid": _mode_by(d, key, "token_valid", idx).to_numpy().astype("int64"),
+        "any_suspicion": any_nonzero(d["suspicion_flags"].astype("int64").to_numpy()),
+        "range_anomaly": any_nonzero(d["range_anomaly"].to_numpy()),
+        "rssi_distance_mismatch": any_nonzero(d["rssi_distance_mismatch"].to_numpy()),
+        "rssi_colocation": any_nonzero(d["rssi_colocation"].to_numpy()),
+        "trajectory_shadowing": any_nonzero(d["trajectory_shadowing"].to_numpy()),
+        "traj_shadow_score": traj_score,
+        "traj_shadow_compared": any_nonzero(d["traj_shadow_compared"].to_numpy()),
+        "iat_entropy": ent,
+        "label": label.astype("int64"),
+        "attack_type": np.where(label.astype("int64") != 0, at_first, 0).astype("int64"),
+        "rsu_id": _mode_by(d, key, "rsu_id", idx).to_numpy().astype("int64"),
+        "controller_id": 0,
+        "attack_percentage": G["attack_percentage"].first().reindex(idx).to_numpy().astype("int64"),
+    })
+    # add_coloc_features indexes its output arrays by label, so the RangeIndex the
+    # old list-of-dicts construction produced is part of the contract.
+    return out.reset_index(drop=True)
 
 
 def add_coloc_features(w, sigma_ch, gamma_co):
@@ -546,8 +670,12 @@ def build_client_cache(df, feature_cols):
     return cache
 
 
-def _local_train(gstate, X, y, epochs, lr, mu, bs, nf, pos_weight=None):
-    m = TrustMLP(nf); m.load_state_dict(gstate); g = _clone(gstate)
+def _local_train(gstate, X, y, epochs, lr, mu, bs, nf, pos_weight=None,
+                 hidden1=32, hidden2=16, dropout=0.3):
+    # Build the local model at the SAME architecture as the global state so the
+    # hidden-width sweep is honoured and hp["dropout"] actually takes effect during
+    # local training (it was previously fixed at the TrustMLP default of 0.3).
+    m = TrustMLP(nf, hidden1, hidden2, dropout); m.load_state_dict(gstate); g = _clone(gstate)
     opt = torch.optim.Adam(m.parameters(), lr=lr)
     pw = torch.tensor([pos_weight], dtype=torch.float32) if pos_weight else None
     crit = nn.BCEWithLogitsLoss(pos_weight=pw)
@@ -598,7 +726,9 @@ def _fl_round(gstate, cache, keys, hp, nf, sel_frac=0.3, min_clients=8, pos_weig
     for si in _select_clients(keys, has_pos, n_sel):
         X, y, rkey, _ = cache[keys[si]]
         ls, n = _local_train(gstate, X, y, hp["local_epochs"], hp["local_lr"],
-                             hp["fedprox_mu"], hp["batch_size"], nf, pos_weight)
+                             hp["fedprox_mu"], hp["batch_size"], nf, pos_weight,
+                             hp.get("hidden1", 32), hp.get("hidden2", 16),
+                             hp.get("dropout", 0.3))
         noised = {k: gstate[k] + (v - gstate[k]) + torch.randn(v.shape) * hp["dp_sigma"]
                   for k, v in ls.items()}
         rsu_up.setdefault(rkey, []).append((noised, n)); tot += n
@@ -609,16 +739,20 @@ def _fl_round(gstate, cache, keys, hp, nf, sel_frac=0.3, min_clients=8, pos_weig
 
 
 def evaluate_state(state, df, feature_cols, nf, threshold=0.5):
-    m = TrustMLP(nf, dropout=0.0); m.load_state_dict(state); m.eval()
+    # Infer the hidden widths from the trained state so any swept architecture
+    # (16/8, 32/16, 64/32, ...) evaluates without the caller passing them.
+    h1 = int(state["fc1.weight"].shape[0]); h2 = int(state["fc2.weight"].shape[0])
+    m = TrustMLP(nf, h1, h2, dropout=0.0); m.load_state_dict(state); m.eval()
     X = torch.tensor(df[feature_cols].to_numpy(dtype=np.float32))
     with torch.no_grad():
         logit, phi = m(X); probs = torch.sigmoid(logit).numpy()
     return compute_metrics(df["label"].to_numpy(), (probs >= threshold).astype(int)), probs, phi.numpy()
 
 
-def centralized_pretrain(tr, feature_cols, nf, epochs=3, lr=0.01, dropout=0.1, bs=64, pos_weight=None):
+def centralized_pretrain(tr, feature_cols, nf, epochs=3, lr=0.01, dropout=0.1, bs=64,
+                         pos_weight=None, hidden1=32, hidden2=16):
     torch.manual_seed(RNG_SEED)
-    m = TrustMLP(nf, dropout=dropout); opt = torch.optim.Adam(m.parameters(), lr=lr)
+    m = TrustMLP(nf, hidden1, hidden2, dropout=dropout); opt = torch.optim.Adam(m.parameters(), lr=lr)
     pw = torch.tensor([pos_weight], dtype=torch.float32) if pos_weight else None
     crit = nn.BCEWithLogitsLoss(pos_weight=pw)
     X = torch.tensor(tr[feature_cols].to_numpy(dtype=np.float32))
@@ -635,7 +769,9 @@ def centralized_pretrain(tr, feature_cols, nf, epochs=3, lr=0.01, dropout=0.1, b
 def train_fl(tr, va, feature_cols, hp, nf, max_rounds=25, patience=6, min_delta=1e-3,
              sel_frac=0.3, min_clients=8, pos_weight=None, warm_start=None, verbose=True):
     torch.manual_seed(RNG_SEED)
-    gstate = _clone(warm_start) if warm_start is not None else _clone(TrustMLP(nf, dropout=hp.get("dropout", 0.3)).state_dict())
+    gstate = _clone(warm_start) if warm_start is not None else _clone(
+        TrustMLP(nf, hp.get("hidden1", 32), hp.get("hidden2", 16),
+                 dropout=hp.get("dropout", 0.3)).state_dict())
     cache = build_client_cache(tr, feature_cols); keys = list(cache.keys())
     hist = []; best_mcc, best_state, bad = -1.0, gstate, 0
     for r in range(1, max_rounds + 1):
@@ -736,14 +872,17 @@ def export_fusion_parquet(df, state, feature_cols, out_parquet=None):
 
 
 def export_weights_json(state, feature_cols, stats, hp, out_json):
+    # Read the trained architecture straight off the state so a width selected by
+    # the sensitivity sweep is recorded faithfully (phi_trust = penultimate width).
+    h1 = int(state["fc1.weight"].shape[0]); h2 = int(state["fc2.weight"].shape[0])
     payload = {
         "feature_columns": feature_cols,
         "impute_median": stats["impute_median"],
         "feature_mean": stats["mean"], "feature_std": stats["std"],
         "trust_equation_hyperparameters": {k: hp[k] for k in
             ("alpha", "beta", "gamma", "lam", "mu", "sigma_ch", "gamma_co") if k in hp},
-        "model_hyperparameters": {"hidden1": 32, "hidden2": 16, "dropout": 0.3,
-                                  "phi_trust_dim": 16},
+        "model_hyperparameters": {"hidden1": h1, "hidden2": h2,
+                                  "dropout": hp.get("dropout", 0.3), "phi_trust_dim": h2},
         "layers": {k: v.cpu().numpy().tolist() for k, v in state.items()},
     }
     Path(out_json).parent.mkdir(parents=True, exist_ok=True)
