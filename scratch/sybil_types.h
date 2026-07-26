@@ -1489,6 +1489,10 @@ extern double                   v2vReliableRange;
 // DEFINED in Sybil-Developing-Improved.cc; controlled via --SecEnabled=true/false.
 extern bool g_secEnabled;
 extern uint32_t solution_mode;
+// A1 dual-mode (Eq 3.11) engagement flag. DEFINED in Sybil-Developing-Improved.cc.
+// true => the adaptive selector has escalated to Full mode this cycle. Only ever
+// set under solution_mode==MODE_ADAPTIVE; irrelevant (stays false) for modes 4/5.
+extern bool g_adaptiveFullEngaged;
 
 enum CryptoMechanismMode
 {
@@ -1509,6 +1513,11 @@ GetCryptoMechanismMode()
         return CRYPTO_MECHANISM_LIGHTWEIGHT;
     case MODE_FULL:
         return CRYPTO_MECHANISM_FULL;
+    case MODE_ADAPTIVE:
+        // A1 dual-mode: crypto depth follows the Eq 3.11 selector's current choice —
+        // full (PQC/classical) while engaged, lightweight otherwise.
+        return g_adaptiveFullEngaged ? CRYPTO_MECHANISM_FULL
+                                     : CRYPTO_MECHANISM_LIGHTWEIGHT;
     default:
         return CRYPTO_MECHANISM_OFF;
     }

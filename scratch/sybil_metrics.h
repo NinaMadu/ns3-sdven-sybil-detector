@@ -171,7 +171,8 @@ enum DetectionMode
     MODE_BASELINE_ML   = 3, ///< Placeholder: baseline ML detection.
     MODE_LIGHTWEIGHT   = 4, ///< Implemented lightweight solution.
     MODE_FULL          = 5, ///< Placeholder: full proposed solution.
-    MODE_NO_DETECTION  = 6  ///< Implemented no-detection baseline.
+    MODE_NO_DETECTION  = 6, ///< Implemented no-detection baseline.
+    MODE_ADAPTIVE      = 7  ///< A1 dual-mode selector (Eq 3.11): runtime L<->F switch.
 };
 
 static inline bool
@@ -192,7 +193,7 @@ IsPlaceholderDetectionMode(uint32_t mode)
 static inline bool
 IsKnownDetectionMode(uint32_t mode)
 {
-    return mode >= MODE_BASELINE_FL && mode <= MODE_NO_DETECTION;
+    return mode >= MODE_BASELINE_FL && mode <= MODE_ADAPTIVE;
 }
 
 // =============================================================================
@@ -714,7 +715,8 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         // MODE_FULL (RecordFullModeDecision). Those modes count their detector's own
         // decisions directly; letting the per-packet path also write here would double-count
         // and drown the detector's per-identity verdicts in per-packet FN/TN.
-        if (m_proposedMethod != MODE_BASELINE_FL && m_proposedMethod != MODE_FULL)
+        if (m_proposedMethod != MODE_BASELINE_FL && m_proposedMethod != MODE_FULL
+            && m_proposedMethod != MODE_ADAPTIVE)
         {
             if      ( isActuallySybil &&  isFlagged) { m_windowMatrix.TP++; m_totalMatrix.TP++; }
             else if (!isActuallySybil &&  isFlagged) { m_windowMatrix.FP++; m_totalMatrix.FP++;
@@ -724,7 +726,8 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
             else                                     { m_windowMatrix.TN++; m_totalMatrix.TN++; }
         }
 
-        if (isFlagged && m_proposedMethod != MODE_BASELINE_FL && m_proposedMethod != MODE_FULL)
+        if (isFlagged && m_proposedMethod != MODE_BASELINE_FL && m_proposedMethod != MODE_FULL
+            && m_proposedMethod != MODE_ADAPTIVE)
         {
             // M7: record detection start only on first flag for this identity;
             // subsequent packets from the same Sybil claimedId are already tracked.
@@ -947,7 +950,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                 double             timestampSec,
                                 double             revLatencySec = 0.001)
     {
-        if (m_proposedMethod != MODE_FULL) return;
+        if (m_proposedMethod != MODE_FULL && m_proposedMethod != MODE_ADAPTIVE) return;
 
         // M5/M6: per-decision confusion matrix
         if      ( isActuallySybil &&  predictedSybil) { m_windowMatrix.TP++; m_totalMatrix.TP++; }

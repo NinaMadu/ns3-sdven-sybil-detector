@@ -527,6 +527,13 @@ static std::map<std::string, RevocationManifestRecord> g_revocationManifestsByEn
 static std::vector<std::string> g_latestRevocationManifestCids;
 static std::vector<std::set<uint32_t> > g_rsuRevokedVehicleBlacklist;
 
+// Enforcement accounting for the RSU-tier revocation drop (see LogReceivedPacket).
+// Before this drop existed the blacklist only gated the V2RSU/V2I unicast channels,
+// which Sybil identities never use — so a revoked identity kept being ingested from
+// the V2V beacons an RSU overhears. These counters make the enforcement measurable.
+static uint64_t g_rsuRevocationDroppedPackets = 0;   ///< packets dropped at an RSU by the blacklist
+static std::set<uint32_t> g_rsuRevocationDroppedIds; ///< distinct claimed ids dropped at least once
+
 struct V2IAuthSessionState
 {
     bool authenticated = false;
@@ -4118,10 +4125,42 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
     return flags;
 }
 
+// ============================================================================
+// A1 Dual-Mode selector (Eq 3.11) — ADDITIVE. Inert unless solution_mode==7:
+// EffectiveMode() returns the mode unchanged for 4/5/6, so every existing gate
+// that routes through it keeps byte-identical behavior. Only under adaptive
+// does the effective mode swing between LIGHTWEIGHT and FULL per the selector.
+// ============================================================================
+bool   g_adaptiveFullEngaged = false;   // set by EvaluateModeSelector each cycle
+static double g_lambdaLo   = 0.02;      // Λlo  low-threat boundary (frac vehicles flagged)
+static double g_rhoMin     = 0.20;      // ρmin min OBU capacity for ML inference
+static double g_rhoTh      = 0.20;      // ρth  RSU spare-capacity threshold
+static double g_rhoV       = 1.00;      // ρv   modeled OBU capacity  (default: sufficient)
+static double g_rhoR       = 1.00;      // ρr   modeled RSU capacity  (default: sufficient)
+static double g_modeSelectInterval     = 1.0;  // selector re-evaluation period (s)
+static double g_adaptiveEngagedTimeSec = 0.0;  // cumulative sim-time spent in Full
+static double g_adaptiveLastEvalSec    = 0.0;  // time of previous selector evaluation
+
+static bool
+AdaptiveSolutionModeActive()
+{
+    return solution_mode == MODE_ADAPTIVE;
+}
+
+// Effective per-cycle detection mode. Identity for modes 4/5/6; for the adaptive
+// mode it resolves to FULL while the Eq 3.11 selector is engaged, else LIGHTWEIGHT.
+static uint32_t
+EffectiveMode()
+{
+    if (solution_mode == MODE_ADAPTIVE)
+        return g_adaptiveFullEngaged ? MODE_FULL : MODE_LIGHTWEIGHT;
+    return solution_mode;
+}
+
 static bool
 LightweightDecisionModeActive()
 {
-    return solution_mode == MODE_LIGHTWEIGHT;
+    return EffectiveMode() == MODE_LIGHTWEIGHT;
 }
 
 static bool
@@ -4157,7 +4196,63 @@ FLSolutionModeActive()
 static bool
 FullSolutionModeActive()
 {
-    return solution_mode == MODE_FULL;
+    return EffectiveMode() == MODE_FULL;
+}
+
+// A1 threat level Λ (Eq 3.11): fraction of vehicles currently carrying a
+// lightweight rule-based suspicion flag (the LW-SSD output of Eq 3.13),
+// observed across all RSU evidence tables. Cheap — reuses the always-on
+// rule-based detector, so the selector needs no extra detection work.
+static double
+ComputeAdaptiveThreatLevel()
+{
+    std::set<uint32_t> flagged;
+    for (uint32_t rsuId = 0;
+         rsuId < N_RSUs && rsuId < g_computedDetectionEvidenceTables.size(); ++rsuId)
+    {
+        for (const auto& kv : g_computedDetectionEvidenceTables[rsuId])
+        {
+            for (const auto& rec : kv.second)
+            {
+                if (rec.suspicionFlags != SUSPICION_NONE) { flagged.insert(kv.first); break; }
+            }
+        }
+    }
+    double denom = static_cast<double>(std::max<uint32_t>(1u, N_Vehicles));
+    return static_cast<double>(flagged.size()) / denom;
+}
+
+// A1 mode selector M (Eq 3.11). Re-evaluates every g_modeSelectInterval seconds:
+// reads Λ, applies the resource+threat cascade, flips g_adaptiveFullEngaged, and
+// appends the decision to mode_selector_log.csv for the offline Ĉ_R / mode-mix
+// analysis. Self-scheduling; inert unless solution_mode==MODE_ADAPTIVE.
+static void
+EvaluateModeSelector()
+{
+    if (!AdaptiveSolutionModeActive())
+        return;
+    double now = Simulator::Now().GetSeconds();
+    if (g_adaptiveFullEngaged)
+        g_adaptiveEngagedTimeSec += (now - g_adaptiveLastEvalSec);
+    g_adaptiveLastEvalSec = now;
+
+    double lambda = ComputeAdaptiveThreatLevel();
+    // Eq 3.11:  Full  iff (ρr ≥ ρth) AND (ρv ≥ ρmin) AND (Λ ≥ Λlo);  else Lightweight.
+    bool wantFull = (g_rhoR >= g_rhoTh) && (g_rhoV >= g_rhoMin) && (lambda >= g_lambdaLo);
+    if (wantFull != g_adaptiveFullEngaged)
+    {
+        std::cout << "[A1Selector] t=" << now << "s Lambda=" << lambda
+                  << " -> " << (wantFull ? "FULL (engage)" : "LIGHTWEIGHT (disengage)")
+                  << "  (Lambda_lo=" << g_lambdaLo << " rho_v=" << g_rhoV
+                  << " rho_r=" << g_rhoR << ")\n" << std::flush;
+    }
+    g_adaptiveFullEngaged = wantFull;
+
+    std::ofstream sel((outputDir + "/mode_selector_log.csv").c_str(), std::ios::app);
+    sel << now << "," << lambda << "," << g_rhoV << "," << g_rhoR << ","
+        << (wantFull ? 1 : 0) << "," << g_adaptiveEngagedTimeSec << "\n";
+
+    Simulator::Schedule(Seconds(g_modeSelectInterval), &EvaluateModeSelector);
 }
 
 static uint32_t
@@ -11118,6 +11213,28 @@ LogReceivedPacket(const std::string& receiverRole,
     double   delay       = hasTag ? Simulator::Now().GetSeconds() - tag.GetCreatedTime() : 0.0;
     uint32_t messageType = hasTag ? tag.GetMessageType() : 0;
 
+    // --- RSU-tier revocation enforcement -----------------------------------
+    // A revoked identity gets NOTHING through at this RSU, on any channel. This
+    // runs before every handler, the awareness ingest and the metrics hooks, so a
+    // revoked id can neither be re-learned into regional awareness (and forwarded
+    // to the controller) nor counted as successfully diverted traffic.
+    //
+    // Placed here rather than on the V2RSU path alone because Sybil identities
+    // reach an RSU as OVERHEARD V2V beacons, never as V2RSU reports under their own
+    // name — which is why the pre-existing blacklist checks never fired.
+    if (hasTag && receiverRole == "rsu_edge" && FullCryptoMechanismActive() &&
+        receiverId < g_rsuRevokedVehicleBlacklist.size() &&
+        g_rsuRevokedVehicleBlacklist[receiverId].count(tag.GetClaimedNodeId()) > 0)
+    {
+        ++g_rsuRevocationDroppedPackets;
+        g_rsuRevocationDroppedIds.insert(tag.GetClaimedNodeId());
+        std::cout << "[FullModeRevocation] RSU " << receiverId
+                  << " dropped " << MessageTypeToString(messageType)
+                  << " from revoked identity=" << tag.GetClaimedNodeId()
+                  << " real=" << tag.GetRealNodeId() << std::endl;
+        return;
+    }
+
     if (hasTag)
     {
         std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
@@ -13472,7 +13589,14 @@ main(int argc, char* argv[])
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
     cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
-    cmd.AddValue("solution_mode",              "Solution mode: 1=FLEMDS FL 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=no detection",solution_mode);
+    cmd.AddValue("solution_mode",              "Solution mode: 1=FLEMDS FL 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=no detection 7=adaptive dual-mode (Eq 3.11 selector)",solution_mode);
+    // A1 dual-mode selector (Eq 3.11) knobs — only consulted when solution_mode=7.
+    cmd.AddValue("lambdaLo", "A1 adaptive: low-threat boundary Λlo (escalate to Full when flagged-vehicle fraction >= this) [default 0.02]", g_lambdaLo);
+    cmd.AddValue("rhoMin",   "A1 adaptive: min OBU compute ρmin for ML (Lightweight if ρv<ρmin) [default 0.20]", g_rhoMin);
+    cmd.AddValue("rhoTh",    "A1 adaptive: RSU spare-capacity threshold ρth (Full needs ρr>=ρth) [default 0.20]", g_rhoTh);
+    cmd.AddValue("rhoV",     "A1 adaptive: modeled OBU capacity ρv [default 1.0 = sufficient]", g_rhoV);
+    cmd.AddValue("rhoR",     "A1 adaptive: modeled RSU spare capacity ρr [default 1.0 = sufficient]", g_rhoR);
+    cmd.AddValue("modeSelectInterval", "A1 adaptive: selector re-evaluation period in sim-seconds [default 1.0]", g_modeSelectInterval);
     cmd.AddValue("full_crypto_profile",       "Inside solution_mode=5: 1=current classical full, 2=real PQC ML-KEM-1024 + ML-DSA-87 + FN-DSA-1024 beacons", full_crypto_profile);
     cmd.AddValue("proposed_method",            "Legacy alias: 0=none 1=old rule/lightweight 2=old ML 3=old FL 4=old hybrid/full",proposed_method);
     cmd.AddValue("rsuCoverageRange",           "RSU coverage radius in metres",          rsuCoverageRange);
@@ -13701,6 +13825,8 @@ main(int argc, char* argv[])
     g_llmRevocationTrack.clear();
     g_groundTruthSybilIds.clear();
     g_rsuRevokedVehicleBlacklist.assign(N_RSUs, std::set<uint32_t>());
+    g_rsuRevocationDroppedPackets = 0;
+    g_rsuRevocationDroppedIds.clear();
     g_vehicleV2IAuthSessions.assign(N_Vehicles, std::map<uint32_t, V2IAuthSessionState>());
     g_rsuV2IAuthSessions.assign(N_RSUs, std::map<uint32_t, V2IAuthSessionState>());
     g_rsuPendingV2IAuthNonces.assign(N_RSUs, std::map<uint32_t, std::vector<uint8_t> >());
@@ -14375,10 +14501,12 @@ main(int argc, char* argv[])
     // Full-mode (MODE_FULL): launch the persistent LLM detector daemon and schedule
     // periodic SCORE windows. Blocks briefly while the daemon loads its models. The
     // sink feeds each window's verdicts into the RSU evidence tables + Eq 3.22 consensus.
-    if (FullSolutionModeActive())
+    if (FullSolutionModeActive() || AdaptiveSolutionModeActive())
     {
         // Phase 0: make the run self-describing — the LLM verdicts feed the full-crypto
         // revocation path, whose signatures are classical or PQC depending on this profile.
+        // Adaptive (A1) warm-launches the SAME daemon here; RunWindow only SCOREs while
+        // the Eq 3.11 selector is engaged (gated via the should-score callback below).
         std::cout << "[LLMRealtime] full-mode detection ARMED"
                   << " crypto=" << (FullCryptoMechanismActive() ? FullCryptoProfileName()
                                                                 : "INACTIVE(g_secEnabled off)")
@@ -14432,6 +14560,25 @@ main(int argc, char* argv[])
             LLMRealtimeDetector::SetDetectLatency(detectLatencySec);
             LLMRealtimeDetector::Init(llmDetectInterval);
         }
+        if (AdaptiveSolutionModeActive())
+        {
+            // A1 dual-mode: gate the (warm) daemon's SCORE on the selector's current
+            // choice, then start the Eq 3.11 selector loop. FullSolutionModeActive()
+            // under adaptive == "currently engaged", so the daemon only pays the LLM
+            // cost while escalated — the whole point of the dual-mode design.
+            LLMRealtimeDetector::SetShouldScoreGate(&FullSolutionModeActive);
+            g_adaptiveLastEvalSec = 0.0;
+            {
+                std::ofstream sel((outputDir + "/mode_selector_log.csv").c_str(),
+                                  std::ios::trunc);
+                sel << "time_s,lambda,rho_v,rho_r,full_engaged,engaged_time_cum_s\n";
+            }
+            std::cout << "[A1Selector] ADAPTIVE dual-mode ARMED: Lambda_lo=" << g_lambdaLo
+                      << " rho_min=" << g_rhoMin << " rho_th=" << g_rhoTh
+                      << " rho_v=" << g_rhoV << " rho_r=" << g_rhoR
+                      << " select_interval=" << g_modeSelectInterval << "s\n" << std::flush;
+            Simulator::Schedule(Seconds(g_modeSelectInterval), &EvaluateModeSelector);
+        }
     }
 
     // v5 control-plane detector: close the first Eq. (3.9) evaluation window
@@ -14471,7 +14618,7 @@ main(int argc, char* argv[])
     Simulator::Destroy();
     if (v6DetectActive)
         ControllerDetectionFinalize(simTime, N_Controllers);
-    if (FullSolutionModeActive() && p4SelfTestRealId == 0)
+    if ((FullSolutionModeActive() || AdaptiveSolutionModeActive()) && p4SelfTestRealId == 0)
         LLMRealtimeDetector::FinalizeAndReport();
     if (FullCryptoMechanismActive() && rsuTrustWindowedS5Enabled)
         WriteV5DetectionSummary();
@@ -14517,6 +14664,24 @@ main(int argc, char* argv[])
 
     WriteMetricsRow(simTime);
     WriteFinalSummary();
+
+    // RSU-tier revocation enforcement: how much attack traffic the blacklist actually
+    // stopped. Before the RSU-tier drop this was structurally zero — the blacklist only
+    // gated V2RSU/V2I, channels no Sybil identity ever uses.
+    if (FullCryptoMechanismActive())
+    {
+        std::cout << "\n[FullModeRevocation] RSU-tier enforcement summary\n"
+                  << "  revoked identities (blacklisted) : "
+                  << (g_rsuRevokedVehicleBlacklist.empty()
+                          ? 0u
+                          : static_cast<uint32_t>(g_rsuRevokedVehicleBlacklist[0].size()))
+                  << " (per RSU)\n"
+                  << "  packets dropped at RSUs          : "
+                  << g_rsuRevocationDroppedPackets << "\n"
+                  << "  distinct identities enforced on  : "
+                  << g_rsuRevocationDroppedIds.size() << "\n" << std::flush;
+    }
+
     if (RssiSolutionModeActive())
         RssiSybilDetector::PrintMetrics();
 

@@ -88,6 +88,12 @@ static std::vector<Verdict> g_lastVerdicts;   // verdicts from the most recent R
 // Called by RunWindow after each score (nullptr => verdicts only go to the CSV).
 static void (*g_verdictSink)(const std::vector<Verdict>&) = nullptr;
 
+// A1 dual-mode: optional gate. When set (adaptive mode), RunWindow skips the
+// expensive SCORE while it returns false (selector disengaged) — so the daemon
+// only pays the LLM cost while the Eq 3.11 selector is in Full. nullptr (full
+// mode) => always score, i.e. no behavior change.
+static bool (*g_shouldScoreFn)() = nullptr;
+
 // ── config setters (optional; call before Init). [[maybe_unused]] because the .cc
 //    may configure none of them and just call Init() with defaults. ─────────────
 [[maybe_unused]] static void SetInterval(double s)      { g_interval = s; }
@@ -107,6 +113,7 @@ static void (*g_verdictSink)(const std::vector<Verdict>&) = nullptr;
 [[maybe_unused]] static void SetAblateAnalyzer(const std::string& b) { g_ablateAnalyzer = b; }
 [[maybe_unused]] static void SetAblateStream(const std::string& s)   { g_ablateStream = s; }
 [[maybe_unused]] static void SetVerdictSink(void (*cb)(const std::vector<Verdict>&)) { g_verdictSink = cb; }
+[[maybe_unused]] static void SetShouldScoreGate(bool (*fn)()) { g_shouldScoreFn = fn; }
 
 // ── launch the persistent daemon in the background ───────────────────────────
 static void LaunchDaemon()
@@ -203,6 +210,14 @@ static void RunWindow()
     double now = ns3::Simulator::Now().GetSeconds();
     g_lastVerdicts.clear();
     if (!g_conn)
+    {
+        ns3::Simulator::Schedule(ns3::Seconds(g_interval), &RunWindow);
+        return;
+    }
+
+    // A1 dual-mode: skip the expensive SCORE while the selector is disengaged, so the
+    // LLM cost is only paid in Full. Full mode leaves g_shouldScoreFn null (no-op).
+    if (g_shouldScoreFn && !g_shouldScoreFn())
     {
         ns3::Simulator::Schedule(ns3::Seconds(g_interval), &RunWindow);
         return;
