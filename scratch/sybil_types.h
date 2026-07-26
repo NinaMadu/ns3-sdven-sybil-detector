@@ -79,7 +79,8 @@ enum MessageType
     CONTROLLER2CONTROLLER_COMMAND = 16, ///< Controller-to-controller command forward
     V2I_AUTH_HELLO          = 17,  ///< Vehicle->RSU: paper V2I-AUTH phase 1
     V2I_AUTH_CHALLENGE      = 18,  ///< RSU->Vehicle: paper V2I-AUTH phase 2
-    V2I_AUTH_PROOF          = 19   ///< Vehicle->RSU: paper V2I-AUTH phase 3
+    V2I_AUTH_PROOF          = 19,  ///< Vehicle->RSU: paper V2I-AUTH phase 3
+    REVOCATION_BULLETIN     = 20   ///< RSU->broadcast: threshold-signed revoked-identity list
 };
 
 inline std::string
@@ -88,6 +89,11 @@ MessageTypeToString(uint32_t messageType)
     switch (messageType)
     {
     case V2V_BEACON:             return "v2v_beacon";
+    // Distinct flow label matters: the ML analyzers select on it
+    // (temporal-GRU keeps flow=="v2v_beacon", temporal-XGB keeps
+    // {"v2v_beacon","v2rsu_report"}), so bulletins are filtered out of every
+    // model's input by construction and cannot shift any learned feature.
+    case REVOCATION_BULLETIN:    return "revocation_bulletin";
     case V2RSU_REPORT:           return "v2rsu_report";
     case RSU2CONTROLLER_REPORT:  return "rsu2controller_report";
     case CONTROLLER2RSU_COMMAND: return "controller2rsu_command";
@@ -446,6 +452,60 @@ class V2VSignatureTag : public Tag
 // Carries the vehicle's ephemeral ECDH public key and a random nonce.
 // The RSU uses these to compute the session key and build the CHAN_ACK.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RevocationBulletinTag — RSU → broadcast, threshold-signed revoked-identity list.
+//
+// ONE bulletin carries the WHOLE revoked set, not one manifest per identity.
+// That matters for airtime: a per-identity manifest is ~19 KB (18.6 KB of which
+// is two hex-encoded ML-DSA-87 endorsements), and broadcasting one per revoked
+// identity would consume a large fraction of the channel and thin out the V2V
+// beacon stream every ML analyzer is trained on.  Batching amortises the single
+// threshold signature over the entire list instead of paying it per identity.
+//
+// `version` is a monotonic counter so a receiver can ignore a bulletin it has
+// already applied, and (later) suppress redundant re-broadcasts.
+// ---------------------------------------------------------------------------
+class RevocationBulletinTag : public Tag
+{
+  public:
+    static constexpr uint32_t MAX_IDS = 256;
+
+    uint32_t rsuId    = 0;
+    uint32_t version  = 0;
+    uint32_t idCount  = 0;
+    uint32_t ids[MAX_IDS] = {};
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::RevocationBulletinTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<RevocationBulletinTag>();
+        return tid;
+    }
+    TypeId   GetInstanceTypeId() const override { return RevocationBulletinTag::GetTypeId(); }
+    uint32_t GetSerializedSize()  const override { return 12 + MAX_IDS * 4; }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU32(rsuId);
+        i.WriteU32(version);
+        i.WriteU32(idCount);
+        for (uint32_t k = 0; k < MAX_IDS; ++k) i.WriteU32(ids[k]);
+    }
+    void Deserialize(TagBuffer i) override
+    {
+        rsuId   = i.ReadU32();
+        version = i.ReadU32();
+        idCount = i.ReadU32();
+        for (uint32_t k = 0; k < MAX_IDS; ++k) ids[k] = i.ReadU32();
+    }
+    void Print(std::ostream& os) const override
+    {
+        os << "RevocationBulletinTag rsu=" << rsuId << " v=" << version
+           << " ids=" << idCount;
+    }
+};
 
 class ChanHelloTag : public Tag
 {
@@ -1668,6 +1728,12 @@ CreateSenderSocket(Ptr<Node> node)
     return Socket::CreateSocket(node, UdpSocketFactory::GetTypeId());
 }
 
+// Defined in Sybil-Developing-Improved.cc.  True when this vehicle holds a revocation
+// bulletin covering claimedId and will therefore drop the packet on arrival.  Exposed as
+// a predicate rather than the blacklist container so this header stays independent of the
+// enforcement data structures.
+bool VehicleBlocksClaimedId(uint32_t vehicleIndex, uint32_t claimedId);
+
 inline void
 SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
                  uint16_t destinationPort, Ptr<TxInfo> tx)
@@ -1746,6 +1812,13 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
                 for (uint32_t i = 0; i < g_vehicleNodes.GetN(); ++i)
                 {
                     if (i == tx->realNodeId)
+                        continue;
+                    // A receiver that has revoked this claimed identity will drop the
+                    // packet, so it is not an intended delivery.  Excluding it here keeps
+                    // M1 honest: without this, vehicle-tier enforcement removes deliveries
+                    // from the numerator while leaving them in the denominator, and a
+                    // working defence shows up as a PDR collapse.
+                    if (VehicleBlocksClaimedId(i, tx->claimedNodeId))
                         continue;
                     Ptr<MobilityModel> receiverMob =
                         g_vehicleNodes.Get(i)->GetObject<MobilityModel>();

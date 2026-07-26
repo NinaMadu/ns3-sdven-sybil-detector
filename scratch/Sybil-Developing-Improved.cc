@@ -238,8 +238,13 @@ std::string mobilityMode4Name = "sumo_kl_cheras";
 std::string mobilityMode4TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_mobility.tcl";
 std::string mobilityMode4RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-cheras/klcp_rsus_200m.csv";
 std::string mobilityMode5Name = "sumo_kuala_lumpur_bb";
-std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_mobility.tcl";
-std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb_rsus_200m.csv";
+// klbb2km (2 km bbox, 200 vehicles, 8x8 = 64 RSUs) is the scenario every comparable
+// dataset uses, so it is the default.  The older klbb_* files describe a different,
+// smaller scenario (165 vehicles / 41 RSUs) and are not baseline-comparable.
+// Geometry check: in klbb2km all 200 vehicles are within 300 m of an RSU at t=0
+// (median 131 m, max 215 m), so RSU coverage is never the limiting factor.
+std::string mobilityMode5TraceFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_mobility.tcl";
+std::string mobilityMode5RsuPositionFile = "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_rsus_8x8.csv";
 
 std::string communicationCsv = "sybil-attack/outputs/communication_log.csv";
 std::string vehicleNeighborTableCsv = "sybil-attack/outputs/vehicle_neighbor_table_log.csv";
@@ -533,6 +538,46 @@ static std::vector<std::set<uint32_t> > g_rsuRevokedVehicleBlacklist;
 // the V2V beacons an RSU overhears. These counters make the enforcement measurable.
 static uint64_t g_rsuRevocationDroppedPackets = 0;   ///< packets dropped at an RSU by the blacklist
 static std::set<uint32_t> g_rsuRevocationDroppedIds; ///< distinct claimed ids dropped at least once
+
+// ── Vehicle-tier revocation distribution (STEP 1: distribution + measurement only) ──
+// RSUs broadcast one threshold-signed bulletin carrying the WHOLE revoked set; a
+// vehicle that hears it records the ids locally.  Nothing is enforced yet — this
+// step exists to measure reach and, critically, whether the extra airtime thins the
+// V2V beacon stream that every ML analyzer is trained on.  Enforcement is deliberately
+// a separate step so that if the beacon distribution shifts we stop here and nothing
+// downstream is invalidated.
+//
+// Broadcast (not unicast) and verified by the manifest's own 2-of-3 threshold
+// endorsement rather than a pairwise session key, so a vehicle needs NO registered
+// session to receive and trust a revocation.
+static std::vector<std::set<uint32_t> > g_vehicleRevokedIdBlacklist;
+static std::vector<uint32_t> g_vehicleBulletinVersion;  ///< last bulletin version applied
+static uint32_t g_revocationBulletinVersion   = 0;      ///< bumped when the revoked set grows
+static uint64_t g_revocationBulletinsSent     = 0;
+static uint64_t g_revocationBulletinsReceived = 0;
+static std::set<uint32_t> g_vehiclesReachedByBulletin;  ///< distinct vehicles that applied one
+
+// V2V epidemic gossip was built and measured, then removed: in this topology it cost
+// far more than it bought.  363 relays reached only +10 vehicles (45 -> 55/200) because
+// the network is too sparse to percolate (observer_count ~= 1 neighbour), while the
+// 9.7 KB relays landed in the *vehicle* collision domains and moved observer_count
+// -5.5% — a feature four analyzers use, which would have broken the no-retraining
+// property.  RSU broadcast alone reaches 45/200 with the guard clean (-0.17% beacons,
+// +0.7% observer_count), so distribution stays RSU-only.
+//
+// Vehicle-tier ENFORCEMENT accounting (the drop itself lives in LogReceivedPacket).
+static uint64_t g_vehicleRevocationDroppedPackets = 0;
+static std::set<uint32_t> g_vehicleRevocationDroppedIds;
+
+// Declared in sybil_types.h so SendTaggedPacket can exclude a blocking receiver from
+// expectedDeliveries (M1 PDR denominator).
+bool
+VehicleBlocksClaimedId(uint32_t vehicleIndex, uint32_t claimedId)
+{
+    return FullCryptoMechanismActive() &&
+           vehicleIndex < g_vehicleRevokedIdBlacklist.size() &&
+           g_vehicleRevokedIdBlacklist[vehicleIndex].count(claimedId) > 0;
+}
 
 struct V2IAuthSessionState
 {
@@ -3446,6 +3491,18 @@ ApplyRevocationManifestJson(uint32_t rsuId,
         if (inserted)
         {
             LkhRevokeVehicleAtRsu(entityId, rsuId);
+
+            // Drop the identity's RESIDENT regional-awareness state. The ingest gate in
+            // LogReceivedPacket stops it being re-learned, but any record built before the
+            // revocation stays in the table and keeps being re-forwarded to the controller
+            // by the batch loop (records are selected on dirty/last-seen, not on validity).
+            // Nothing else erases on revocation — the only other purge is the time-based
+            // staleness sweep, which is driven by age, not by a detection verdict.
+            if (rsuId < g_rsuRegionalAwarenessTables.size())
+                g_rsuRegionalAwarenessTables[rsuId].erase(entityId);
+            if (rsuId < g_rsuVehicleObservationTables.size())
+                g_rsuVehicleObservationTables[rsuId].erase(entityId);
+
             std::cout << "[FullModeRevocation] RSU " << rsuId
                       << " blacklisted vehicle=" << entityId
                       << " manifest=" << manifestCid
@@ -3455,6 +3512,89 @@ ApplyRevocationManifestJson(uint32_t rsuId,
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// BroadcastRevocationBulletin — RSU broadcasts the whole revoked set once.
+//
+// Sizing is the point of this function.  A per-identity manifest is ~19 KB (18.6 KB
+// of hex-encoded ML-DSA-87 endorsements), so broadcasting one per revoked identity
+// would burn a large share of the channel and thin the V2V beacon stream the ML
+// analyzers depend on.  Instead ONE bulletin carries every revoked id under a single
+// 2-of-3 threshold signature, and the signature is charged as RAW bytes rather than
+// hex.  The packet is created at its true size so ns-3 actually models the airtime —
+// otherwise the contention measurement this step exists for would be meaningless.
+// ---------------------------------------------------------------------------
+// MLDSA87_SIG_BYTES (4627, raw) comes from sybil_metrics.h — the same constant the
+// M8 overhead accounting uses, so bulletin sizing and overhead reporting agree.
+
+static void
+BroadcastRevocationBulletin(uint32_t rsuId)
+{
+    if (!FullCryptoMechanismActive() || rsuId >= N_RSUs) return;
+    if (rsuId >= g_rsuRevokedVehicleBlacklist.size())     return;
+
+    const std::set<uint32_t>& revoked = g_rsuRevokedVehicleBlacklist[rsuId];
+    if (revoked.empty()) return;
+
+    RevocationBulletinTag bt;
+    bt.rsuId   = rsuId;
+    bt.version = g_revocationBulletinVersion;
+    for (uint32_t id : revoked)
+    {
+        if (bt.idCount >= RevocationBulletinTag::MAX_IDS) break;
+        bt.ids[bt.idCount++] = id;
+    }
+
+    // True wire cost: id list + one 2-of-3 threshold signature (raw, not hex).
+    uint32_t payloadBytes = 12u + bt.idCount * 4u + 2u * MLDSA87_SIG_BYTES;
+
+    Ptr<Packet> pkt = Create<Packet>(payloadBytes);
+    SybilPacketTag meta(N_Vehicles + rsuId, N_Vehicles + rsuId, 0xFFFFFFFF,
+                        static_cast<uint32_t>(REVOCATION_BULLETIN), g_seq++);
+    pkt->AddPacketTag(meta);
+    pkt->AddPacketTag(bt);
+
+    Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuId));
+    sock->SetAllowBroadcast(true);
+    sock->SendTo(pkt, 0, InetSocketAddress(Ipv4Address("255.255.255.255"), VEHICLE_PORT));
+    // Deliberately NOT counted in M1/M3/M4: the receive path returns before
+    // MetricsOnReceive, so counting the transmit would depress PDR without a matching
+    // delivery (the same denominator trap that makes a vehicle-side DROP unsafe).
+    // Bulletins are control-plane overhead and are tracked by the counters below;
+    // leaving them out keeps M1/M3/M4 directly comparable with the baseline run,
+    // which is exactly what the beacon-shift guard needs.
+    ++g_revocationBulletinsSent;
+
+    std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
+              << "[SEND] [REVOCATION_BULLETIN]     RSU=" << rsuId
+              << " v=" << bt.version << " ids=" << bt.idCount
+              << " bytes=" << payloadBytes << " -> Broadcast" << std::endl;
+}
+
+// Coalescing round.  PublishFullModeRevocationManifest fires once PER REVOKED
+// IDENTITY, so broadcasting there directly would send (identities x RSUs) bulletins
+// — 105 x 64 in a typical run.  Instead each revocation only bumps the version and
+// arms a short debounce; every revocation decided in the same scoring window then
+// collapses into ONE broadcast round carrying the full set.
+static bool   g_bulletinBroadcastPending = false;
+static double bulletinDebounceSec        = 0.1;
+
+static void
+RunRevocationBulletinRound()
+{
+    g_bulletinBroadcastPending = false;
+    for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
+        BroadcastRevocationBulletin(rsuId);
+}
+
+static void
+ScheduleRevocationBulletin()
+{
+    if (!FullCryptoMechanismActive() || g_bulletinBroadcastPending) return;
+    g_bulletinBroadcastPending = true;
+    ++g_revocationBulletinVersion;
+    Simulator::Schedule(Seconds(bulletinDebounceSec), &RunRevocationBulletinRound);
 }
 
 static void
@@ -3548,6 +3688,10 @@ PublishFullModeRevocationManifest(const IsolationRecord& isolation)
 
     for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
         Simulator::ScheduleNow(&SyncRsuRevocationManifestsFromIpfs, rsuId);
+
+    // Arm the vehicle-tier bulletin (debounced, so a whole window of revocations
+    // becomes one broadcast round rather than one per identity).
+    ScheduleRevocationBulletin();
 
     std::cout << "[FullModeRevocationManifest] entity=" << rec.entityType
               << "/" << rec.entityId
@@ -5113,6 +5257,7 @@ NS_OBJECT_ENSURE_REGISTERED(RegResponseTag);
 NS_OBJECT_ENSURE_REGISTERED(RegConfirmTag);
 NS_OBJECT_ENSURE_REGISTERED(V2CtrlHelloTag);
 NS_OBJECT_ENSURE_REGISTERED(Ctrl2VehicleAckTag);
+NS_OBJECT_ENSURE_REGISTERED(RevocationBulletinTag);
 
 // ---------------------------------------------------------------------------
 // Filesystem setup
@@ -11235,6 +11380,63 @@ LogReceivedPacket(const std::string& receiverRole,
         return;
     }
 
+    // --- Revocation bulletin -------------------------------------------------
+    // Trust comes from the manifest's 2-of-3 threshold endorsement, which the RSU
+    // already verified before blacklisting, so a vehicle needs no session key and no
+    // registration to accept this.
+    //
+    // The early return must apply to EVERY receiver role, not just vehicles.  These are
+    // link-layer broadcasts, so neighbouring RSUs hear them too; letting those fall
+    // through counted 56,070 bulletin receptions into g_allReceived, which inflated the
+    // M3 denominator (making attraction look far lower than it was) and pushed M1 PDR
+    // from 3.8 to 8.5.  RSUs need no action here — they hold the blacklist already.
+    if (hasTag && messageType == static_cast<uint32_t>(REVOCATION_BULLETIN))
+    {
+        RevocationBulletinTag bt;
+        if (receiverRole == "vehicle" &&
+            packet->PeekPacketTag(bt) && receiverId < g_vehicleRevokedIdBlacklist.size())
+        {
+            ++g_revocationBulletinsReceived;
+            if (bt.version > g_vehicleBulletinVersion[receiverId])
+            {
+                g_vehicleBulletinVersion[receiverId] = bt.version;
+                for (uint32_t k = 0; k < bt.idCount && k < RevocationBulletinTag::MAX_IDS; ++k)
+                    g_vehicleRevokedIdBlacklist[receiverId].insert(bt.ids[k]);
+                g_vehiclesReachedByBulletin.insert(receiverId);
+
+                // Drop any already-learned neighbour records for the revoked ids. Without
+                // this the vehicle keeps carrying stale Sybil observations upward inside
+                // its own V2RSU reports, which is exactly how these identities reached the
+                // RSU tables in the first place.
+                if (receiverId < g_vehicleNeighborTables.size())
+                    for (uint32_t k = 0; k < bt.idCount && k < RevocationBulletinTag::MAX_IDS; ++k)
+                        g_vehicleNeighborTables[receiverId].erase(bt.ids[k]);
+
+                std::cout << "[RevocationBulletin] vehicle=" << receiverId
+                          << " applied v=" << bt.version
+                          << " ids=" << bt.idCount
+                          << " (total known=" << g_vehicleRevokedIdBlacklist[receiverId].size()
+                          << ") from=" << bt.rsuId << std::endl;
+            }
+        }
+        return;   // bulletins carry no BSM/awareness payload — nothing else to do
+    }
+
+    // --- Vehicle-tier revocation enforcement ---------------------------------
+    // A vehicle holding the bulletin drops traffic from revoked identities. This is the
+    // V2V tier — 84.9% of sybil traffic — which the RSU-tier drop does not cover.
+    // Placed before the metrics hooks so blocked traffic is not counted as successfully
+    // diverted; the matching transmit-side exclusion (SendTaggedPacket) keeps M1 PDR
+    // honest, since unlike RSU receptions these DO sit in the PDR numerator.
+    if (hasTag && receiverRole == "vehicle" && FullCryptoMechanismActive() &&
+        receiverId < g_vehicleRevokedIdBlacklist.size() &&
+        g_vehicleRevokedIdBlacklist[receiverId].count(tag.GetClaimedNodeId()) > 0)
+    {
+        ++g_vehicleRevocationDroppedPackets;
+        g_vehicleRevocationDroppedIds.insert(tag.GetClaimedNodeId());
+        return;
+    }
+
     if (hasTag)
     {
         std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
@@ -12930,6 +13132,17 @@ SendRsuControllerReport(uint32_t rsuIndex)
         };
         for (auto it = regionalTable.begin(); it != regionalTable.end(); ++it)
         {
+            // Never forward a revoked identity upstream. The purge on revocation already
+            // removes its resident record, so this is the standing invariant rather than
+            // the primary mechanism: it holds even if some other path reintroduces the id
+            // between revocation and this report.
+            if (FullCryptoMechanismActive() &&
+                rsuIndex < g_rsuRevokedVehicleBlacklist.size() &&
+                g_rsuRevokedVehicleBlacklist[rsuIndex].count(it->second.claimedVehicleId) > 0)
+            {
+                continue;
+            }
+
             if (sendSnapshot || it->second.dirty || it->second.lastSeenTime >= windowStart)
             {
                 if (batchTag.GetRecordCount() >= MAX_RSU2CONTROLLER_RECORDS)
@@ -13827,6 +14040,15 @@ main(int argc, char* argv[])
     g_rsuRevokedVehicleBlacklist.assign(N_RSUs, std::set<uint32_t>());
     g_rsuRevocationDroppedPackets = 0;
     g_rsuRevocationDroppedIds.clear();
+    g_vehicleRevokedIdBlacklist.assign(N_Vehicles, std::set<uint32_t>());
+    g_vehicleBulletinVersion.assign(N_Vehicles, 0u);
+    g_revocationBulletinVersion   = 0;
+    g_revocationBulletinsSent     = 0;
+    g_revocationBulletinsReceived = 0;
+    g_vehiclesReachedByBulletin.clear();
+    g_bulletinBroadcastPending    = false;
+    g_vehicleRevocationDroppedPackets = 0;
+    g_vehicleRevocationDroppedIds.clear();
     g_vehicleV2IAuthSessions.assign(N_Vehicles, std::map<uint32_t, V2IAuthSessionState>());
     g_rsuV2IAuthSessions.assign(N_RSUs, std::map<uint32_t, V2IAuthSessionState>());
     g_rsuPendingV2IAuthNonces.assign(N_RSUs, std::map<uint32_t, std::vector<uint8_t> >());
@@ -14680,6 +14902,20 @@ main(int argc, char* argv[])
                   << g_rsuRevocationDroppedPackets << "\n"
                   << "  distinct identities enforced on  : "
                   << g_rsuRevocationDroppedIds.size() << "\n" << std::flush;
+
+        // STEP 1 (distribution only, nothing enforced at vehicles yet).
+        std::size_t reached = g_vehiclesReachedByBulletin.size();
+        std::cout << "\n[RevocationBulletin] vehicle-tier distribution summary\n"
+                  << "  bulletins broadcast by RSUs      : " << g_revocationBulletinsSent << "\n"
+                  << "  bulletins received at vehicles   : " << g_revocationBulletinsReceived << "\n"
+                  << "  vehicles reached (>=1 applied)   : " << reached << " / " << N_Vehicles
+                  << " (" << (N_Vehicles ? 100.0 * static_cast<double>(reached) /
+                                           static_cast<double>(N_Vehicles) : 0.0)
+                  << "%)\n"
+                  << "  packets dropped at vehicles      : "
+                  << g_vehicleRevocationDroppedPackets << "\n"
+                  << "  identities enforced on (vehicle) : "
+                  << g_vehicleRevocationDroppedIds.size() << "\n" << std::flush;
     }
 
     if (RssiSolutionModeActive())
