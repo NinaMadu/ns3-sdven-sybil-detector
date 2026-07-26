@@ -28,6 +28,9 @@
 #include "rssi_sybil_detection.h"
 #include "fl_sybil_detection.h"
 #include "llm_realtime_detection.h"   // full-mode (MODE_FULL) real-time LLM detector
+#include "controller_sybil_detection.h"  // v6 malicious-SDN-controller detector (isolated;
+                                         // writes its own CSVs, never touches M5/M6 or the
+                                         // vehicle-tier evidence path)
 
 #include <algorithm>
 #include <chrono>
@@ -199,6 +202,19 @@ uint32_t llmMaxCandidates = 2000;            ///< Top-K identities/window (by ŷ
                                              ///< scale; a low cap throttles recall (cap=48 → in-sim
                                              ///< recall 0.19 vs 0.96 uncapped). Lower = less runtime.
 uint32_t llmMaxIdentities = 0;               ///< Hard ceiling on identities considered/window (0=none).
+double   llmDetectInterval = 10.0;           ///< Full-mode: sim-seconds between LLM SCORE windows.
+                                             ///< 10 s is the validated default. Short runs (e.g. a
+                                             ///< 30 s sequential_all6 ladder, 5 s/phase) need a
+                                             ///< smaller value or most attack phases never get a
+                                             ///< detection window at all. Lower = more windows =
+                                             ///< proportionally more wall-clock.
+std::string ablateAnalyzer = "";             ///< Ablation B1 (vehicle-tier analyzer contributions):
+                                             ///< "trust"|"rssi"|"temp" zeroes that phi-block in the
+                                             ///< Eq 3.18 fusion head and renormalises the survivors.
+                                             ///< "" = full head (the proposed condition).
+std::string ablateStream = "";               ///< Ablation B2 (RSU-tier ensemble evidence streams):
+                                             ///< "fl_only"|"temp_only"|"rssi_only" pins the Eq 3.20
+                                             ///< lambda to one term. "" = jointly-tuned lambda.
 uint32_t p4SelfTestRealId = 0;               ///< >0: run the P4 FP-safety self-test on this REAL
                                              ///< vehicle id instead of the daemon (proves the
                                              ///< real-id corroboration branch: t=10 DEFERRED,
@@ -5717,6 +5733,58 @@ WriteV5DetectionSummary()
               << "  -> " << rsuDetectionQualityCsv << "\n";
 }
 
+// ---------------------------------------------------------------------------
+// v6 (malicious SDN controller) revocation.
+//
+// Mirrors Algorithm 7 line 16: RevokeEntity(c_mal, ..., C \ {c_mal}, v6).  The
+// accused controller is EXCLUDED from the authority that revokes it — the
+// authority id is the first controller that is not the accused — so a
+// compromised controller cannot veto its own removal.
+// ---------------------------------------------------------------------------
+static std::string
+RevokeMaliciousController(uint32_t controllerId)
+{
+    // Authority = any peer controller (C \ {c_mal}).
+    uint32_t authorityId = (controllerId == 0u && N_Controllers > 1u) ? 1u : 0u;
+
+    // Quorum sanity: the honest remainder must still be able to co-authorise.
+    uint32_t remaining = (N_Controllers > 0u) ? N_Controllers - 1u : 0u;
+    uint32_t tc        = GetControllerRegistrationThreshold();
+    if (remaining < tc)
+    {
+        std::cout << "[V6Detect] WARNING controller=" << controllerId
+                  << " flagged but remaining honest controllers (" << remaining
+                  << ") < t_c (" << tc << "): revocation would break liveness."
+                  << std::endl;
+    }
+
+    std::vector<std::string> evidenceCids;   // assertion evidence lives in the v6 CSVs
+    std::string isolationCid =
+        RevokeEntityCurrentCrypto("controller", controllerId, authorityId,
+                                  "v6_malicious_sdn_controller",
+                                  evidenceCids, std::string());
+
+    std::cout << "[V6Detect] REVOKE controller=" << controllerId
+              << " authority=" << authorityId
+              << " remaining=" << remaining << "/" << N_Controllers
+              << " t_c=" << tc
+              << " isolation_cid=" << isolationCid << std::endl;
+    return isolationCid;
+}
+
+// Periodic S6 evaluation; self-reschedules until the end of the run.
+static void
+EvaluateControllerAssertionWindow()
+{
+    double now = Simulator::Now().GetSeconds();
+    ControllerDetectionEvaluateWindow(now, N_Controllers, &RevokeMaliciousController);
+
+    double next = now + std::max(0.1, controllerDetectWindowSec);
+    if (next < simTime)
+        Simulator::Schedule(Seconds(std::max(0.1, controllerDetectWindowSec)),
+                            &EvaluateControllerAssertionWindow);
+}
+
 static void
 LogRssiVerification(uint32_t observerVehicleId,
                     uint32_t observedClaimedId,
@@ -7383,6 +7451,10 @@ UpdateRsuVehicleRecord(uint32_t rsuIndex, const SybilPacketTag& tag, uint32_t tr
     record.distanceToRsu = distanceToRsu;
     g_rsuVehicleTables[rsuIndex][claimedVehicleId] = record;
     LogRsuVehicleTableEvent("learned_or_updated", rsuIndex, record, false, "in_range", triggerSeq);
+
+    // v6 detector provenance (additive: records that this identity was heard
+    // over the air by this RSU).  Read-only for every other subsystem.
+    ControllerDetectionNoteOverTheAirObservation(rsuIndex, claimedVehicleId);
 }
 
 static bool
@@ -10216,6 +10288,30 @@ HandleControllerSybilInjection(const std::string& receiverRole,
     uint32_t phantomId = tag.GetClaimedNodeId();
     // Only accept out-of-range IDs — intra-range IDs would collide with real vehicles.
     if (phantomId < g_vehicleNodes.GetN()) return;
+
+    // ---- v6 detection point: corroborate the controller's assertion --------
+    // The asserting controller is carried in realNodeId.  The detector decides
+    // purely on observation provenance; if the identity cannot be corroborated
+    // by this RSU or its peers, the assertion is rejected here and counted
+    // against that controller's S6 score.
+    uint32_t assertingController = tag.GetRealNodeId();
+    bool accept = ControllerDetectionRecordAssertion(receiverId,
+                                                     assertingController,
+                                                     phantomId,
+                                                     g_vehicleNodes.GetN(),
+                                                     Simulator::Now().GetSeconds());
+    if (!accept)
+    {
+        RsuVehicleRecord rejected;
+        rejected.realVehicleId    = phantomId;
+        rejected.claimedVehicleId = phantomId;
+        rejected.lastSeenTime     = Simulator::Now().GetSeconds();
+        rejected.lastPosition     = Vector(0.0, 0.0, 0.0);
+        rejected.distanceToRsu    = 0.0;
+        LogRsuVehicleTableEvent("rejected", receiverId, rejected, false,
+                                "uncorroborated_controller_assertion");
+        return;
+    }
 
     RsuVehicleRecord phantom;
     phantom.realVehicleId    = phantomId;
@@ -13303,6 +13399,9 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("llmEnsembleGate",                 llmEnsembleGate);
     getUint("llmMaxCandidates",                  llmMaxCandidates);
     getUint("llmMaxIdentities",                  llmMaxIdentities);
+    getDouble("llmDetectInterval",               llmDetectInterval);
+    getStr("ablateAnalyzer",                     ablateAnalyzer);
+    getStr("ablateStream",                       ablateStream);
     getDouble("detectLatency",                   detectLatencySec);
     getDouble("vehicleSpacing",                  vehicleSpacing);
     getDouble("minVehicleSpeed",                 minVehicleSpeed);
@@ -13407,6 +13506,12 @@ main(int argc, char* argv[])
     cmd.AddValue("rsuTrustAnomalyThreshold",   "S5 approval-anomaly threshold for RSU trust demotion", rsuTrustAnomalyThreshold);
     cmd.AddValue("rsuTrustDisagreementEpsilon", "epsilon_5 deviation from cross-RSU mean S5 required before RSU trust penalty", rsuTrustDisagreementEpsilon);
     cmd.AddValue("sdnAttestationCheckEnabled", "SDN verifies RSU-asserted identities against its own token-issuance ledger (T_valid)", sdnAttestationCheckEnabled);
+    cmd.AddValue("controllerDetectEnabled",   "v6: enable malicious-SDN-controller detection (RSU corroboration of controller-asserted identities)", controllerDetectEnabled);
+    cmd.AddValue("controllerDetectBlock",     "v6: reject uncorroborated controller assertions (false = detect+score only, attack still lands)", controllerDetectBlock);
+    cmd.AddValue("controllerPeerCorroborate", "v6: k peer RSUs whose over-the-air observation corroborates a controller-asserted identity", controllerPeerCorroborate);
+    cmd.AddValue("controllerS6Threshold",     "v6: theta_6 on the per-controller uncorroborated-assertion fraction S6", controllerS6Threshold);
+    cmd.AddValue("controllerS6MinSamples",    "v6: minimum assertions before a controller can be flagged", controllerS6MinSamples);
+    cmd.AddValue("controllerDetectWindowSec", "v6: S6 evaluation window length in seconds", controllerDetectWindowSec);
     cmd.AddValue("sdnAttestationGraceReports", "Report epochs an identity may stay unattested before counting against the RSU", sdnAttestationGraceReports);
     cmd.AddValue("rsuTrustWindowInterval", "Seconds per Eq. 3.9 RSU approval-anomaly evaluation window", rsuTrustWindowInterval);
     cmd.AddValue("rsuTrustWindowAnomalyThreshold", "theta_5 for the windowed Eq. 3.9 score (attestation-based numerator)", rsuTrustWindowAnomalyThreshold);
@@ -13418,6 +13523,9 @@ main(int argc, char* argv[])
     cmd.AddValue("llmEnsembleGate", "Full-mode throughput: ŷ_ens threshold to send an identity to the 3-agent LLM (below = ensemble-cleared legit, no LLM call)", llmEnsembleGate);
     cmd.AddValue("llmMaxCandidates", "Full-mode throughput: max identities/window (top-K by ŷ_ens) adjudicated by the LLM; raise for dense-attack runs", llmMaxCandidates);
     cmd.AddValue("llmMaxIdentities", "Full-mode throughput: hard ceiling on identities considered per window (0 = none)", llmMaxIdentities);
+    cmd.AddValue("llmDetectInterval", "Full-mode: sim-seconds between LLM detection windows (default 10; lower it for short runs so every attack phase gets scored)", llmDetectInterval);
+    cmd.AddValue("ablateAnalyzer", "Ablation B1: drop one vehicle-tier analyzer from the Eq 3.18 fusion head — trust|rssi|temp (empty = full head)", ablateAnalyzer);
+    cmd.AddValue("ablateStream", "Ablation B2: pin the Eq 3.20 RSU ensemble to one evidence stream — fl_only|temp_only|rssi_only (empty = jointly-tuned lambda)", ablateStream);
     cmd.AddValue("detectLatency", "Full-mode modeled detection->revocation reaction delay in sim-seconds (verdict at t, revocation effective at t+detectLatency; 0 = instant)", detectLatencySec);
     cmd.AddValue("p4SelfTest", "Full-mode P4 FP-safety self-test: REAL vehicle id to inject a synthetic sybil verdict for at t=10 and t=20 (0=off; proves deferral->corroboration; daemon not launched)", p4SelfTestRealId);
     cmd.AddValue("vehicleSpacing",             "Initial vehicle spacing in metres",vehicleSpacing);
@@ -14298,8 +14406,31 @@ main(int argc, char* argv[])
             LLMRealtimeDetector::SetEnsembleGate(llmEnsembleGate);
             LLMRealtimeDetector::SetMaxLlmCandidates(static_cast<int>(llmMaxCandidates));
             LLMRealtimeDetector::SetMaxIdentities(static_cast<int>(llmMaxIdentities));
+            // B1/B2 ablations. Reject a typo loudly: silently falling back to the full
+            // pipeline would make a degraded condition indistinguishable from the baseline.
+            if (!ablateAnalyzer.empty() && ablateAnalyzer != "trust"
+                && ablateAnalyzer != "rssi" && ablateAnalyzer != "temp")
+            {
+                NS_FATAL_ERROR("--ablateAnalyzer must be trust|rssi|temp (got '"
+                               << ablateAnalyzer << "')");
+            }
+            if (!ablateStream.empty() && ablateStream != "fl_only"
+                && ablateStream != "temp_only" && ablateStream != "rssi_only")
+            {
+                NS_FATAL_ERROR("--ablateStream must be fl_only|temp_only|rssi_only (got '"
+                               << ablateStream << "')");
+            }
+            if (!ablateAnalyzer.empty() || !ablateStream.empty())
+            {
+                std::cout << "[LLMRealtime] ABLATION active:"
+                          << " analyzer_dropped=" << (ablateAnalyzer.empty() ? "none" : ablateAnalyzer)
+                          << " ensemble_stream=" << (ablateStream.empty() ? "tuned-lambda" : ablateStream)
+                          << "\n" << std::flush;
+            }
+            LLMRealtimeDetector::SetAblateAnalyzer(ablateAnalyzer);
+            LLMRealtimeDetector::SetAblateStream(ablateStream);
             LLMRealtimeDetector::SetDetectLatency(detectLatencySec);
-            LLMRealtimeDetector::Init(10.0);
+            LLMRealtimeDetector::Init(llmDetectInterval);
         }
     }
 
@@ -14311,8 +14442,35 @@ main(int argc, char* argv[])
                             &EvaluateRsuApprovalWindow);
     }
 
+    // v6 control-plane detector (malicious SDN controller).  Only meaningful
+    // when the controller tier is under attack; the assertion path it scores
+    // exists solely under sybil_attack_type=6.
+    bool v6DetectActive = controllerDetectEnabled &&
+                          sybil_attack_enabled &&
+                          (sybil_attack_type == 6u ||
+                           sybil_attack_type == 9u ||
+                           controller_malicious_assumption);
+    if (v6DetectActive)
+    {
+        ControllerDetectionInit(outputDir, N_RSUs);
+        std::cout << "[V6Detect] enabled: theta_6=" << controllerS6Threshold
+                  << " min_samples=" << controllerS6MinSamples
+                  << " peer_k=" << controllerPeerCorroborate
+                  << " window=" << controllerDetectWindowSec << "s"
+                  << " block=" << (controllerDetectBlock ? "true" : "false")
+                  << std::endl;
+        Simulator::Schedule(Seconds(std::max(0.1, controllerDetectWindowSec)),
+                            &EvaluateControllerAssertionWindow);
+    }
+    else
+    {
+        controllerDetectEnabled = false;   // keep every other run path untouched
+    }
+
     Simulator::Run();
     Simulator::Destroy();
+    if (v6DetectActive)
+        ControllerDetectionFinalize(simTime, N_Controllers);
     if (FullSolutionModeActive() && p4SelfTestRealId == 0)
         LLMRealtimeDetector::FinalizeAndReport();
     if (FullCryptoMechanismActive() && rsuTrustWindowedS5Enabled)

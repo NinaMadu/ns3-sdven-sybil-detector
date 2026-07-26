@@ -214,7 +214,6 @@ CryptoRandBytes(size_t n)
 }
 
 // ---------------------------------------------------------------------------
-
 // ECDH ephemeral key generation — fresh P-256 keypair each call.
 //   returns: {priv(32B), pub(64B x||y)}; both empty on failure.
 // ---------------------------------------------------------------------------
