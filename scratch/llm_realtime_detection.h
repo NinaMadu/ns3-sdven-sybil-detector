@@ -68,6 +68,11 @@ static int         g_maxLlmCandidates = 2000;// top-K by ŷ_ens adjudicated by t
                                             // throttles recall (cap=48 gave in-sim recall 0.19 vs
                                             // 0.96 uncapped). Lower it to trade recall for runtime.
 static int         g_maxIdentities = 0;    // hard ceiling on rows/window (0 = none)
+// ── B1/B2 ablation knobs (empty = proposed/full pipeline; forwarded to the daemon) ──
+static std::string g_ablateAnalyzer = "";  // B1: "trust"|"rssi"|"temp" — zero that vehicle-tier
+                                           //     phi-block in the Eq 3.18 head (renormalised)
+static std::string g_ablateStream   = "";  // B2: "fl_only"|"temp_only"|"rssi_only" — pin the
+                                           //     Eq 3.20 lambda to a single evidence stream
 static std::string g_sock   = "/tmp/sybil_rt_detect.sock";       // MUST be < 108 chars
 static std::string g_runDir = "sybil-attack/outputs";            // where the sim writes logs
 static std::string g_python = "sybil-attack/ml/.venv/bin/python";
@@ -99,6 +104,8 @@ static void (*g_verdictSink)(const std::vector<Verdict>&) = nullptr;
 [[maybe_unused]] static void SetEnsembleGate(double g)   { g_ensembleGate = g; }
 [[maybe_unused]] static void SetMaxLlmCandidates(int k)  { g_maxLlmCandidates = k; }
 [[maybe_unused]] static void SetMaxIdentities(int n)     { g_maxIdentities = n; }
+[[maybe_unused]] static void SetAblateAnalyzer(const std::string& b) { g_ablateAnalyzer = b; }
+[[maybe_unused]] static void SetAblateStream(const std::string& s)   { g_ablateStream = s; }
 [[maybe_unused]] static void SetVerdictSink(void (*cb)(const std::vector<Verdict>&)) { g_verdictSink = cb; }
 
 // ── launch the persistent daemon in the background ───────────────────────────
@@ -114,6 +121,11 @@ static void LaunchDaemon()
         << " --max-llm-candidates " << g_maxLlmCandidates;
     if (g_maxIdentities > 0)
         cmd << " --max-identities " << g_maxIdentities;
+    // B1/B2 ablations: forwarded only when set, so a normal run's argv is unchanged.
+    if (!g_ablateAnalyzer.empty())
+        cmd << " --ablate-analyzer " << g_ablateAnalyzer;
+    if (!g_ablateStream.empty())
+        cmd << " --ablate-stream " << g_ablateStream;
     cmd << " > " << g_daemonLog << " 2>&1 &'";
     std::cout << "[LLMRealtime] launching detector daemon: " << g_script << "\n"
               << "              log -> " << g_daemonLog << "\n" << std::flush;

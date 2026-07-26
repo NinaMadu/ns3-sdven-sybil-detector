@@ -72,7 +72,8 @@ def _confidence(d_row, dg):
 class Daemon:
     def __init__(self, run_dir, cap=None, carry_forward=True, tol=20.0,
                  batch=64, max_new=128, agent_device=0, max_identities=None,
-                 window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=2000):
+                 window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=2000,
+                 ablate_analyzer=None, ablate_stream=None):
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
@@ -110,6 +111,15 @@ class Daemon:
         self._txgb_upto = float("-inf")  # cumulative state has folded in all beacons < this
         self.head = EL.FusionHeadLive.load()          # Eq 3.18 head (weights, no refit)
         # ŷ_ens (Eq 3.20) now blends all 3 terms: ŷ_i + p̄_temp + p̄_rssi (λ 0.3/0.5/0.2).
+        # ── ablations (default None = the proposed pipeline, byte-identical to before) ──
+        # B1: drop one vehicle-tier analyzer from the Eq 3.18 head (renormalised survivors).
+        # B2: pin the Eq 3.20 λ to a single evidence stream. Both are inference-time only —
+        # nothing is retrained, matching the offline b1_/b2_ scorers.
+        self.ablate_analyzer = ablate_analyzer
+        self.ablate_stream = ablate_stream
+        if ablate_analyzer:
+            self.head.ablate_block(ablate_analyzer)
+        self.lam = EL.STREAM_LAMBDAS[ablate_stream] if ablate_stream else None
 
         # incremental log caches: parse each physical log ONCE, then per-SCORE ingest
         # only the appended tail (kills the ~60 s/SCORE full re-read). comm feeds GRU +
@@ -136,7 +146,9 @@ class Daemon:
         self.sysmsg = {a: A.AGENTS[a]["system"] for a in A.AGENT_ORDER}
         print(f"[daemon] READY in {time.time() - t0:.0f}s "
               f"(θ={self.cfg['theta']}, ω={self.cfg['omega']}; "
-              f"ensemble_gate={self.ensemble_gate}, max_llm_candidates={self.max_llm_candidates})",
+              f"ensemble_gate={self.ensemble_gate}, max_llm_candidates={self.max_llm_candidates}; "
+              f"ablate_analyzer={self.ablate_analyzer or 'none'}, "
+              f"ablate_stream={self.ablate_stream or 'tuned-lambda'})",
               flush=True)
 
     # -- the full chain for one scoring window -------------------------------
@@ -200,7 +212,7 @@ class Daemon:
                             tol=(self.tol if self.carry_forward else None))
         # Eq 3.18 ŷ_i (from live φ) + Eq 3.20 ŷ_ens = renorm(λ1·ŷ_i + λ2·p̄_temp + λ3·p̄_rssi)
         # over the terms present for each window (all 3 now wired).
-        ci = EL.enrich(ci, head=self.head)
+        ci = EL.enrich(ci, head=self.head, lam=self.lam)
         if only_new:
             ci = ci[ci["window_start_seconds"] > self.last_t]
         self.last_t = max(self.last_t, t)
@@ -355,7 +367,7 @@ def main():
                     help="bounded incremental windowing lookback (s) for GRU/CNN/trust")
     ap.add_argument("--batch", type=int, default=64,
                     help="LLM generation batch size (measured sweet spot on RTX 5090; "
-                         "16->64 ~1.9x throughput, 64->96 only +11%)")
+                         "16->64 ~1.9x throughput, 64->96 only +11%%)")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--once", type=float, default=None, help="score once at t and print (no socket)")
     ap.add_argument("--max-identities", type=int, default=None, help="hard ceiling on rows/window")
@@ -365,13 +377,22 @@ def main():
                     help="max identities/window adjudicated by the 3 agents (top-K by ŷ_ens); "
                          "effectively uncapped at this scale — a low cap throttles recall "
                          "(cap=48 gave in-sim recall 0.19 vs 0.96 uncapped)")
+    ap.add_argument("--ablate-analyzer", default=None,
+                    choices=["trust", "rssi", "temp"],
+                    help="ablation B1: zero that vehicle-tier φ-block in the Eq 3.18 head "
+                         "and renormalise the survivors (omit = full head)")
+    ap.add_argument("--ablate-stream", default=None,
+                    choices=list(EL.STREAM_LAMBDAS),
+                    help="ablation B2: pin the Eq 3.20 λ to one evidence stream "
+                         "(omit = jointly-tuned λ)")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
 
     d = Daemon(args.run_dir, cap=args.cap, carry_forward=args.carry_forward,
                tol=args.tol, batch=args.batch, max_new=args.max_new,
                max_identities=args.max_identities, window_margin=args.window_margin,
-               ensemble_gate=args.ensemble_gate, max_llm_candidates=args.max_llm_candidates)
+               ensemble_gate=args.ensemble_gate, max_llm_candidates=args.max_llm_candidates,
+               ablate_analyzer=args.ablate_analyzer, ablate_stream=args.ablate_stream)
     if args.once is not None:
         vs = d.score(args.once, only_new=False, max_identities=args.max_identities)
         print(f"\n=== {len(vs)} verdicts @ t={args.once} ===")

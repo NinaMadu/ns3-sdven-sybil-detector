@@ -44,6 +44,7 @@ extern uint32_t sybil_attack_type;
 extern uint32_t sybil_attacker_level;
 extern bool     controller_malicious_assumption;
 extern double   rsuReportInterval;
+extern uint32_t N_Controllers;   ///< needed for per-controller v6 compromise flags
 
 // ---------------------------------------------------------------------------
 // Per-node and per-infrastructure attack state.
@@ -52,7 +53,8 @@ extern double   rsuReportInterval;
 
 static std::vector<bool>  g_vehicleIsAttacker;   ///< true ↔ vehicle participates in attack
 static std::vector<bool>  g_rsuIsMalicious;       ///< true ↔ RSU is compromised
-static bool               g_controllerIsMalicious = false;
+static bool               g_controllerIsMalicious = false;  ///< true ↔ ANY controller compromised
+static std::vector<bool>  g_controllerIsMaliciousVec;       ///< per-controller compromise flags (v6)
 static SybilAttackType    g_activeAttackType      = ATTACK_NONE;
 
 // ---------------------------------------------------------------------------
@@ -239,6 +241,29 @@ IsControllerMalicious()
     return g_controllerIsMalicious;
 }
 
+// Per-controller compromise query (v6).  g_controllerIsMalicious above stays as
+// the "any controller compromised" predicate so every existing caller keeps its
+// current meaning; this one answers the per-entity question the v6 detector and
+// its confusion matrix need.  Falls back to the global flag when the per-node
+// vector has not been sized (paths that never ran DeclareAttackers).
+inline bool
+IsControllerMaliciousById(uint32_t controllerIndex)
+{
+    if (controllerIndex < g_controllerIsMaliciousVec.size())
+        return g_controllerIsMaliciousVec[controllerIndex];
+    return g_controllerIsMalicious;
+}
+
+// Count of compromised controllers — used for the threat-model bound report.
+inline uint32_t
+MaliciousControllerCount()
+{
+    uint32_t n = 0;
+    for (std::size_t i = 0; i < g_controllerIsMaliciousVec.size(); ++i)
+        if (g_controllerIsMaliciousVec[i]) n++;
+    return n;
+}
+
 inline std::string
 AttackTypeToString(SybilAttackType t)
 {
@@ -345,6 +370,7 @@ DeclareAttackers()
     g_vehicleIsAttacker.assign(N_Vehicles, false);
     g_rsuIsMalicious.assign(N_RSUs, false);
     g_controllerIsMalicious = false;
+    g_controllerIsMaliciousVec.assign(std::max(1u, N_Controllers), false);
 
     if (g_activeAttackType == ATTACK_NONE) return;
 
@@ -396,10 +422,44 @@ DeclareAttackers()
     }
 
     // --- Controller-level (type 6 or explicit override) ---------------------
-    // The controller is a single node — its compromise is binary (on/off),
-    // not percentage-based.  sybil_attack_percentage does not gate this.
+    // sybil_attack_percentage now selects HOW MANY of the n_c controllers are
+    // compromised, mirroring the vehicle/RSU tiers:  f = floor(n_c * pct/100),
+    // with a floor of 1 whenever the attack is enabled at a non-zero percentage
+    // (a "malicious controller" run with zero malicious controllers is not the
+    // experiment anyone asked for).
+    //
+    // Threshold-safety note (reported, NOT enforced — running past the bound is
+    // a deliberate experiment):  a t_c-of-n_c co-authorisation scheme is only
+    // sound while BOTH
+    //      safety:    f <  t_c          (compromised set alone cannot reach quorum)
+    //      liveness:  t_c <= n_c - f    (honest set alone can still reach quorum)
+    // hold, which together require f <= (n_c - 1) / 2.  Above that ceiling no
+    // threshold value satisfies both and the tier is unprotectable by quorum.
     if (g_activeAttackType == ATTACK_MALICIOUS_SDN_CONTROLLER || controller_malicious_assumption)
-        g_controllerIsMalicious = true;
+    {
+        uint32_t nControllers = std::max(1u, N_Controllers);
+        uint32_t nMalicious   = nControllers * sybil_attack_percentage / 100u;
+        if (nMalicious == 0u && sybil_attack_percentage > 0u)
+            nMalicious = 1u;
+        if (controller_malicious_assumption && nMalicious == 0u)
+            nMalicious = 1u;                       // explicit override always compromises one
+        if (nMalicious > nControllers)
+            nMalicious = nControllers;
+
+        for (uint32_t i = 0; i < nMalicious; ++i)
+            g_controllerIsMaliciousVec[i] = true;
+        g_controllerIsMalicious = (nMalicious > 0u);
+
+        uint32_t ceiling = (nControllers - 1u) / 2u;   // f <= (n_c - 1)/2
+        std::cout << "[sybil_attacks] v6 controller compromise: f=" << nMalicious
+                  << "/" << nControllers
+                  << " (pct=" << sybil_attack_percentage << "%)"
+                  << " byzantine_ceiling=" << ceiling;
+        if (nMalicious > ceiling)
+            std::cout << "  *** ABOVE CEILING: no t_c satisfies both safety and"
+                         " liveness; quorum protection is void by construction ***";
+        std::cout << std::endl;
+    }
 
     // ── Mode 9: Sequential-All-6 — also mark RSUs and controller for phases 5-6 ──
     if (g_activeAttackType == ATTACK_SEQUENTIAL_ALL6)
@@ -1334,24 +1394,35 @@ RelayForwardSybilBeacon(uint32_t attackerIndex, uint32_t relayEpoch)
 static void
 MaliciousControllerInjectPhantoms(uint32_t rsuIndex)
 {
-    // Bug 4 fix: honour percentage honestly — 0 phantoms is valid at low percentage.
-    uint32_t nPhantoms =
-        std::min(SdnSybilBudget(), N_Vehicles * sybil_attack_percentage / 100u);
+    // The zone owner is the only controller that legitimately talks to this RSU,
+    // so it is the only one that can plausibly inject into it.  Percentage now
+    // selects WHICH controllers are compromised (see DeclareAttackers), and the
+    // phantom count per controller is the attacker-level budget.
+    uint32_t ownerController =
+        (rsuIndex < g_rsuControllerAssignment.size()) ? g_rsuControllerAssignment[rsuIndex] : 0u;
+    if (!IsControllerMaliciousById(ownerController)) return;
+
+    uint32_t nPhantoms = SdnSybilBudget();
     if (nPhantoms == 0) return;
     for (uint32_t f = 0; f < nPhantoms; ++f)
     {
         uint32_t fakeId = N_Vehicles + 150u + f;
-        Ptr<Socket> sock = CreateSenderSocket(g_controllerNode.Get(0));
+        Ptr<Node> srcNode = (ownerController < g_controllerNode.GetN())
+                            ? g_controllerNode.Get(ownerController)
+                            : g_controllerNode.Get(0);
+        Ptr<Socket> sock = CreateSenderSocket(srcNode);
         Ptr<TxInfo> tx = Create<TxInfo>();
         tx->packetSize    = 100;
-        tx->realNodeId    = 0;              // controller node index
+        // realNodeId carries the ORIGINATING controller index so the receiving
+        // RSU can attribute the assertion to a specific controller entity.
+        tx->realNodeId    = ownerController;
         tx->claimedNodeId = fakeId;         // authorises a non-existent vehicle
         tx->destinationId = rsuIndex;
         tx->messageType   = static_cast<uint32_t>(SYBIL_INJECTION);
         tx->sequenceNumber = g_seq++;
         std::cout << "[t=" << Simulator::Now().GetSeconds() << "] "
                   << "[SEND] [CTRL_SYBIL_INJECTION] "
-                  << "Controller FakeId=" << fakeId
+                  << "Controller=" << ownerController << " FakeId=" << fakeId
                   << " -> RSU=" << rsuIndex << std::endl;
         SendTaggedPacket(sock,
                          g_wiredInterfaces.GetAddress(rsuIndex),
