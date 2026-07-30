@@ -30,6 +30,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import fl_common as F
 from fl_common import C, A
+from per_class_mcc import per_class_mcc, summarise   # Eq 3.64, emitted directly
 sys.path.insert(0, os.path.join(F._LLM, "stage2_agents"))
 import consensus_infer as I     # noqa: E402  (shared generation + Eq 3.22 math)
 

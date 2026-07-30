@@ -68,11 +68,14 @@ static int         g_maxLlmCandidates = 2000;// top-K by ŷ_ens adjudicated by t
                                             // throttles recall (cap=48 gave in-sim recall 0.19 vs
                                             // 0.96 uncapped). Lower it to trade recall for runtime.
 static int         g_maxIdentities = 0;    // hard ceiling on rows/window (0 = none)
-// ── B1/B2 ablation knobs (empty = proposed/full pipeline; forwarded to the daemon) ──
+// ── B1/B2/C1 ablation knobs (empty = proposed/full pipeline; forwarded to the daemon) ──
 static std::string g_ablateAnalyzer = "";  // B1: "trust"|"rssi"|"temp" — zero that vehicle-tier
                                            //     phi-block in the Eq 3.18 head (renormalised)
 static std::string g_ablateStream   = "";  // B2: "fl_only"|"temp_only"|"rssi_only" — pin the
                                            //     Eq 3.20 lambda to a single evidence stream
+static std::string g_ablateLlm      = "";  // C1: "mlfl_only" — drop the LLM tier entirely and
+                                           //     threshold ŷ_ens (Eq 3.20) at a val-calibrated
+                                           //     scalar; no Eq 3.21 agents, no Eq 3.22 consensus
 static std::string g_sock   = "/tmp/sybil_rt_detect.sock";       // MUST be < 108 chars
 static std::string g_runDir = "sybil-attack/outputs";            // where the sim writes logs
 static std::string g_python = "sybil-attack/ml/.venv/bin/python";
@@ -112,6 +115,7 @@ static bool (*g_shouldScoreFn)() = nullptr;
 [[maybe_unused]] static void SetMaxIdentities(int n)     { g_maxIdentities = n; }
 [[maybe_unused]] static void SetAblateAnalyzer(const std::string& b) { g_ablateAnalyzer = b; }
 [[maybe_unused]] static void SetAblateStream(const std::string& s)   { g_ablateStream = s; }
+[[maybe_unused]] static void SetAblateLlm(const std::string& s)      { g_ablateLlm = s; }
 [[maybe_unused]] static void SetVerdictSink(void (*cb)(const std::vector<Verdict>&)) { g_verdictSink = cb; }
 [[maybe_unused]] static void SetShouldScoreGate(bool (*fn)()) { g_shouldScoreFn = fn; }
 
@@ -133,6 +137,8 @@ static void LaunchDaemon()
         cmd << " --ablate-analyzer " << g_ablateAnalyzer;
     if (!g_ablateStream.empty())
         cmd << " --ablate-stream " << g_ablateStream;
+    if (!g_ablateLlm.empty())
+        cmd << " --ablate-llm " << g_ablateLlm;
     cmd << " > " << g_daemonLog << " 2>&1 &'";
     std::cout << "[LLMRealtime] launching detector daemon: " << g_script << "\n"
               << "              log -> " << g_daemonLog << "\n" << std::flush;

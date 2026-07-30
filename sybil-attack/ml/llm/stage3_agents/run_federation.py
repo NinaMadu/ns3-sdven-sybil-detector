@@ -86,14 +86,25 @@ def kappa_conv(curve, window, tol):
     return None
 
 
-def train_zone(base, endpoint, zone, agent, init_adapter, out, mu, lc, tl, log, smoke):
+def round_lr(lc, rnd):
+    """Round-wise learning-rate decay:  lr_t = lr_0 · decay^(t-1).
+
+    Without this, every round restarts the local cosine schedule at the full lr,
+    so the federation never globally anneals and the Eq 3.73 plateau is never
+    reached. decay = 1.0 reproduces the original (non-decaying) behaviour.
+    """
+    decay = float(lc.get("lr_decay_per_round", 1.0))
+    return float(lc["lr"]) * (decay ** max(0, rnd - 1))
+
+
+def train_zone(base, endpoint, zone, agent, init_adapter, out, mu, lc, tl, log, smoke, rnd=1):
     cmd = [_PY, os.path.join(_HERE, "fedprox_train.py"),
            "--base", base, "--agent", agent,
            "--data", os.path.join(F.DATA_DIR, endpoint, agent, f"zone_{zone}"),
            "--init-adapter", init_adapter, "--out", out, "--mu", str(mu),
            "--epochs", str(0.02 if smoke else lc["epochs_per_round"]),
            "--batch", str(lc["batch"]), "--grad-accum", str(lc["grad_accum"]),
-           "--max-len", str(lc["max_len"]), "--lr", str(lc["lr"]),
+           "--max-len", str(lc["max_len"]), "--lr", str(round_lr(lc, rnd)),
            "--r", str(tl["r"]), "--alpha", str(tl["alpha"]), "--dropout", str(tl["dropout"])]
     sh(cmd, log)
 
@@ -149,7 +160,15 @@ def main():
     r0 = os.path.join(exp, "round_000")
     history = []
 
-    def eval_triple(adapters, split="val"):
+    def eval_triple(adapters, split="val", cache=None):
+        """Evaluate a 3-agent adapter set. With --resume, a round whose
+        metrics.json already exists is read back instead of re-generating it
+        (generation is the expensive half of a round)."""
+        if args.resume and cache and os.path.exists(cache):
+            m = json.load(open(cache))
+            if "mcc_macro" in m:
+                print(f"  [resume] reusing cached metrics {os.path.relpath(cache, exp)}")
+                return m
         m, tm = EV.evaluate_global(adapters, cfg, split=split)
         del tm                                     # drop (tok, model); free VRAM
         if _torch.cuda.is_available():
@@ -162,7 +181,7 @@ def main():
             if not os.path.exists(os.path.join(gdir[a], "adapter_model.safetensors")):
                 os.makedirs(os.path.dirname(gdir[a]), exist_ok=True)
                 shutil.copytree(os.path.join(init_dir, a), gdir[a], dirs_exist_ok=True)
-        m0 = eval_triple(gdir)
+        m0 = eval_triple(gdir, cache=os.path.join(r0, "metrics.json"))
         history.append({"round": 0, "mcc_macro": m0["mcc_macro"], "metrics": m0})
         json.dump(m0, open(os.path.join(r0, "metrics.json"), "w"), indent=2)
         print(f"  round 0 (init) mcc_macro={m0['mcc_macro']} binary_mcc={m0['binary_mcc']}")
@@ -176,7 +195,7 @@ def main():
                 for z in range(1, n_zones + 1):
                     out = os.path.join(rd, "local", f"zone_{z}", a)
                     if not (args.resume and os.path.exists(os.path.join(out, "adapter_model.safetensors"))):
-                        train_zone(base, args.endpoint, z, a, gdir[a], out, mu, lc, tl, log, args.smoke)
+                        train_zone(base, args.endpoint, z, a, gdir[a], out, mu, lc, tl, log, args.smoke, rnd)
                     zdirs.append(out)
                     weights.append(Dr[z])
                     local_dirs_all.append(out)
@@ -184,7 +203,7 @@ def main():
                 aggregate(zdirs, weights, zdirs[0], gout, log)
                 new_global[a] = gout
             gdir = new_global
-            m = eval_triple(gdir)
+            m = eval_triple(gdir, cache=os.path.join(rd, "metrics.json"))
             history.append({"round": rnd, "mcc_macro": m["mcc_macro"], "metrics": m})
             json.dump(m, open(os.path.join(rd, "metrics.json"), "w"), indent=2)
 
@@ -224,10 +243,10 @@ def main():
                 for a in A.AGENT_ORDER:
                     out = os.path.join(rd, "local", f"zone_{z}", a)
                     if not (args.resume and os.path.exists(os.path.join(out, "adapter_model.safetensors"))):
-                        train_zone(base, args.endpoint, z, a, zcur[z][a], out, mu, lc, tl, log, args.smoke)
+                        train_zone(base, args.endpoint, z, a, zcur[z][a], out, mu, lc, tl, log, args.smoke, rnd)
                     newz[a] = out
                 zcur[z] = newz
-                mz = eval_triple(newz)
+                mz = eval_triple(newz, cache=os.path.join(rd, "local", f"zone_{z}", "metrics.json"))
                 zone_m[z] = mz["mcc_macro"]
                 per_zone_curves[z].append(mz["mcc_macro"])
                 json.dump(mz, open(os.path.join(rd, "local", f"zone_{z}", "metrics.json"), "w"), indent=2)

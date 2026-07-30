@@ -187,6 +187,45 @@ bool rsuTrustImmediateRevoke = true;         ///< Alg. 7 lines 5-6: revoke on th
 // RSU is the point.
 bool v5EnforcementEnabled = false;
 
+// ---------------------------------------------------------------------------
+// Group E — Security Infrastructure ablations (thesis Table 5.3 / §5.2.5).
+//
+// Every default below reproduces the PROPOSED system exactly, so a run that
+// sets none of these flags behaves bit-for-bit as it did before they existed.
+// Only the degraded baseline conditions need a flag.
+//
+//   E1  Post-Quantum vs Classical vs No Mitigation
+//         proposed : --full_crypto_profile=2                    (defaults)
+//         classical: --full_crypto_profile=1 --rsuRevocationThreshold=1
+//         none     : --ablateMitigation=none
+//   E2  Threshold Dilithium vs Single-Signer Revocation
+//         proposed : --rsuRevocationThreshold=3 --rsuEndorserPoolSize=5
+//         single   : --rsuRevocationThreshold=1 --rsuEndorserPoolSize=5
+//   E3  Dynamic Trust-Driven vs Static RSU Endorser Set
+//         proposed : --rsuEndorserPolicy=dynamic                (default)
+//         static   : --rsuEndorserPolicy=static
+// ---------------------------------------------------------------------------
+std::string ablateMitigation = "";           ///< E1(iii). "" = full mitigation pipeline;
+                                             ///< "none" = detection still fires and is scored,
+                                             ///< but RevokeEntity is never called, so Sybil
+                                             ///< identities persist to the end of the window.
+uint32_t rsuRevocationThreshold = 0;         ///< E1/E2: t in the t-of-n RSU co-authorisation of
+                                             ///< Eq. (3.47). 0 = legacy GetRsuThreshold(N_RSUs),
+                                             ///< which is driven by controllerRegistrationThreshold.
+                                             ///< Set explicitly so E2 does not also move the
+                                             ///< controller registration quorum.
+uint32_t rsuEndorserPoolSize = 0;            ///< E2: n, the active signer set the t signatures are
+                                             ///< drawn from (top-n by omega). 0 = every eligible RSU.
+std::string rsuEndorserPolicy = "dynamic";   ///< E3. "dynamic" = Table 3.4 three-state lifecycle
+                                             ///< gates manifest signing on omega_r >= theta_endorse;
+                                             ///< "static" = every RSU signs permanently, whatever
+                                             ///< its trust history or detected misbehaviour.
+bool maliciousRsuForgeRevocation = false;    ///< E2 adversary: a compromised RSU unilaterally
+                                             ///< fabricates a revocation manifest naming a
+                                             ///< LEGITIMATE vehicle, signed by itself alone.
+                                             ///< Without this the two E2 conditions are
+                                             ///< observationally identical.
+double maliciousRsuForgeInterval = 5.0;      ///< Seconds between forgery attempts per malicious RSU.
 
 double weightedDetectionConsensusThreshold = 1.0; ///< theta_consensus for weighted RSU detection votes.
 uint32_t llmRevokeMinWindows = 2;            ///< Phase-4 FP safety: a REAL id (< N_Vehicles) needs
@@ -215,6 +254,10 @@ std::string ablateAnalyzer = "";             ///< Ablation B1 (vehicle-tier anal
 std::string ablateStream = "";               ///< Ablation B2 (RSU-tier ensemble evidence streams):
                                              ///< "fl_only"|"temp_only"|"rssi_only" pins the Eq 3.20
                                              ///< lambda to one term. "" = jointly-tuned lambda.
+std::string ablateLlm = "";                  ///< Ablation C1 (LLM multi-agent tier vs ML-FL only):
+                                             ///< "mlfl_only" drops the Eq 3.21 agents and the Eq 3.22
+                                             ///< consensus, thresholding ŷ_ens (Eq 3.20) directly at a
+                                             ///< val-calibrated scalar. "" = full LLM tier (proposed).
 uint32_t p4SelfTestRealId = 0;               ///< >0: run the P4 FP-safety self-test on this REAL
                                              ///< vehicle id instead of the daemon (proves the
                                              ///< real-id corroboration branch: t=10 DEFERRED,
@@ -264,6 +307,37 @@ std::string rsuApprovalLogCsv    = "sybil-attack/outputs/rsu_approval_log.csv";
 std::string rsuDetectionQualityCsv =
     "sybil-attack/outputs/metrics_v5_rsu_detection_quality.csv";
 std::string controllerLogCsv     = "sybil-attack/outputs/controller_log.csv";
+
+// ── Group E ablation ledgers ───────────────────────────────────────────────
+// E1(iii): every revocation the detector asked for and --ablateMitigation=none
+// suppressed. Written so the "no mitigation" arm still yields a detection
+// timeline — Sybil identities persist, but we know exactly when the system
+// WOULD have cut them off, which is what makes the PDR/Xi contrast readable.
+std::string e1SuppressedRevocationCsv =
+    "sybil-attack/outputs/metrics_E1_suppressed_revocations.csv";
+// E2: every revocation manifest a compromised RSU fabricated, and whether the
+// receiving RSU's t-of-n policy accepted it.
+std::string e2ForgedRevocationCsv =
+    "sybil-attack/outputs/metrics_E2_forged_revocations.csv";
+// E1: MEASURED cost of one mitigation event — real wall-clock microseconds
+// spent signing + publishing, and the real byte size of the records produced.
+//
+// This exists because metrics_M7_revocation_latency.csv cannot answer E1: its
+// latency_ms is an analytical constant and its crypto_scheme column is
+// hardcoded to the PQC string regardless of --full_crypto_profile, so under
+// the classical arm M7 would report PQC timings for ECDSA work. E1 asks
+// exactly how much the post-quantum pipeline costs over the classical one, so
+// it needs a measurement, not a label.
+std::string e1RevocationCostCsv =
+    "sybil-attack/outputs/metrics_E1_revocation_cost.csv";
+
+// E1 cost instrumentation. PublishFullModeRevocationManifest fills these in for
+// the revocation currently being issued; RevokeEntityCurrentCrypto reads them
+// back when it writes the cost row. Single-threaded discrete-event simulator,
+// so plain globals are safe here.
+static std::size_t g_lastManifestBytes        = 0;
+static std::size_t g_lastManifestEndorsements = 0;
+static uint32_t    g_lastManifestThreshold    = 0;
 
 
 // Persistent CSV file handles — opened once after headers are written, closed at program exit.
@@ -1049,6 +1123,32 @@ HashStringHex(const std::string& value)
     return BytesToHex(CryptoSha256(StringToBytes(value)));
 }
 
+// ── Group E ablation predicates (see the flag block near the top) ───────────
+//
+// Each is false / identity for the proposed system, so the untouched build is
+// unchanged. They are deliberately tiny and read at the single choke point
+// each condition needs, rather than being sprinkled through the call graph.
+
+// E1(iii). Detection still runs, is scored into M5/M6 and logged; only the
+// RevokeEntity call of Algorithm 4 is suppressed.
+static bool
+MitigationDisabled()
+{
+    return ablateMitigation == "none";
+}
+
+// E3(ii). Endorsement eligibility ignores the Table 3.4 lifecycle entirely.
+// omega is still computed, penalised (Eq. 3.42) and logged — the trust history
+// exists, it just no longer gates manifest signing. That is precisely the
+// report's "static endorser set ... regardless of detected misbehaviour or
+// trust score history", and it keeps RSU revocation itself intact so
+// L_revoke(e) remains measurable in BOTH conditions.
+static bool
+StaticEndorserPolicy()
+{
+    return rsuEndorserPolicy == "static";
+}
+
 static RsuTrustRole
 RoleForRsuTrustScore(double omega)
 {
@@ -1147,6 +1247,13 @@ static bool
 IsRsuTrustEndorser(uint32_t rsuId)
 {
     EnsureRsuTrustTableInitialized();
+    // E3(ii): under a static endorser set every RSU signs permanently. This is
+    // the ONE place the dynamic lifecycle is consulted for signing rights —
+    // both BuildRsuManifestEndorsements (token manifests) and
+    // ApplyRevocationManifestJson (signer eligibility) route through here — so
+    // overriding it here is the whole ablation.
+    if (StaticEndorserPolicy())
+        return rsuId < N_RSUs;
     return rsuId < g_rsuTrustTable.size() &&
            g_rsuTrustTable[rsuId].role == RSU_TRUST_ENDORSER;
 }
@@ -1177,8 +1284,16 @@ LogRsuTrustLifecycleEvent(const std::string& event,
         << status << "\n";
 }
 
+// Returns the t signers of the t-of-n co-authorisation in Eq. (3.47).
+//
+// poolSize (n) is the ACTIVE SIGNER SET: the n highest-trust eligible RSUs.
+// The t signatures are drawn from that set. n = 0 means "every eligible RSU is
+// an active signer", which is the historical behaviour and stays the default.
+// Modelling n explicitly matters because quorum is unreachable — and the
+// revocation correctly refused — whenever the pool holds fewer than t eligible
+// RSUs, which is exactly the liveness edge E2 and E3 push on.
 static std::vector<uint32_t>
-SelectTrustedRsuEndorsers(uint32_t threshold)
+SelectTrustedRsuEndorsers(uint32_t threshold, uint32_t poolSize = 0)
 {
     EnsureRsuTrustTableInitialized();
     std::vector<uint32_t> candidates;
@@ -1197,6 +1312,12 @@ SelectTrustedRsuEndorsers(uint32_t threshold)
                   return trustA > trustB;
               });
 
+    // Restrict to the n active signers first, so a shortfall inside the pool is
+    // reported as a shortfall rather than being silently back-filled from RSUs
+    // that are not part of the signer set.
+    if (poolSize > 0 && candidates.size() > poolSize)
+        candidates.resize(poolSize);
+
     if (candidates.size() > threshold)
         candidates.resize(threshold);
 
@@ -1204,6 +1325,7 @@ SelectTrustedRsuEndorsers(uint32_t threshold)
     {
         std::cerr << "[RsuTrust] WARNING: trusted endorsers="
                   << candidates.size() << "/" << threshold
+                  << (poolSize > 0 ? (" (pool n=" + std::to_string(poolSize) + ")") : "")
                   << "; threshold manifest may be rejected" << std::endl;
     }
     return candidates;
@@ -2023,6 +2145,30 @@ GetRsuThreshold(uint32_t participantCount)
 {
     participantCount = std::max(1u, participantCount);
     return std::min(std::max(1u, controllerRegistrationThreshold), participantCount);
+}
+
+// t for the RSU-tier threshold revocation of Eq. (3.47).
+//
+// Historically this was GetRsuThreshold(N_RSUs), i.e. it rode on
+// controllerRegistrationThreshold. E2 has to move t WITHOUT moving the
+// controller registration quorum, or the two conditions differ in more than
+// the one variable the ablation names. --rsuRevocationThreshold overrides it
+// on its own; 0 keeps the legacy coupling so untouched runs are unchanged.
+static uint32_t
+GetRsuRevocationThreshold()
+{
+    if (rsuRevocationThreshold > 0)
+        return std::min(rsuRevocationThreshold, std::max(1u, N_RSUs));
+    return GetRsuThreshold(N_RSUs);
+}
+
+// n, the active signer set the t signatures are drawn from. 0 = all RSUs.
+static uint32_t
+GetRsuEndorserPoolSize()
+{
+    return (rsuEndorserPoolSize > 0)
+               ? std::min(rsuEndorserPoolSize, std::max(1u, N_RSUs))
+               : 0u;
 }
 
 static uint32_t
@@ -3454,7 +3600,19 @@ ApplyRevocationManifestJson(uint32_t rsuId,
 
     std::string entityType = ExtractJsonStringField(manifestJson, "entity_type");
     uint32_t entityId = ExtractJsonUintField(manifestJson, "entity_id", 0);
-    uint32_t threshold = ExtractJsonUintField(manifestJson, "endorsement_threshold", 1);
+
+    // The threshold carried INSIDE the manifest is attacker-controlled data: a
+    // compromised RSU that forges a manifest can simply write
+    // "endorsement_threshold": 1 and have it self-validate. The verifier must
+    // therefore hold the manifest to the RECEIVER's own policy, and use the
+    // manifest's field only when it demands MORE signatures than local policy.
+    // Without this, --rsuRevocationThreshold has no enforcement side and E2's
+    // two conditions collapse into one.
+    uint32_t claimedThreshold = ExtractJsonUintField(manifestJson, "endorsement_threshold", 1);
+    uint32_t policyThreshold = (entityType == "vehicle")
+                                   ? GetRsuRevocationThreshold()
+                                   : GetControllerRegistrationThreshold();
+    uint32_t threshold = std::max(claimedThreshold, policyThreshold);
 
     std::set<uint32_t> signers;
     std::size_t pos = 0;
@@ -3638,7 +3796,7 @@ PublishFullModeRevocationManifest(const IsolationRecord& isolation)
     rec.isolationCid = isolation.isolationCid;
     rec.evidenceCids = isolation.evidenceCids;
     rec.threshold = (isolation.entityType == "vehicle")
-                        ? GetRsuThreshold(N_RSUs)
+                        ? GetRsuRevocationThreshold()
                         : GetControllerRegistrationThreshold();
 
     std::string signInput = isolation.entityType + "|" +
@@ -3648,7 +3806,8 @@ PublishFullModeRevocationManifest(const IsolationRecord& isolation)
                             isolation.isolationCid;
     if (isolation.entityType == "vehicle")
     {
-        std::vector<uint32_t> signerIds = SelectTrustedRsuEndorsers(rec.threshold);
+        std::vector<uint32_t> signerIds =
+            SelectTrustedRsuEndorsers(rec.threshold, GetRsuEndorserPoolSize());
         for (std::size_t i = 0; i < signerIds.size(); ++i)
         {
             uint32_t signerId = signerIds[i];
@@ -3670,6 +3829,14 @@ PublishFullModeRevocationManifest(const IsolationRecord& isolation)
             rec.endorsements.push_back(e);
         }
     }
+
+    // E1: real serialized size of the threshold-endorsed manifest. Under
+    // ML-DSA-87 each endorsement carries a ~4,595-byte signature (hex-encoded,
+    // so ~9,190 characters on the wire); under classical ECDSA it is 64 bytes.
+    // That difference is the dominant term in Omega_IPFS (Eq. 3.73).
+    g_lastManifestBytes        = BuildRevocationManifestJson(rec).size();
+    g_lastManifestEndorsements = rec.endorsements.size();
+    g_lastManifestThreshold    = rec.threshold;
 
     rec.manifestCid = PublishRevocationManifestToIpfs(rec);
     g_revocationManifestsByEntity[key.str()] = rec;
@@ -3701,6 +3868,134 @@ PublishFullModeRevocationManifest(const IsolationRecord& isolation)
     return rec.manifestCid;
 }
 
+// ---------------------------------------------------------------------------
+// E2 adversary — a compromised RSU unilaterally authorises a FRAUDULENT
+// revocation (thesis §5.2.5, E2).
+//
+// The threshold scheme of Eq. (3.47) exists so that "no single compromised RSU
+// can unilaterally authorize a fraudulent revocation". Nothing in the baseline
+// simulator ever attempts one, so with the attack absent the t-of-n and
+// single-signer conditions are observationally identical and E2 measures
+// nothing. This is that attack, and it is the ONLY thing that separates the
+// two E2 arms.
+//
+// Threat model: the compromised RSU holds a valid RSU signing key, so it can
+// mint a syntactically perfect manifest. What it cannot do is produce t valid
+// signatures from DISTINCT eligible endorsers. It therefore forges a manifest
+// naming a legitimate vehicle, signs it alone, and declares
+// endorsement_threshold = 1 to make the document self-validating. Whether that
+// works is decided entirely by the receiving RSU's own policy threshold in
+// ApplyRevocationManifestJson:
+//    t >= 2  -> signers(1) < t  -> rejected, no harm
+//    t == 1  -> accepted        -> a legitimate vehicle is blacklisted network-wide
+//
+// It also gives E3 its mechanism: eligibility runs through IsRsuTrustEndorser,
+// so once the dynamic lifecycle demotes the compromised RSU its signature stops
+// counting, whereas a static endorser set keeps honouring it forever.
+//
+// Off by default (--maliciousRsuForgeRevocation), so no existing run changes.
+// ---------------------------------------------------------------------------
+static uint32_t g_forgedRevocationRound = 0;
+static uint32_t g_forgedRevocationAccepted = 0;
+static uint32_t g_forgedRevocationRejected = 0;
+
+static void
+MaliciousRsuForgeRevocationRound()
+{
+    double now = Simulator::Now().GetSeconds();
+
+    if (maliciousRsuForgeRevocation && FullCryptoMechanismActive() &&
+        sybil_attack_enabled && now >= g_attackOnsetTime)
+    {
+        static bool headerWritten = false;
+        std::ofstream out(e2ForgedRevocationCsv.c_str(),
+                          headerWritten ? std::ios::app : std::ios::out);
+        if (!headerWritten)
+        {
+            out << "time,forging_rsu_id,victim_vehicle_id,victim_is_legitimate,"
+                   "signer_eligible,signers,policy_threshold,accepting_rsus,"
+                   "n_rsus,accepted\n";
+            headerWritten = true;
+        }
+
+        for (uint32_t r = 0; r < N_RSUs; ++r)
+        {
+            if (!IsRsuMalicious(r))
+                continue;
+
+            // Pick a LEGITIMATE victim — revoking an actual Sybil would be the
+            // system working, not an attack. Deterministic rotation so the run
+            // is reproducible and successive rounds hit different vehicles.
+            uint32_t victim = N_Vehicles;
+            for (uint32_t k = 0; k < N_Vehicles; ++k)
+            {
+                uint32_t cand =
+                    (r * 7u + g_forgedRevocationRound * 13u + k) % std::max(1u, N_Vehicles);
+                if (!IsSybilVehicle(cand))
+                {
+                    victim = cand;
+                    break;
+                }
+            }
+            if (victim >= N_Vehicles)
+                continue;   // no legitimate vehicle available to frame
+
+            RevocationManifestRecord forged;
+            forged.entityType = "vehicle";
+            forged.entityId = victim;
+            forged.revocationTimestamp = now;
+            forged.attackVariant = "forged_by_malicious_rsu";
+            forged.isolationCid = "local://forged";
+            forged.threshold = 1;   // the attacker's self-serving claim
+
+            ManifestEndorsement e;
+            e.signerId = r;
+            e.signatureHex = SignWithCurrentRsuKeyHex(
+                r, "vehicle|" + std::to_string(victim) + "|forged_by_malicious_rsu");
+            forged.endorsements.push_back(e);
+
+            const std::string cid = PublishRevocationManifestToIpfs(forged);
+            const std::string json = BuildRevocationManifestJson(forged);
+
+            // Deliver to every RSU exactly as a genuine manifest would be.
+            uint32_t acceptingRsus = 0;
+            for (uint32_t peer = 0; peer < N_RSUs; ++peer)
+            {
+                if (ApplyRevocationManifestJson(peer, cid, json))
+                    ++acceptingRsus;
+            }
+
+            const bool accepted = (acceptingRsus > 0);
+            if (accepted) ++g_forgedRevocationAccepted;
+            else          ++g_forgedRevocationRejected;
+
+            out << now << "," << r << "," << victim << ",1,"
+                << (IsRsuTrustEndorser(r) ? 1 : 0) << ","
+                << forged.endorsements.size() << ","
+                << GetRsuRevocationThreshold() << ","
+                << acceptingRsus << "," << N_RSUs << ","
+                << (accepted ? 1 : 0) << "\n";
+
+            if (accepted)
+            {
+                std::cout << "[E2_FORGED_REVOCATION] ACCEPTED rsu=" << r
+                          << " framed legitimate vehicle=" << victim
+                          << " signers=1/" << GetRsuRevocationThreshold()
+                          << " accepting_rsus=" << acceptingRsus << "/" << N_RSUs
+                          << " t=" << now << std::endl;
+            }
+        }
+        ++g_forgedRevocationRound;
+    }
+
+    if (maliciousRsuForgeInterval > 0.0 &&
+        now + maliciousRsuForgeInterval <= simTime)
+    {
+        Simulator::Schedule(Seconds(maliciousRsuForgeInterval),
+                            &MaliciousRsuForgeRevocationRound);
+    }
+}
+
 static std::string
 RevokeEntityCurrentCrypto(const std::string& entityType,
                           uint32_t entityId,
@@ -3713,6 +4008,42 @@ RevokeEntityCurrentCrypto(const std::string& entityType,
     key << entityType << ":" << entityId;
     if (g_isolationRecordsByEntity.find(key.str()) != g_isolationRecordsByEntity.end())
         return g_isolationRecordsByEntity[key.str()].isolationCid;
+
+    // ── E1(iii): no mitigation ──────────────────────────────────────────────
+    // Algorithm 4's RevokeEntity is never called: no isolation record, no
+    // threshold manifest, no blacklist, no LKH re-key. The detection decision
+    // that got us here has already been scored into M5/M6 upstream, so the
+    // detection pipeline is identical to the other two conditions — only the
+    // mitigation layer is gone, and the Sybil identity keeps transmitting to
+    // the end of the evaluation window. The suppressed request is still
+    // ledgered so the arm has a comparable timeline.
+    if (MitigationDisabled())
+    {
+        static bool headerWritten = false;
+        std::ofstream out(e1SuppressedRevocationCsv.c_str(),
+                          headerWritten ? std::ios::app : std::ios::out);
+        if (!headerWritten)
+        {
+            out << "suppressed_time_sec,entity_type,entity_id,authority_id,"
+                   "attack_variant,evidence_cids\n";
+            headerWritten = true;
+        }
+        out << Simulator::Now().GetSeconds() << "," << entityType << ","
+            << entityId << "," << authorityId << "," << attackVariant << ","
+            << evidenceCids.size() << "\n";
+
+        std::cout << "[MITIGATION_DISABLED] would revoke entity=" << entityType
+                  << "/" << entityId
+                  << " variant=" << attackVariant
+                  << " at t=" << Simulator::Now().GetSeconds()
+                  << " (ablateMitigation=none)" << std::endl;
+        return std::string();
+    }
+
+    // E1: measure the real cost of this mitigation event (see e1RevocationCostCsv).
+    g_lastManifestBytes = g_lastManifestEndorsements = 0;
+    g_lastManifestThreshold = 0;
+    const auto e1WallStart = std::chrono::steady_clock::now();
 
     IsolationRecord rec;
     rec.entityType = entityType;
@@ -3733,11 +4064,46 @@ RevokeEntityCurrentCrypto(const std::string& entityType,
     else
         rec.thresholdSignatureHex = SignWithCurrentControllerKeyHex(authorityId, signMsg.str());
 
+    const auto e1WallAfterSign = std::chrono::steady_clock::now();
+
     rec.isolationCid = PublishIsolationRecordToIpfs(rec);
     g_isolationRecordsByEntity[key.str()] = rec;
 
+    const std::size_t isolationBytes = BuildIsolationRecordJson(rec).size();
+
     if (FullCryptoMechanismActive())
         PublishFullModeRevocationManifest(rec);
+
+    // ── E1: L_revoke(e) (Eq. 3.68) and Omega_IPFS (Eq. 3.73), MEASURED ──────
+    // authority_sign_us  : the single authority signature over the isolation record
+    // total_us           : that plus isolation publish plus the t-of-n endorsed
+    //                      manifest — i.e. one complete mitigation event
+    // manifest_bytes     : real serialized manifest size, which is where the
+    //                      ~4.6 KB ML-DSA-87 signatures show up
+    {
+        const auto e1WallEnd = std::chrono::steady_clock::now();
+        const double signUs = std::chrono::duration<double, std::micro>(
+                                  e1WallAfterSign - e1WallStart).count();
+        const double totalUs = std::chrono::duration<double, std::micro>(
+                                   e1WallEnd - e1WallStart).count();
+
+        static bool headerWritten = false;
+        std::ofstream out(e1RevocationCostCsv.c_str(),
+                          headerWritten ? std::ios::app : std::ios::out);
+        if (!headerWritten)
+        {
+            out << "sim_time_sec,entity_type,entity_id,attack_variant,crypto_profile,"
+                   "authority_sign_us,total_us,isolation_bytes,manifest_bytes,"
+                   "endorsements,threshold\n";
+            headerWritten = true;
+        }
+        out << std::fixed << std::setprecision(3)
+            << rec.isolationTimestamp << "," << entityType << "," << entityId << ","
+            << attackVariant << "," << FullCryptoProfileName() << ","
+            << signUs << "," << totalUs << ","
+            << isolationBytes << "," << g_lastManifestBytes << ","
+            << g_lastManifestEndorsements << "," << g_lastManifestThreshold << "\n";
+    }
 
     std::cout << "[ISOLATION_RECORD] entity=" << entityType
               << "/" << entityId
@@ -13732,6 +14098,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("llmDetectInterval",               llmDetectInterval);
     getStr("ablateAnalyzer",                     ablateAnalyzer);
     getStr("ablateStream",                       ablateStream);
+    getStr("ablateLlm",                          ablateLlm);
     getDouble("detectLatency",                   detectLatencySec);
     getDouble("vehicleSpacing",                  vehicleSpacing);
     getDouble("minVehicleSpeed",                 minVehicleSpeed);
@@ -13863,6 +14230,14 @@ main(int argc, char* argv[])
     cmd.AddValue("llmDetectInterval", "Full-mode: sim-seconds between LLM detection windows (default 10; lower it for short runs so every attack phase gets scored)", llmDetectInterval);
     cmd.AddValue("ablateAnalyzer", "Ablation B1: drop one vehicle-tier analyzer from the Eq 3.18 fusion head — trust|rssi|temp (empty = full head)", ablateAnalyzer);
     cmd.AddValue("ablateStream", "Ablation B2: pin the Eq 3.20 RSU ensemble to one evidence stream — fl_only|temp_only|rssi_only (empty = jointly-tuned lambda)", ablateStream);
+    cmd.AddValue("ablateLlm", "Ablation C1: drop the LLM tier and threshold Eq 3.20 y_hat_ens directly — mlfl_only (empty = full LLM multi-agent tier)", ablateLlm);
+    // ── Group E: security-infrastructure ablations (§5.2.5) ────────────────
+    cmd.AddValue("ablateMitigation", "Ablation E1(iii): 'none' = detection still fires and is scored but Algorithm 4 RevokeEntity is never called (Sybil identities persist). Empty = full mitigation pipeline", ablateMitigation);
+    cmd.AddValue("rsuRevocationThreshold", "Ablation E1/E2: t in the t-of-n RSU co-authorisation of Eq 3.47, decoupled from controllerRegistrationThreshold. 1 = single-signer. 0 = legacy coupling", rsuRevocationThreshold);
+    cmd.AddValue("rsuEndorserPoolSize", "Ablation E2: n, the active signer set the t signatures are drawn from (top-n by omega). 0 = every eligible RSU", rsuEndorserPoolSize);
+    cmd.AddValue("rsuEndorserPolicy", "Ablation E3: dynamic = Table 3.4 trust-gated three-state endorser lifecycle; static = every RSU signs manifests permanently regardless of trust history", rsuEndorserPolicy);
+    cmd.AddValue("maliciousRsuForgeRevocation", "Ablation E2/E3 adversary: a compromised RSU fabricates single-signer revocation manifests naming LEGITIMATE vehicles. Required for E2 to have any signal", maliciousRsuForgeRevocation);
+    cmd.AddValue("maliciousRsuForgeInterval", "Seconds between forgery attempts per compromised RSU [default 5]", maliciousRsuForgeInterval);
     cmd.AddValue("detectLatency", "Full-mode modeled detection->revocation reaction delay in sim-seconds (verdict at t, revocation effective at t+detectLatency; 0 = instant)", detectLatencySec);
     cmd.AddValue("p4SelfTest", "Full-mode P4 FP-safety self-test: REAL vehicle id to inject a synthetic sybil verdict for at t=10 and t=20 (0=off; proves deferral->corroboration; daemon not launched)", p4SelfTestRealId);
     cmd.AddValue("vehicleSpacing",             "Initial vehicle spacing in metres",vehicleSpacing);
@@ -13925,12 +14300,54 @@ main(int argc, char* argv[])
         controllerLogCsv  = outputDir + "/controller_log.csv";
         rsuTrustLifecycleCsv   = outputDir + "/rsu_trust_lifecycle_log.csv";
         rsuDetectionQualityCsv = outputDir + "/metrics_v5_rsu_detection_quality.csv";
+        e1SuppressedRevocationCsv = outputDir + "/metrics_E1_suppressed_revocations.csv";
+        e2ForgedRevocationCsv     = outputDir + "/metrics_E2_forged_revocations.csv";
+        e1RevocationCostCsv       = outputDir + "/metrics_E1_revocation_cost.csv";
         // Make sure the run folder (and the revocation-manifest subdir) exist — the flag
         // says "must exist", but a fresh datasets/<run> folder usually won't yet.
         std::system(("mkdir -p " + outputDir + "/ipfs-revocation-manifests").c_str());
         // Full-mode: point the detector daemon's run-dir (where it READS the sim's logs and
         // writes its verdict CSV + log) at the same folder, or it would read the empty default.
         LLMRealtimeDetector::SetRunDir(outputDir);
+    }
+
+    // ── Group E ablation validation + provenance banner (§5.2.5) ───────────
+    // Same contract as the B1/C1 flags: an unrecognised value is fatal, never a
+    // silent fall-back to the proposed system. A degraded condition that
+    // quietly ran as the baseline is the one failure mode that would invalidate
+    // the whole table without leaving a trace.
+    if (!ablateMitigation.empty() && ablateMitigation != "none")
+    {
+        NS_FATAL_ERROR("--ablateMitigation must be 'none' or empty (got '"
+                       << ablateMitigation << "')");
+    }
+    if (rsuEndorserPolicy != "dynamic" && rsuEndorserPolicy != "static")
+    {
+        NS_FATAL_ERROR("--rsuEndorserPolicy must be dynamic|static (got '"
+                       << rsuEndorserPolicy << "')");
+    }
+    if (rsuEndorserPoolSize > 0 && rsuRevocationThreshold > rsuEndorserPoolSize)
+    {
+        NS_FATAL_ERROR("--rsuRevocationThreshold t=" << rsuRevocationThreshold
+                       << " exceeds --rsuEndorserPoolSize n=" << rsuEndorserPoolSize
+                       << "; t-of-n quorum is unreachable by construction");
+    }
+    if (!ablateMitigation.empty() || rsuRevocationThreshold > 0 ||
+        rsuEndorserPoolSize > 0 || rsuEndorserPolicy != "dynamic" ||
+        maliciousRsuForgeRevocation)
+    {
+        std::cout << "[GroupE] ABLATION active:"
+                  << " mitigation=" << (ablateMitigation.empty() ? "full" : ablateMitigation)
+                  << " crypto_profile=" << full_crypto_profile
+                  << " revocation_t=" << (rsuRevocationThreshold > 0
+                                              ? std::to_string(rsuRevocationThreshold)
+                                              : std::string("legacy"))
+                  << " endorser_n=" << (rsuEndorserPoolSize > 0
+                                            ? std::to_string(rsuEndorserPoolSize)
+                                            : std::string("all"))
+                  << " endorser_policy=" << rsuEndorserPolicy
+                  << " forge_revocation=" << (maliciousRsuForgeRevocation ? "on" : "off")
+                  << "\n" << std::flush;
     }
 
     // ── Dataset generation v2: post-parse processing ────────────────────────
@@ -14770,15 +15187,22 @@ main(int argc, char* argv[])
                 NS_FATAL_ERROR("--ablateStream must be fl_only|temp_only|rssi_only (got '"
                                << ablateStream << "')");
             }
-            if (!ablateAnalyzer.empty() || !ablateStream.empty())
+            if (!ablateLlm.empty() && ablateLlm != "mlfl_only")
+            {
+                NS_FATAL_ERROR("--ablateLlm must be mlfl_only (got '"
+                               << ablateLlm << "')");
+            }
+            if (!ablateAnalyzer.empty() || !ablateStream.empty() || !ablateLlm.empty())
             {
                 std::cout << "[LLMRealtime] ABLATION active:"
                           << " analyzer_dropped=" << (ablateAnalyzer.empty() ? "none" : ablateAnalyzer)
                           << " ensemble_stream=" << (ablateStream.empty() ? "tuned-lambda" : ablateStream)
+                          << " llm_tier=" << (ablateLlm.empty() ? "full-3-agent-consensus" : ablateLlm)
                           << "\n" << std::flush;
             }
             LLMRealtimeDetector::SetAblateAnalyzer(ablateAnalyzer);
             LLMRealtimeDetector::SetAblateStream(ablateStream);
+            LLMRealtimeDetector::SetAblateLlm(ablateLlm);
             LLMRealtimeDetector::SetDetectLatency(detectLatencySec);
             LLMRealtimeDetector::Init(llmDetectInterval);
         }
@@ -14809,6 +15233,18 @@ main(int argc, char* argv[])
     {
         Simulator::Schedule(Seconds(std::max(0.1, rsuTrustWindowInterval)),
                             &EvaluateRsuApprovalWindow);
+    }
+
+    // E2/E3 adversary: compromised RSUs attempting unilateral fraudulent
+    // revocations. Opt-in, so a run that does not ask for it is untouched.
+    if (maliciousRsuForgeRevocation && FullCryptoMechanismActive())
+    {
+        std::cout << "[E2Forge] enabled: compromised RSUs forge single-signer"
+                  << " revocation manifests every " << maliciousRsuForgeInterval
+                  << "s against legitimate vehicles; local policy t="
+                  << GetRsuRevocationThreshold() << std::endl;
+        Simulator::Schedule(Seconds(std::max(0.1, maliciousRsuForgeInterval)),
+                            &MaliciousRsuForgeRevocationRound);
     }
 
     // v6 control-plane detector (malicious SDN controller).  Only meaningful
@@ -14844,6 +15280,26 @@ main(int argc, char* argv[])
         LLMRealtimeDetector::FinalizeAndReport();
     if (FullCryptoMechanismActive() && rsuTrustWindowedS5Enabled)
         WriteV5DetectionSummary();
+
+    if (maliciousRsuForgeRevocation)
+    {
+        uint32_t attempts = g_forgedRevocationAccepted + g_forgedRevocationRejected;
+        std::cout << "\n[E2 forged-revocation summary]  (t-of-n resilience,"
+                  << " Eq. 3.47)\n"
+                  << "  policy threshold t = " << GetRsuRevocationThreshold()
+                  << "   endorser policy = " << rsuEndorserPolicy << "\n"
+                  << "  forgery attempts   = " << attempts << "\n"
+                  << "  ACCEPTED (fraudulent revocations of legitimate vehicles) = "
+                  << g_forgedRevocationAccepted << "\n"
+                  << "  rejected by quorum = " << g_forgedRevocationRejected << "\n"
+                  << "  -> " << e2ForgedRevocationCsv << "\n";
+    }
+    if (MitigationDisabled())
+    {
+        std::cout << "\n[E1 mitigation disabled]  RevokeEntity was never called;"
+                  << " every detection is ledgered in\n  "
+                  << e1SuppressedRevocationCsv << "\n";
+    }
 
     // --- Window-aligned batch verification summary (Eq. batch_verify) ---
     {

@@ -31,6 +31,8 @@ import socket
 import sys
 import time
 
+import pandas as pd
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)                                     # build_context_live, protocol
 sys.path.insert(0, os.path.join(_HERE, "..", "fusion"))      # identity_manifest (snap_grid)
@@ -53,6 +55,26 @@ import constants as C                    # noqa: E402
 # full-history read exactly. -inf - pad is still -inf, so the uncapped path is unaffected.
 RSSI_ASOF_TOL = 1.0
 
+# C1 ablation (LLM tier vs ML-FL only): decision threshold on ŷ_ens for the
+# mlfl_only condition. The report specifies "a scalar calibrated on the validation
+# set"; ablation/C1/c1_llm_vs_mlfl.py performs that calibration offline and writes
+# it to ablation/C1/results/mlfl_tau.json, which is read here so the in-sim
+# condition uses the SAME scalar as the offline one. This constant is only the
+# fallback when that file is absent; --mlfl-tau overrides both.
+# Unused unless --ablate-llm mlfl_only is given.
+MLFL_TAU_FALLBACK = 0.5
+MLFL_TAU_FILE = os.path.join(_HERE, "..", "..", "ablation", "C1", "results", "mlfl_tau.json")
+
+
+def _calibrated_mlfl_tau():
+    """Read the val-calibrated tau written by the offline C1 scorer; fall back to
+    MLFL_TAU_FALLBACK if it has not been run yet."""
+    try:
+        with open(MLFL_TAU_FILE) as f:
+            return float(json.load(f)["tau"]), MLFL_TAU_FILE
+    except (OSError, KeyError, ValueError, TypeError):
+        return MLFL_TAU_FALLBACK, "built-in fallback (offline C1 not run)"
+
 
 def _load_predictor(name, relpath):
     spec = importlib.util.spec_from_file_location(name, os.path.join(_HERE, "..", relpath))
@@ -73,7 +95,8 @@ class Daemon:
     def __init__(self, run_dir, cap=None, carry_forward=True, tol=20.0,
                  batch=64, max_new=128, agent_device=0, max_identities=None,
                  window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=2000,
-                 ablate_analyzer=None, ablate_stream=None):
+                 ablate_analyzer=None, ablate_stream=None, ablate_llm=None,
+                 mlfl_tau=None):
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
@@ -115,8 +138,19 @@ class Daemon:
         # B1: drop one vehicle-tier analyzer from the Eq 3.18 head (renormalised survivors).
         # B2: pin the Eq 3.20 λ to a single evidence stream. Both are inference-time only —
         # nothing is retrained, matching the offline b1_/b2_ scorers.
+        # C1: "mlfl_only" removes the LLM tier altogether — no Eq 3.21 agents, no Eq 3.22
+        # consensus. ŷ_ens (Eq 3.20) is thresholded directly at a scalar calibrated on the
+        # val split (mlfl_tau). Upstream (analyzers, Eq 3.18 head, Eq 3.20 ensemble) is
+        # untouched, which is what the report requires: "all upstream components are
+        # identical across conditions".
         self.ablate_analyzer = ablate_analyzer
         self.ablate_stream = ablate_stream
+        self.ablate_llm = ablate_llm
+        self.mlfl_only = (ablate_llm == "mlfl_only")
+        if mlfl_tau is not None:
+            self.mlfl_tau, self.mlfl_tau_src = float(mlfl_tau), "--mlfl-tau"
+        else:
+            self.mlfl_tau, self.mlfl_tau_src = _calibrated_mlfl_tau()
         if ablate_analyzer:
             self.head.ablate_block(ablate_analyzer)
         self.lam = EL.STREAM_LAMBDAS[ablate_stream] if ablate_stream else None
@@ -139,17 +173,28 @@ class Daemon:
         self.nb_cache = LC.LogCache(os.path.join(rd, trust.T.NEIGHBOR_LOG),
                                     (lambda c: c in trust.T.NEIGHBOR_COLS), "time", nrows=cap)
 
-        print("[daemon] loading frozen consensus config + 3 LoRA agents (GPU) ...", flush=True)
-        self.cfg = CI.load_config()
-        self.tok, self.model = CI.load_agents(self.cfg["base"], self.cfg["adapters"],
-                                              device=agent_device)
-        self.sysmsg = {a: A.AGENTS[a]["system"] for a in A.AGENT_ORDER}
-        print(f"[daemon] READY in {time.time() - t0:.0f}s "
-              f"(θ={self.cfg['theta']}, ω={self.cfg['omega']}; "
-              f"ensemble_gate={self.ensemble_gate}, max_llm_candidates={self.max_llm_candidates}; "
-              f"ablate_analyzer={self.ablate_analyzer or 'none'}, "
-              f"ablate_stream={self.ablate_stream or 'tuned-lambda'})",
-              flush=True)
+        if self.mlfl_only:
+            # No LLM tier in this condition: skip the GPU base + adapters entirely, so the
+            # ML-FL-only run also reflects the real cost of dropping the LLM stage.
+            self.cfg, self.tok, self.model, self.sysmsg = None, None, None, None
+            print(f"[daemon] READY in {time.time() - t0:.0f}s "
+                  f"(C1 ABLATION mlfl_only: LLM tier DISABLED, no agents loaded; "
+                  f"ŷ_ens thresholded at τ={self.mlfl_tau} (from {self.mlfl_tau_src}); "
+                  f"ablate_analyzer={self.ablate_analyzer or 'none'}, "
+                  f"ablate_stream={self.ablate_stream or 'tuned-lambda'})",
+                  flush=True)
+        else:
+            print("[daemon] loading frozen consensus config + 3 LoRA agents (GPU) ...", flush=True)
+            self.cfg = CI.load_config()
+            self.tok, self.model = CI.load_agents(self.cfg["base"], self.cfg["adapters"],
+                                                  device=agent_device)
+            self.sysmsg = {a: A.AGENTS[a]["system"] for a in A.AGENT_ORDER}
+            print(f"[daemon] READY in {time.time() - t0:.0f}s "
+                  f"(θ={self.cfg['theta']}, ω={self.cfg['omega']}; "
+                  f"ensemble_gate={self.ensemble_gate}, max_llm_candidates={self.max_llm_candidates}; "
+                  f"ablate_analyzer={self.ablate_analyzer or 'none'}, "
+                  f"ablate_stream={self.ablate_stream or 'tuned-lambda'})",
+                  flush=True)
 
     # -- the full chain for one scoring window -------------------------------
     def score(self, t, only_new=True, max_identities=None):
@@ -220,6 +265,37 @@ class Daemon:
             ci = ci.head(max_identities)
         if len(ci) == 0:
             return []
+
+        # ── C1 ablation: ML-FL only — threshold ŷ_ens, no LLM tier ──────────────
+        # Condition (ii) of C1: the Eq 3.20 ensemble score IS the decision. No agents,
+        # no consensus, no top-K gating (the gate exists only to bound LLM cost, which
+        # is zero here). Rows with a missing ŷ_ens cannot be decided by this condition
+        # and are emitted d=0, matching the offline scorer's treatment.
+        if self.mlfl_only:
+            # A bare threshold on ŷ_ens is a BINARY detector: it yields no attack
+            # variant. Seven-class classification is exactly what the LLM tier adds
+            # (report §5.2), so this condition must not invent one. A positive is
+            # therefore labelled "sybil_unclassified" / id -1 — deliberately outside
+            # the 0..6 label space so it can never be mistaken for legitimate(0) or
+            # for a real variant. attack_type_id is log-only in the .cc (the verdict
+            # sink drives off d), so this affects reporting, not detection.
+            verdicts = []
+            for _, r in ci.iterrows():
+                y = r.get("y_hat_ens")
+                has_y = y is not None and not pd.isna(y)
+                d = int(has_y and float(y) >= self.mlfl_tau)
+                verdicts.append(PROTO.verdict_line(
+                    claimed_id=int(r["claimed_node_id"]),
+                    window_start=float(r["window_start_seconds"]),
+                    d=d,
+                    attack_type=("sybil_unclassified" if d else "legitimate"),
+                    attack_type_id=(-1 if d else C.class_id("legitimate")),
+                    confidence="medium",
+                    y_hat_ens=(float(y) if has_y else None),
+                    reason=f"C1 mlfl_only: y_hat_ens="
+                           f"{f'{float(y):.3f}' if has_y else 'nan'}"
+                           f" vs tau={self.mlfl_tau} (no LLM tier, no variant class)"))
+            return verdicts
 
         # ── Ensemble pre-filter (A) + bounded LLM (B) ────────────────────────────
         # Split ci by the cheap ŷ_ens: below the gate → ensemble-cleared (d=0, no LLM);
@@ -385,6 +461,14 @@ def main():
                     choices=list(EL.STREAM_LAMBDAS),
                     help="ablation B2: pin the Eq 3.20 λ to one evidence stream "
                          "(omit = jointly-tuned λ)")
+    ap.add_argument("--ablate-llm", default=None, choices=["mlfl_only"],
+                    help="ablation C1: drop the LLM tier — no Eq 3.21 agents, no Eq 3.22 "
+                         "consensus; threshold ŷ_ens directly (omit = full LLM tier)")
+    ap.add_argument("--mlfl-tau", type=float, default=None,
+                    help=f"C1 mlfl_only decision threshold on ŷ_ens "
+                         f"(default: read from ablation/C1/results/mlfl_tau.json, else "
+                         f"{MLFL_TAU_FALLBACK}; calibrated on the val split by "
+                         f"ablation/C1/c1_llm_vs_mlfl.py)")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
 
@@ -392,7 +476,8 @@ def main():
                tol=args.tol, batch=args.batch, max_new=args.max_new,
                max_identities=args.max_identities, window_margin=args.window_margin,
                ensemble_gate=args.ensemble_gate, max_llm_candidates=args.max_llm_candidates,
-               ablate_analyzer=args.ablate_analyzer, ablate_stream=args.ablate_stream)
+               ablate_analyzer=args.ablate_analyzer, ablate_stream=args.ablate_stream,
+               ablate_llm=args.ablate_llm, mlfl_tau=args.mlfl_tau)
     if args.once is not None:
         vs = d.score(args.once, only_new=False, max_identities=args.max_identities)
         print(f"\n=== {len(vs)} verdicts @ t={args.once} ===")

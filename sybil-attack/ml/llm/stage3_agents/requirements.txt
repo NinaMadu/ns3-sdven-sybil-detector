@@ -1,0 +1,36 @@
+# Stage-3 LLM-FL — cluster dependencies.
+# Pinned to the exact versions the completed 5-round study ran on, so the
+# convergence run is comparable. Python 3.9.
+#
+#   python -m venv ~/llmfl-venv && source ~/llmfl-venv/bin/activate
+#   pip install --upgrade pip
+#   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements.txt
+#
+# NOTE ON TORCH: install torch FIRST and SEPARATELY (line above), because the
+# right wheel depends on the cluster's CUDA driver. cu128 is what we used; pick
+# the matching index-url for the cluster's CUDA (cu121, cu124, ...) if it differs.
+# Check with `nvidia-smi`. Everything below is CUDA-independent.
+
+# ── training stack ──────────────────────────────────────────────────────────
+transformers==4.57.6
+peft==0.17.1            # LoRA adapters + PeftModel (Eq 3.32 operates on these)
+trl==0.24.0             # SFTTrainer, subclassed for the FedProx proximal term
+datasets==4.5.0
+accelerate>=0.34
+safetensors==0.7.0      # adapter serialization (bf16 A/B tensors only)
+sentencepiece           # tokenizer backend
+protobuf
+
+# ── data + metrics ──────────────────────────────────────────────────────────
+pandas==2.3.3
+numpy==2.0.2
+pyarrow                 # reads c_i.parquet
+scikit-learn==1.6.1     # MCC / F1 / recall in evaluate_round.py
+
+# ── figures ─────────────────────────────────────────────────────────────────
+matplotlib==3.9.4       # plot_convergence.py
+
+# Not required by the federation run itself (tensorflow / tf-keras are only used
+# by the older vehicle-tier analyser notebooks) — deliberately omitted to keep
+# the cluster environment small.
