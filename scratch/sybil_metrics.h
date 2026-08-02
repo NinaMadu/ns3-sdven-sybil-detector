@@ -48,6 +48,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace ns3;
@@ -97,9 +98,33 @@ static const double kDroppedPacketLatencyPenaltyMs = 100.0;
 static uint64_t g_sybilDiverted = 0;
 static uint64_t g_allReceived   = 0;
 
+// M7 aggregate accumulators, for the metrics_summary.csv rollup: how many
+// confirmed-Sybil revocations completed, and the running sums needed to
+// derive mean L_revoke and mean exposure window Xi(e) from them. Populated
+// in WriteM7Row below; read back (via the accessors after this file's
+// includers have g_attackOnsetTime in scope) when the summary is written.
+static uint64_t g_m7CorrectRevocationCount        = 0;
+static double   g_m7CorrectRevocationLatencySumMs = 0.0;
+static double   g_m7CorrectRevocationDetTimeSumSec = 0.0;
+
+inline uint64_t GetM7CorrectRevocationCount()        { return g_m7CorrectRevocationCount; }
+inline double   GetM7CorrectRevocationLatencySumMs() { return g_m7CorrectRevocationLatencySumMs; }
+inline double   GetM7CorrectRevocationDetTimeSumSec(){ return g_m7CorrectRevocationDetTimeSumSec; }
+
 // M4 – Congestion
 static uint64_t g_falseTrafficPackets = 0;
 static uint64_t g_legitimatePackets   = 0;
+
+// M11 – Sybil Channel Load (chi_sybil)   [Experiment 1, metric 5]
+// Fraction of offered channel BYTES attributable to fake-identity traffic.
+// Deliberately distinct from M4: M4 is a packet-COUNT ratio, whereas chi_sybil
+// is bandwidth, so it responds to iota (identities per attacker) even when the
+// per-packet size is unchanged.  Accumulated at TRANSMIT, because channel load
+// is airtime the attacker consumes whether or not anyone receives the frame.
+static uint64_t g_sybilChannelBytes  = 0;
+static uint64_t g_totalChannelBytes  = 0;
+static uint64_t g_windowSybilChannelBytes = 0;
+static uint64_t g_windowTotalChannelBytes = 0;
 
 // Per time-window accumulators (reset each flush)
 static double   g_nextMetricWindow    = 1.0;
@@ -270,9 +295,13 @@ struct ConfusionMatrix
 //   multihash header.  DHT announce costs ~500 bytes per publication
 //   (provider record broadcast to k=20 peers × 25-byte peer ID).
 //
-// Threshold ML-DSA-87 coordination (t-of-n):
-//   n partial signatures (4627 B each) + 1 aggregated signature (4627 B)
-//   + commitment vector (32 B × n) + ML-KEM-1024 session key (1568 B).
+// Threshold signature coordination (t-of-n):
+//   n partial signatures + 1 aggregated signature + commitment vector (32 B × n)
+//   + one KEM session ciphertext.  The signature and KEM sizes are SUITE-DEPENDENT
+//   — see SuiteAuthSigBytes()/SuiteKemCtBytes() in sybil_types.h.  Hardcoding the
+//   ML-DSA-87/ML-KEM-1024 numbers here used to make M8 report identical overhead
+//   for the classical and PQC arms, which silently broke the three-arm comparison
+//   (docs/PQC_vs_Classical_Comparison_README.md).
 //
 // Per-tier breakdown: OBU→RSU hop and RSU→Controller hop recorded separately.
 // =============================================================================
@@ -285,6 +314,13 @@ static const uint32_t MLDSA87_SIG_BYTES          = 4627;  // ML-DSA-87 signature
 static const uint32_t FNDSA1024_BEACON_SIG_BYTES = 1280;  // FN-DSA-1024 beacon signature
 static const uint32_t THRESHOLD_COMMITMENT_BYTES =  32;
 
+// Suite-dependent primitive sizes.  DEFINED (inline) in sybil_types.h, which is
+// included after this header; declared here so the accounting below can use them.
+// Returning 0 for the no-security arm is intentional: with SecEnabled=false there
+// is no threshold signature to pay for.
+inline uint32_t SuiteAuthSigBytes();
+inline uint32_t SuiteKemCtBytes();
+
 inline uint32_t ComputeIPFSPublicationBytes(uint32_t payloadBytes)
 {
     uint32_t nChunks = std::max(1u, (payloadBytes + IPFS_CHUNK_SIZE_BYTES - 1)
@@ -294,9 +330,12 @@ inline uint32_t ComputeIPFSPublicationBytes(uint32_t payloadBytes)
 
 inline uint32_t ComputeThresholdSigBytes(uint32_t n, uint32_t /*t*/)
 {
-    return (n + 1) * MLDSA87_SIG_BYTES
+    const uint32_t sigBytes = SuiteAuthSigBytes();   // 0 / 64 / 4627
+    if (sigBytes == 0)
+        return 0;                                    // no-security arm pays nothing
+    return (n + 1) * sigBytes
            + n * THRESHOLD_COMMITMENT_BYTES
-           + MLKEM1024_SESSION_BYTES;
+           + SuiteKemCtBytes();
 }
 
 struct TierOverhead
@@ -1246,6 +1285,12 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                     bool isSybil, const std::string& scheme,
                     double latMs, const std::string& detectionMode)
     {
+        if (isSybil)
+        {
+            g_m7CorrectRevocationCount++;
+            g_m7CorrectRevocationLatencySumMs  += latMs;
+            g_m7CorrectRevocationDetTimeSumSec += detTimeSec;
+        }
         std::ofstream o(csvM7.c_str(), std::ios::app);
         o << std::fixed << std::setprecision(4);
         o << detTimeSec << "," << claimedId << ","
@@ -1304,6 +1349,109 @@ static Ptr<SecurityEvaluationMetrics> g_secMetrics;
 // M1–M4  Metric update hooks
 // =============================================================================
 
+// ---------------------------------------------------------------------------
+// M3 PAR (Eq 3.67) and M4 chi_sybil (Eq 3.68) — TRANSMIT-side counters.
+//
+//   PAR       = |{p : route(p) INTERSECT V_sybil != empty}| / N_tx
+//   chi_sybil = N_beacon_sybil / N_beacon
+//
+// These are two mechanistically distinct quantities in the report: PAR is a
+// ROUTING measure over ALL transmitted packets (did this packet's relay path
+// touch a Sybil identity?), while chi_sybil is a CHANNEL-LOAD measure over
+// V2V BEACON transmissions only (what share of beacon airtime is Sybil-claimed?).
+// The denominators differ -- N_tx counts every packet type including the
+// infrastructure traffic that is never Sybil, N_beacon counts beacons alone --
+// so the two do NOT collapse to the same number.
+//
+// The previous implementation derived both from the RECEIVE path as
+// (receptions with real != claimed) / (all receptions).  Because
+// g_sybilDiverted and g_falseTrafficPackets were incremented on the same
+// condition and g_allReceived equalled falseTraffic + legitimate, M3 and M4
+// were identically equal at every sample -- one quantity reported twice.
+// Counting on transmit also matches the equations' own N_tx / N_beacon
+// denominators and is immune to the 7-channel reception duplication.
+//
+// Sybil membership uses the same ground truth as the rest of the code: a
+// transmission asserts a Sybil identity when realNodeId != claimedNodeId.
+// ---------------------------------------------------------------------------
+static uint64_t g_parSybilRouteTx   = 0;   // Eq 3.67 numerator
+static uint64_t g_parAllTx          = 0;   // Eq 3.67 denominator (N_tx)
+static uint64_t g_beaconSybilTx     = 0;   // Eq 3.68 numerator (N_beacon_sybil)
+static uint64_t g_beaconAllTx       = 0;   // Eq 3.68 denominator (N_beacon)
+static uint64_t g_winParSybilRouteTx = 0;
+static uint64_t g_winParAllTx        = 0;
+static uint64_t g_winBeaconSybilTx   = 0;
+static uint64_t g_winBeaconAllTx     = 0;
+
+// Called once per transmitted packet, from SendTaggedPacket.
+// messageType 1 == V2V_BEACON (see SybilMessageType in sybil_types.h).
+static inline void
+MetricsOnTransmitIdentity(uint32_t messageType, uint32_t realNodeId, uint32_t claimedNodeId)
+{
+    const bool sybilClaim = (realNodeId != claimedNodeId);
+
+    // Eq 3.67 — every transmitted packet counts toward N_tx.  For the
+    // single-hop V2V/V2I traffic this simulator generates, route(p) is the
+    // transmitting identity, so a packet's route touches V_sybil exactly when
+    // the transmission asserts a Sybil identity.  Relayed variants (v4
+    // indirect) send through the relayer, which carries real != claimed here
+    // too, so the relay hop is captured by the same test.
+    g_parAllTx++; g_winParAllTx++;
+    if (sybilClaim) { g_parSybilRouteTx++; g_winParSybilRouteTx++; }
+
+    // Eq 3.68 — beacons only.
+    if (messageType == 1u)
+    {
+        g_beaconAllTx++; g_winBeaconAllTx++;
+        if (sybilClaim) { g_beaconSybilTx++; g_winBeaconSybilTx++; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M1 PDR de-duplication.
+//
+// Every node carries 7 wifi devices (one per DSRC channel 172..184), each with
+// its own IPv4 address, and V2V beacons go to the LIMITED broadcast address
+// 255.255.255.255 on a socket that is not bound to a device.  ns-3 therefore
+// egresses one beacon out all 7 interfaces, and every neighbour receives the
+// same packet up to 7 times (measured duplication factor 6.29; the 7 copies
+// share a timestamp to the microsecond and carry byte-identical payloads).
+//
+// MetricsOnTransmit is called ONCE per SendTo while MetricsOnReceive fires per
+// reception, so only M1 is distorted: its numerator is reception-counted and
+// its denominator transmission-counted.  M2/M3/M4 are ratios of two
+// reception-counted quantities, so the duplication cancels and they are
+// already correct -- do not "fix" them.
+//
+// This counts each (sender, sequence, receiver) once.  The set is cleared each
+// metrics window; duplicates arrive within 35 ms worst case, far inside a
+// window, so clearing costs no accuracy and keeps memory bounded.
+//
+// NOTE: this corrects the MEASUREMENT only.  The simulator still transmits on
+// all 7 channels, so modelled channel load remains higher than a single-CCH
+// DSRC deployment -- a disclosed modelling limitation.  Binding the beacon
+// socket to the ch178 device is the physical fix, but it changes contention
+// and delivery everywhere and would invalidate existing runs and datasets.
+// ---------------------------------------------------------------------------
+static std::unordered_set<uint64_t> g_pdrSeenDeliveries;
+
+static inline uint64_t
+MetricsPdrKey(uint32_t senderId, uint32_t sequenceNumber, uint32_t receiverId)
+{
+    return (static_cast<uint64_t>(senderId   & 0xFFFFu) << 48) |
+           (static_cast<uint64_t>(receiverId & 0xFFFFu) << 32) |
+            static_cast<uint64_t>(sequenceNumber);
+}
+
+// True when this exact (sender, seq, receiver) delivery has already been
+// counted -- i.e. this reception is a duplicate channel copy, not a new
+// delivery.  First sighting records the key and returns false.
+static inline bool
+MetricsPdrIsDuplicateDelivery(uint32_t senderId, uint32_t sequenceNumber, uint32_t receiverId)
+{
+    return !g_pdrSeenDeliveries.insert(MetricsPdrKey(senderId, sequenceNumber, receiverId)).second;
+}
+
 // expectedDeliveries: 1 for unicast; for V2V broadcast, the sender passes the
 // number of current neighbour vehicles inside communication range.  This keeps
 // M1 aligned with SDVEN/VANET local awareness instead of assuming every vehicle
@@ -1313,6 +1461,26 @@ MetricsOnTransmit(uint32_t expectedDeliveries = 1)
 {
     g_totalTransmitted += expectedDeliveries;
     g_windowTransmitted += expectedDeliveries;
+}
+
+// ---------------------------------------------------------------------------
+// M11 chi_sybil — offered channel load, accumulated per transmitted frame.
+//
+// isSybilIdentity: the frame carries a claimed identity that is not the real
+// transmitting node, i.e. a fake-identity announcement.  Counted once per
+// SendTo (offered airtime), independent of how many receivers exist, so the
+// ratio is unaffected by the broadcast-duplication that distorts M1.
+// ---------------------------------------------------------------------------
+static inline void
+MetricsOnChannelLoad(bool isSybilIdentity, uint32_t bytes)
+{
+    g_totalChannelBytes       += bytes;
+    g_windowTotalChannelBytes += bytes;
+    if (isSybilIdentity)
+    {
+        g_sybilChannelBytes       += bytes;
+        g_windowSybilChannelBytes += bytes;
+    }
 }
 
 static inline uint32_t
@@ -1534,40 +1702,45 @@ WriteMetricsRow(double windowEnd)
             << attackFlag << "," << pct << "\n";
     }
 
-    // M3
+    // M3 — PAR (Eq 3.67): transmitted packets whose route touches V_sybil, over N_tx.
+    // Transmit-side and over ALL packet types, which is what makes it distinct from
+    // M4 below (beacons only).  See the note beside MetricsOnTransmitIdentity.
     double windowAttr =
-        (g_windowAllReceived > 0)
-            ? static_cast<double>(g_windowSybilDiverted) /
-                  static_cast<double>(g_windowAllReceived)
+        (g_winParAllTx > 0)
+            ? static_cast<double>(g_winParSybilRouteTx) /
+                  static_cast<double>(g_winParAllTx)
             : 0.0;
     double cumAttr =
-        (g_allReceived > 0)
-            ? static_cast<double>(g_sybilDiverted) /
-                  static_cast<double>(g_allReceived)
+        (g_parAllTx > 0)
+            ? static_cast<double>(g_parSybilRouteTx) /
+                  static_cast<double>(g_parAllTx)
             : 0.0;
     {
         std::ofstream out(metricsAttractionCsv.c_str(), std::ios::app);
-        out << windowEnd << "," << g_windowSybilDiverted << "," << g_windowAllReceived << ","
-            << windowAttr << "," << g_sybilDiverted << "," << g_allReceived << ","
+        out << windowEnd << "," << g_winParSybilRouteTx << "," << g_winParAllTx << ","
+            << windowAttr << "," << g_parSybilRouteTx << "," << g_parAllTx << ","
             << cumAttr << "," << attackFlag << "," << pct << "\n";
     }
 
-    // M4
-    uint64_t winTotal = g_windowFalseTraffic + g_windowLegitimate;
-    uint64_t cumTotal = g_falseTrafficPackets + g_legitimatePackets;
+    // M4 — chi_sybil (Eq 3.68): Sybil-claimed BEACON transmissions over all beacon
+    // transmissions.  Beacons only, so the denominator excludes the infrastructure
+    // traffic counted in M3's N_tx -- that difference in scope is what makes this a
+    // separate quantity rather than a second copy of PAR.
+    uint64_t winLegitBeacon = g_winBeaconAllTx - g_winBeaconSybilTx;
+    uint64_t cumLegitBeacon = g_beaconAllTx   - g_beaconSybilTx;
     double windowCong =
-        (winTotal > 0)
-            ? static_cast<double>(g_windowFalseTraffic) / static_cast<double>(winTotal)
+        (g_winBeaconAllTx > 0)
+            ? static_cast<double>(g_winBeaconSybilTx) / static_cast<double>(g_winBeaconAllTx)
             : 0.0;
     double cumCong =
-        (cumTotal > 0)
-            ? static_cast<double>(g_falseTrafficPackets) / static_cast<double>(cumTotal)
+        (g_beaconAllTx > 0)
+            ? static_cast<double>(g_beaconSybilTx) / static_cast<double>(g_beaconAllTx)
             : 0.0;
     {
         std::ofstream out(metricsCongestionCsv.c_str(), std::ios::app);
-        out << windowEnd << "," << g_windowFalseTraffic << "," << g_windowLegitimate << ","
-            << winTotal << "," << windowCong << "," << g_falseTrafficPackets << ","
-            << g_legitimatePackets << "," << cumTotal << "," << cumCong << ","
+        out << windowEnd << "," << g_winBeaconSybilTx << "," << winLegitBeacon << ","
+            << g_winBeaconAllTx << "," << windowCong << "," << g_beaconSybilTx << ","
+            << cumLegitBeacon << "," << g_beaconAllTx << "," << cumCong << ","
             << attackFlag << "," << pct << "\n";
     }
 
@@ -1581,8 +1754,16 @@ WriteMetricsRow(double windowEnd)
     g_windowIntendedLatencySamplesMs.clear();
     g_windowSybilDiverted = 0;
     g_windowAllReceived   = 0;
+    g_winParSybilRouteTx  = 0;
+    g_winParAllTx         = 0;
+    g_winBeaconSybilTx    = 0;
+    g_winBeaconAllTx      = 0;
     g_windowFalseTraffic  = 0;
     g_windowLegitimate    = 0;
+
+    // Duplicate channel copies land within 35 ms of the original, far inside a
+    // window, so clearing here bounds memory without losing any de-duplication.
+    g_pdrSeenDeliveries.clear();
 }
 
 // =============================================================================
@@ -1641,14 +1822,22 @@ WriteFinalSummary()
                   static_cast<double>(g_totalTransmitted)
             : 0.0;
     double finalP95LatencyMs = PercentileFromSorted(g_intendedLatencySamplesMs, 95.0);
+    // PAR (Eq 3.67) over N_tx; chi_sybil (Eq 3.68) over N_beacon — see the note
+    // beside MetricsOnTransmitIdentity for why these use transmit-side counters
+    // and why they are no longer the same number.
     double finalAttrRatio =
-        (g_allReceived > 0)
-            ? static_cast<double>(g_sybilDiverted) / static_cast<double>(g_allReceived)
+        (g_parAllTx > 0)
+            ? static_cast<double>(g_parSybilRouteTx) / static_cast<double>(g_parAllTx)
             : 0.0;
-    uint64_t totalPkts    = g_falseTrafficPackets + g_legitimatePackets;
+    uint64_t totalPkts    = g_beaconAllTx;
     double finalCongRatio =
-        (totalPkts > 0)
-            ? static_cast<double>(g_falseTrafficPackets) / static_cast<double>(totalPkts)
+        (g_beaconAllTx > 0)
+            ? static_cast<double>(g_beaconSybilTx) / static_cast<double>(g_beaconAllTx)
+            : 0.0;
+    double finalChiSybil =
+        (g_totalChannelBytes > 0)
+            ? static_cast<double>(g_sybilChannelBytes) /
+              static_cast<double>(g_totalChannelBytes)
             : 0.0;
 
     out << "metric,value,description\n"
@@ -1674,18 +1863,24 @@ WriteFinalSummary()
         << ",Number of received tagged packets used for legacy average latency calculation\n"
         << "M2_intended_latency_sample_count," << g_intendedDelayCount
         << ",Number of intended delivered packets used for intended average and P95 latency\n"
-        << "M3_sybil_diverted,"        << g_sybilDiverted
-        << ",Packets whose path involved Sybil identity spoofing\n"
-        << "M3_all_received,"          << g_allReceived
-        << ",Total packets received at any node\n"
+        << "M3_sybil_diverted,"        << g_parSybilRouteTx
+        << ",Eq 3.67 numerator: transmitted packets whose route touches a Sybil identity\n"
+        << "M3_all_received,"          << g_parAllTx
+        << ",Eq 3.67 denominator N_tx: all transmitted packets (every message type)\n"
         << "M3_attraction_ratio,"      << finalAttrRatio
-        << ",Fraction of traffic diverted through Sybil nodes\n"
-        << "M4_false_traffic_packets," << g_falseTrafficPackets
-        << ",Sybil-injected false traffic packet count\n"
-        << "M4_legitimate_packets,"    << g_legitimatePackets
-        << ",Legitimate (non-Sybil) traffic packet count\n"
+        << ",PAR (Eq 3.67): share of ALL transmissions routed through a Sybil identity\n"
+        << "M4_false_traffic_packets," << g_beaconSybilTx
+        << ",Eq 3.68 numerator N_beacon_sybil: Sybil-claimed V2V beacon transmissions\n"
+        << "M4_legitimate_packets,"    << (g_beaconAllTx - g_beaconSybilTx)
+        << ",Legitimate V2V beacon transmissions\n"
         << "M4_congestion_ratio,"      << finalCongRatio
-        << ",Fraction of total traffic that is Sybil false traffic\n"
+        << ",chi_sybil (Eq 3.68): Sybil share of BEACON transmissions only (N_beacon denominator)\n"
+        << "M11_sybil_channel_bytes,"  << g_sybilChannelBytes
+        << ",Offered channel bytes carrying a fake claimed identity\n"
+        << "M11_total_channel_bytes,"  << g_totalChannelBytes
+        << ",Total offered channel bytes across all transmissions\n"
+        << "M11_chi_sybil,"            << finalChiSybil
+        << ",Sybil Channel Load: fraction of offered channel bytes consumed by fake-identity announcements\n"
         << "sybil_attack_enabled,"     << (sybil_attack_enabled ? 1 : 0)
         << ",Whether Sybil attack was active\n"
         << "sybil_attack_percentage,"  << sybil_attack_percentage
@@ -1699,7 +1894,16 @@ WriteFinalSummary()
         << "v2vReliableRange,"         << v2vReliableRange
         << ",Reliable local V2V beacon evaluation radius in metres\n"
         << "rsuCoverageRange,"         << rsuCoverageRange
-        << ",RSU coverage radius in metres\n";
+        << ",RSU coverage radius in metres\n"
+        << "N_rx,"                     << g_allReceived
+        << ",Raw physical-layer reception count (includes multi-channel duplication; distinct from M1_total_delivered)\n"
+        << "M7_detection_event_count," << GetM7CorrectRevocationCount()
+        << ",Number of confirmed-Sybil identities that were flagged and revoked\n"
+        << "M7_mean_L_revoke_ms,"      << (GetM7CorrectRevocationCount() > 0
+                                                ? GetM7CorrectRevocationLatencySumMs() /
+                                                      static_cast<double>(GetM7CorrectRevocationCount())
+                                                : 0.0)
+        << ",Mean revocation latency (t_contain - t_flag) over confirmed-Sybil revocations\n";
 
     std::cout << "\n=== M1-M4 Evaluation Metrics Summary ===" << std::endl;
     std::cout << "M1 PDR               : " << finalPDR
@@ -1709,10 +1913,15 @@ WriteFinalSummary()
     std::cout << "M2 Loss-Penalized    : " << finalLossPenalizedLatencyMs
               << " ms (" << finalDroppedPackets
               << " dropped, penalty=" << kDroppedPacketLatencyPenaltyMs << " ms)\n";
-    std::cout << "M3 Packet Attraction : " << finalAttrRatio
-              << " (" << g_sybilDiverted << "/" << g_allReceived << " Sybil-diverted)\n";
-    std::cout << "M4 Congestion Ratio  : " << finalCongRatio
-              << " (" << g_falseTrafficPackets << " false / " << totalPkts << " total)\n";
+    std::cout << "M3 PAR (Eq 3.67)     : " << finalAttrRatio
+              << " (" << g_parSybilRouteTx << "/" << g_parAllTx
+              << " transmissions routed via a Sybil identity)\n";
+    std::cout << "M11 chi_sybil        : " << finalChiSybil
+              << " (" << g_sybilChannelBytes << " / " << g_totalChannelBytes
+              << " offered bytes)\n";
+    std::cout << "M4 chi_sybil (3.68)  : " << finalCongRatio
+              << " (" << g_beaconSybilTx << " Sybil / " << totalPkts
+              << " beacon transmissions)\n";
     std::cout << "Summary CSV          : " << summaryPath << std::endl;
 
     std::ofstream tierOut(metricsTierSummaryCsv.c_str(), std::ios::out);

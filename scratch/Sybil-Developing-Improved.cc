@@ -1,3 +1,4 @@
+
 // =============================================================================
 // Sybil-Developing-Improved.cc — SDVEN simulation main file
 //
@@ -16,6 +17,7 @@
 
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
+#include "ns3/simulator.h"
 #include "ns3/csma-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/ipv4-global-routing-helper.h"
@@ -86,6 +88,10 @@ uint32_t solution_mode = MODE_NO_DETECTION; ///< 1=FL (FLEMDS) 2=RSSI 3=ML place
 uint32_t full_crypto_profile = 1;        ///< Inside full mode: 1=current classical, 2=real PQC ML-KEM-1024 + ML-DSA-87 + FN-DSA-1024.
 uint32_t proposed_method = kNoLegacyProposedMethod; ///< Backward-compatible alias for old proposed_method values.
 uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
+// Experiment 1 (rho_a x iota).  Both default to 0 = unchanged legacy behaviour,
+// so no pre-existing scenario, ablation or dataset run is affected.
+uint32_t g_sybilIdentitiesPerAttacker = 0; ///< iota override; 0 = derive from sybil_attacker_level.
+uint32_t g_maliciousControllerCount   = 0; ///< explicit f; 0 = derive from sybil_attack_percentage.
 // RSSI co-location detection tuning + logging flags (bound by CmdLine below).
 double   rssiClusterRadius  = 25.0;   ///< Co-location cluster radius (m).
 double   rssiDist1Thresh    = 15.0;   ///< 1-RSU fallback distance threshold (m).
@@ -95,6 +101,16 @@ uint32_t rssiStreakRequired = 2;      ///< Consecutive windows to confirm Sybil.
 bool     sweepMode          = false;  ///< Suppress per-packet logging for fast threshold sweeps.
 bool     quietMode          = false;  ///< Suppress console output (CSV writes unaffected).
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
+// M1 PDR (Eq 3.62) denominator: a V2V broadcast counts one intended delivery per
+// neighbour inside this radius.  This is the RELIABLE range, deliberately well
+// below the radio's MAXIMUM reach -- the link budget (TxPower 23 dBm minus
+// RxSensitivity -101 dBm = 124 dB) puts marginal reception at ~290 m under the
+// configured COST-231 model, but marginal reception is not reliable delivery.
+// Do NOT raise this to the 290 m max-reach figure: that counts vehicles which
+// were never realistically reachable as intended recipients and deflates PDR
+// (measured 0.23 at 300 m vs 0.62 at 100 m on the same run).  PDR > 1 was NOT
+// caused by this value -- it was the 7-channel broadcast duplication inflating
+// the numerator ~6.3x; see the de-duplication note in sybil_metrics.h.
 double v2vReliableRange = 100.0;      ///< Reliable local V2V beacon evaluation radius (metres).
 double rsuVehicleRecordTimeout = 3.0; ///< Seconds before an RSU forgets an unseen vehicle.
 double rsuVehicleTableSnapshotInterval = 1.0; ///< Periodic RSU table CSV snapshot interval.
@@ -216,6 +232,15 @@ uint32_t rsuRevocationThreshold = 0;         ///< E1/E2: t in the t-of-n RSU co-
                                              ///< controller registration quorum.
 uint32_t rsuEndorserPoolSize = 0;            ///< E2: n, the active signer set the t signatures are
                                              ///< drawn from (top-n by omega). 0 = every eligible RSU.
+double revocationBulletinResyncSec = 2.0;   ///< Periodic full-list bulletin re-broadcast interval.
+                                             ///< Without this, a vehicle out of every RSU's range
+                                             ///< at the exact moment a revocation debounce round
+                                             ///< fires never receives ANY bulletin for that identity
+                                             ///< for the rest of the run (fire-and-forget, no retry) —
+                                             ///< confirmed empirically: 18.5% of vehicles never
+                                             ///< reached in a 300s/40%-attacker run, so a revoked
+                                             ///< pseudonym kept appearing in their beacon log to the
+                                             ///< end. 0 = disable (legacy single-shot behaviour).
 std::string rsuEndorserPolicy = "dynamic";   ///< E3. "dynamic" = Table 3.4 three-state lifecycle
                                              ///< gates manifest signing on omega_r >= theta_endorse;
                                              ///< "static" = every RSU signs permanently, whatever
@@ -546,6 +571,8 @@ struct IsolationRecord
     std::string entityType;
     uint32_t entityId = 0;
     double isolationTimestamp = 0.0;
+    double injectionTimestamp = 0.0;  ///< Eq exposure-window t_inject: attack-onset time
+                                       ///< (g_attackOnsetTime), known at scheduling time.
     std::string attackVariant;
     std::string aggregatedEvidenceHashHex;
     std::vector<std::string> evidenceCids;
@@ -566,6 +593,7 @@ struct RevocationManifestRecord
     std::string entityType;
     uint32_t entityId = 0;
     double revocationTimestamp = 0.0;
+    double injectionTimestamp = 0.0;  ///< Eq exposure-window t_inject, copied from IsolationRecord.
     std::string attackVariant;
     std::string isolationCid;
     std::vector<std::string> evidenceCids;
@@ -1108,7 +1136,7 @@ BytesToHex(const std::vector<uint8_t>& bytes)
     return out;
 }
 
-static bool FullPqcProfileActive();
+// Declared (non-static) in sybil_types.h — GetSecuritySuite() depends on it.
 static std::string FullCryptoProfileName();
 
 static std::vector<uint8_t>
@@ -3474,6 +3502,8 @@ BuildIsolationRecordJson(const IsolationRecord& rec)
        << "  \"entity_type\": \"" << rec.entityType << "\",\n"
        << "  \"entity_id\": " << rec.entityId << ",\n"
        << "  \"isolation_timestamp\": " << rec.isolationTimestamp << ",\n"
+       << "  \"injection_timestamp\": " << rec.injectionTimestamp << ",\n"
+       << "  \"exposure_window_sec\": " << (rec.isolationTimestamp - rec.injectionTimestamp) << ",\n"
        << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
        << "  \"aggregated_evidence_hash\": \"" << rec.aggregatedEvidenceHashHex << "\",\n"
        << "  \"evidence_cids\": [";
@@ -3534,6 +3564,8 @@ BuildRevocationManifestJson(const RevocationManifestRecord& rec)
        << "  \"entity_type\": \"" << rec.entityType << "\",\n"
        << "  \"entity_id\": " << rec.entityId << ",\n"
        << "  \"revocation_timestamp\": " << rec.revocationTimestamp << ",\n"
+       << "  \"injection_timestamp\": " << rec.injectionTimestamp << ",\n"
+       << "  \"exposure_window_sec\": " << (rec.revocationTimestamp - rec.injectionTimestamp) << ",\n"
        << "  \"attack_variant\": \"" << rec.attackVariant << "\",\n"
        << "  \"isolation_cid\": \"" << rec.isolationCid << "\",\n"
        << "  \"endorsement_scheme\": \""
@@ -3705,7 +3737,10 @@ BroadcastRevocationBulletin(uint32_t rsuId)
     }
 
     // True wire cost: id list + one 2-of-3 threshold signature (raw, not hex).
-    uint32_t payloadBytes = 12u + bt.idCount * 4u + 2u * MLDSA87_SIG_BYTES;
+    // SUITE-DEPENDENT: 2x4627 B under ML-DSA-87, 2x64 B under ECDSA P-256.  This
+    // was hardcoded to the PQC constant, which made the bulletin — the single
+    // largest broadcast in the system — cost the same in both arms.
+    uint32_t payloadBytes = 12u + bt.idCount * 4u + 2u * SuiteAuthSigBytes();
 
     Ptr<Packet> pkt = Create<Packet>(payloadBytes);
     SybilPacketTag meta(N_Vehicles + rsuId, N_Vehicles + rsuId, 0xFFFFFFFF,
@@ -3755,6 +3790,28 @@ ScheduleRevocationBulletin()
     Simulator::Schedule(Seconds(bulletinDebounceSec), &RunRevocationBulletinRound);
 }
 
+// Periodic full-list re-broadcast, independent of new revocations. Each RSU's
+// BroadcastRevocationBulletin already sends its COMPLETE current blacklist
+// every time (not a delta), so simply re-firing the same round on a timer
+// gives a vehicle that was out of range during every debounce-triggered round
+// repeated chances to be in range later as it moves — closing the coverage
+// gap without touching detection, revocation decisions, or any other logic.
+static void
+PeriodicRevocationBulletinResync()
+{
+    if (FullCryptoMechanismActive())
+    {
+        ++g_revocationBulletinVersion;
+        RunRevocationBulletinRound();
+    }
+    if (revocationBulletinResyncSec > 0.0 &&
+        Simulator::Now().GetSeconds() + revocationBulletinResyncSec <= simTime)
+    {
+        Simulator::Schedule(Seconds(revocationBulletinResyncSec),
+                            &PeriodicRevocationBulletinResync);
+    }
+}
+
 static void
 SyncRsuRevocationManifestsFromIpfs(uint32_t rsuId)
 {
@@ -3792,6 +3849,7 @@ PublishFullModeRevocationManifest(const IsolationRecord& isolation)
     rec.entityType = isolation.entityType;
     rec.entityId = isolation.entityId;
     rec.revocationTimestamp = isolation.isolationTimestamp;
+    rec.injectionTimestamp = isolation.injectionTimestamp;
     rec.attackVariant = isolation.attackVariant;
     rec.isolationCid = isolation.isolationCid;
     rec.evidenceCids = isolation.evidenceCids;
@@ -4049,6 +4107,11 @@ RevokeEntityCurrentCrypto(const std::string& entityType,
     rec.entityType = entityType;
     rec.entityId = entityId;
     rec.isolationTimestamp = Simulator::Now().GetSeconds();
+    // g_attackOnsetTime is the deterministic scheduling constant every attack
+    // window is gated behind (sybil_attacks.h); it is the correct t_inject for
+    // single-attack-type runs. Phased sequential_all6 runs still fall back to
+    // this global value rather than the per-phase start.
+    rec.injectionTimestamp = g_attackOnsetTime;
     rec.attackVariant = attackVariant;
     rec.aggregatedEvidenceHashHex = aggregatedEvidenceHashHex;
     rec.evidenceCids = evidenceCids;
@@ -4642,14 +4705,26 @@ EvaluateUncorroboratedRsuApproval(uint32_t rsuIndex,
 // does the effective mode swing between LIGHTWEIGHT and FULL per the selector.
 // ============================================================================
 bool   g_adaptiveFullEngaged = false;   // set by EvaluateModeSelector each cycle
-static double g_lambdaLo   = 0.02;      // Λlo  low-threat boundary (frac vehicles flagged)
+static double g_lambdaLo   = 0.02;      // Λlo  low-threat boundary — DIS-engage below this
+static double g_lambdaHi   = 0.15;      // Λhi  high-threat boundary — engage at/above this
 static double g_rhoMin     = 0.20;      // ρmin min OBU capacity for ML inference
 static double g_rhoTh      = 0.20;      // ρth  RSU spare-capacity threshold
 static double g_rhoV       = 1.00;      // ρv   modeled OBU capacity  (default: sufficient)
 static double g_rhoR       = 1.00;      // ρr   modeled RSU capacity  (default: sufficient)
 static double g_modeSelectInterval     = 1.0;  // selector re-evaluation period (s)
+static double g_lambdaWindowSec        = 10.0; // Λ observation window W (s)
+static double g_modeDwellSec           = 5.0;  // min sim-time between mode switches
+static double g_adaptiveLastSwitchSec  = -1e9; // time of previous mode switch
+static uint32_t g_adaptiveSwitchCount  = 0;    // total mode transitions this run
 static double g_adaptiveEngagedTimeSec = 0.0;  // cumulative sim-time spent in Full
 static double g_adaptiveLastEvalSec    = 0.0;  // time of previous selector evaluation
+
+// Λ windowed bookkeeping (mode 7 only — written under AdaptiveSolutionModeActive()).
+// Last sim-time each claimed identity was OBSERVED, and last time it was FLAGGED.
+// Two maps rather than a row deque: Λ needs distinct-identity counts, so the state
+// is O(distinct ids) (~400) instead of O(observations) (~10^5 per window).
+static std::map<uint32_t, double> g_lambdaLastSeen;
+static std::map<uint32_t, double> g_lambdaLastFlagged;
 
 static bool
 AdaptiveSolutionModeActive()
@@ -4673,7 +4748,9 @@ LightweightDecisionModeActive()
     return EffectiveMode() == MODE_LIGHTWEIGHT;
 }
 
-static bool
+// External linkage: GetSecuritySuite() in sybil_types.h calls this, so it cannot
+// have internal linkage (an inline function may not reference a static entity).
+bool
 FullPqcProfileActive()
 {
     return FullCryptoMechanismActive() && full_crypto_profile == 2 && CryptoPqcAvailable();
@@ -4709,27 +4786,50 @@ FullSolutionModeActive()
     return EffectiveMode() == MODE_FULL;
 }
 
-// A1 threat level Λ (Eq 3.11): fraction of vehicles currently carrying a
-// lightweight rule-based suspicion flag (the LW-SSD output of Eq 3.13),
-// observed across all RSU evidence tables. Cheap — reuses the always-on
-// rule-based detector, so the selector needs no extra detection work.
+// A1 threat level Λ (Eq 3.11): share of identities observed in the last W seconds
+// that currently carry a lightweight rule-based suspicion flag (the LW-SSD output
+// of Eq 3.13). Cheap — reuses the always-on rule-based detector, so the selector
+// needs no extra detection work.
+//
+// WHY THIS IS WINDOWED (bug fix, supervisor audit Q22/Q24).  The previous version
+// counted distinct claimed ids present in g_computedDetectionEvidenceTables over
+// a denominator of N_Vehicles.  That table only ever STORES flagged records (see
+// the SUSPICION_NONE early-return in RecordComputedDetectionEvidence) and never
+// evicts an identity key, so the numerator was the set of every id EVER flagged:
+// Λ was cumulative incidence, monotone non-decreasing, and crossed any positive
+// threshold exactly once, never to fall again.  Measured on
+// datasets/A1_quick/adaptive_pct60_s1 the trace was
+//   t=3 0.0077  t=4 0.0309  t=5 0.0656  t=6 0.1004  t=7 0.1274  t=8 0.1583
+// — strictly increasing, so Λlo=0.02 fires at t=4 and Λlo=0.15 at t=8: a 4 s
+// difference in a 300 s run.  Re-calibrating the threshold could not restore
+// adaptive behaviour; only a windowed Λ can.
+//
+// The denominator was also wrong: the numerator counts claimedVehicleId, which
+// includes phantom ids >= N_Vehicles (231 of them measured at 40% attackers, Q9),
+// so Λ could exceed 1.0 and was not a fraction of vehicles at all.  It is now
+// distinct identities OBSERVED in the same window, which bounds Λ to [0,1].
 static double
 ComputeAdaptiveThreatLevel()
 {
-    std::set<uint32_t> flagged;
-    for (uint32_t rsuId = 0;
-         rsuId < N_RSUs && rsuId < g_computedDetectionEvidenceTables.size(); ++rsuId)
+    const double now    = Simulator::Now().GetSeconds();
+    const double cutoff = now - g_lambdaWindowSec;
+
+    uint32_t observed = 0;
+    uint32_t flagged  = 0;
+    for (std::map<uint32_t, double>::const_iterator it = g_lambdaLastSeen.begin();
+         it != g_lambdaLastSeen.end(); ++it)
     {
-        for (const auto& kv : g_computedDetectionEvidenceTables[rsuId])
-        {
-            for (const auto& rec : kv.second)
-            {
-                if (rec.suspicionFlags != SUSPICION_NONE) { flagged.insert(kv.first); break; }
-            }
-        }
+        if (it->second < cutoff)
+            continue;                       // identity went quiet — outside the window
+        observed++;
+        std::map<uint32_t, double>::const_iterator f = g_lambdaLastFlagged.find(it->first);
+        if (f != g_lambdaLastFlagged.end() && f->second >= cutoff)
+            flagged++;
     }
-    double denom = static_cast<double>(std::max<uint32_t>(1u, N_Vehicles));
-    return static_cast<double>(flagged.size()) / denom;
+
+    if (observed == 0)
+        return 0.0;
+    return std::min(1.0, static_cast<double>(flagged) / static_cast<double>(observed));
 }
 
 // A1 mode selector M (Eq 3.11). Re-evaluates every g_modeSelectInterval seconds:
@@ -4747,20 +4847,56 @@ EvaluateModeSelector()
     g_adaptiveLastEvalSec = now;
 
     double lambda = ComputeAdaptiveThreatLevel();
-    // Eq 3.11:  Full  iff (ρr ≥ ρth) AND (ρv ≥ ρmin) AND (Λ ≥ Λlo);  else Lightweight.
-    bool wantFull = (g_rhoR >= g_rhoTh) && (g_rhoV >= g_rhoMin) && (lambda >= g_lambdaLo);
+
+    // Eq 3.11 with HYSTERESIS (bug fix, supervisor audit Q24).  The original rule
+    //   Full iff (ρr>=ρth) AND (ρv>=ρmin) AND (Λ>=Λlo)
+    // was a one-way latch in practice: with a monotone Λ the predicate could never
+    // go false again, so the run was permanently Full after the first crossing and
+    // A1 measured nothing.  A single threshold also chatters once Λ can fall.  So:
+    //   engage    at  Λ >= Λhi   (resources permitting)
+    //   disengage at  Λ <  Λlo   (or resources exhausted)
+    //   Λlo <= Λ < Λhi holds the current mode — the hysteresis band.
+    // Λlo keeps its paper value (0.02) and its paper meaning as the LOW-threat
+    // boundary; it now governs de-escalation, which is what "low boundary" implies.
+    // Λhi is the new escalation threshold. A dwell time bounds the switch rate.
+    const bool resourcesOk = (g_rhoR >= g_rhoTh) && (g_rhoV >= g_rhoMin);
+    bool wantFull = g_adaptiveFullEngaged;
+    if (!g_adaptiveFullEngaged)
+    {
+        if (resourcesOk && lambda >= g_lambdaHi)
+            wantFull = true;
+    }
+    else
+    {
+        if (!resourcesOk || lambda < g_lambdaLo)
+            wantFull = false;
+    }
+
+    bool dwellBlocked = false;
+    if (wantFull != g_adaptiveFullEngaged &&
+        (now - g_adaptiveLastSwitchSec) < g_modeDwellSec)
+    {
+        dwellBlocked = true;
+        wantFull = g_adaptiveFullEngaged;   // too soon since the last transition
+    }
+
     if (wantFull != g_adaptiveFullEngaged)
     {
+        g_adaptiveLastSwitchSec = now;
+        g_adaptiveSwitchCount++;
         std::cout << "[A1Selector] t=" << now << "s Lambda=" << lambda
                   << " -> " << (wantFull ? "FULL (engage)" : "LIGHTWEIGHT (disengage)")
-                  << "  (Lambda_lo=" << g_lambdaLo << " rho_v=" << g_rhoV
-                  << " rho_r=" << g_rhoR << ")\n" << std::flush;
+                  << "  (Lambda_lo=" << g_lambdaLo << " Lambda_hi=" << g_lambdaHi
+                  << " W=" << g_lambdaWindowSec << "s rho_v=" << g_rhoV
+                  << " rho_r=" << g_rhoR << " switch#" << g_adaptiveSwitchCount
+                  << ")\n" << std::flush;
     }
     g_adaptiveFullEngaged = wantFull;
 
     std::ofstream sel((outputDir + "/mode_selector_log.csv").c_str(), std::ios::app);
     sel << now << "," << lambda << "," << g_rhoV << "," << g_rhoR << ","
-        << (wantFull ? 1 : 0) << "," << g_adaptiveEngagedTimeSec << "\n";
+        << (wantFull ? 1 : 0) << "," << g_adaptiveEngagedTimeSec << ","
+        << g_adaptiveSwitchCount << "," << (dwellBlocked ? 1 : 0) << "\n";
 
     Simulator::Schedule(Seconds(g_modeSelectInterval), &EvaluateModeSelector);
 }
@@ -6571,6 +6707,16 @@ RecordComputedDetectionEvidence(uint32_t rsuIndex,
         SignWithCurrentRsuKeyHex(rsuIndex,
                                  rec.evidenceVectorHashHex + "|" +
                                      std::to_string(rec.revocationTimestamp));
+
+    // A1 Λ bookkeeping (mode 7 only — zero effect on modes 4/5/6).  This MUST run
+    // before the SUSPICION_NONE early-return below: the unflagged observations are
+    // exactly the Λ denominator, and they are discarded from here on.
+    if (AdaptiveSolutionModeActive())
+    {
+        g_lambdaLastSeen[rec.claimedVehicleId] = rec.observationTime;
+        if (rec.suspicionFlags != SUSPICION_NONE)
+            g_lambdaLastFlagged[rec.claimedVehicleId] = rec.observationTime;
+    }
 
     if (rec.suspicionFlags == SUSPICION_NONE)
         return;
@@ -10836,6 +10982,31 @@ HandleControllerRsuCommandPayload(const std::string& receiverRole,
                       << "  decrypt  0.000\n";
     }
 
+    // ---- v6 detection point (genuine-assertion side) ----------------------
+    // The same corroboration test the phantom-injection path applies, applied
+    // here to the ORDINARY controller->RSU command.  SelectControllerTargetForRsu
+    // fills this path with real vehicles the RSU is already serving (scored TN
+    // when corroborated, FP when a genuine identity is wrongly rejected) and,
+    // when the controller is compromised, with injected phantom ids (TP/FN).
+    // Scoring only the injection path is what left TN structurally 0 and MCC
+    // undefined for v6.  The asserting controller is this RSU's zone owner —
+    // the base tag carries a simulation node id, not a controller index.
+    if (controllerScoreGenuine)
+    {
+        uint32_t assertingController = GetControllerIndexForRsu(receiverId);
+        bool accept = ControllerDetectionRecordAssertion(receiverId,
+                                                         assertingController,
+                                                         commandTag.GetClaimedVehicleId(),
+                                                         g_vehicleNodes.GetN(),
+                                                         Simulator::Now().GetSeconds());
+        if (!accept)
+        {
+            // Rejected assertions must not reach the RSU table, or the matrix
+            // would score a decision the system never enforces.
+            return;
+        }
+    }
+
     g_controllerCommandTargets[receiverId].valid = true;
     g_controllerCommandTargets[receiverId].realVehicleId = commandTag.GetRealVehicleId();
     g_controllerCommandTargets[receiverId].claimedVehicleId = commandTag.GetClaimedVehicleId();
@@ -11156,15 +11327,65 @@ HandleChanHello(uint32_t rsuIndex, const ChanHelloTag& hello)
     sigData.insert(sigData.end(), nonceV.begin(), nonceV.end());
     sigData.insert(sigData.end(), nonceR.begin(), nonceR.end());
     std::vector<uint8_t> sigHash = CryptoSha256(sigData);
-    std::vector<uint8_t> handshakeSig = CryptoEcdsaSign(g_rsuPrivKeys[rsuIndex], sigHash);
-    if (handshakeSig.empty()) return;
+
+    // Suite-dependent handshake authentication.  Classical = ECDSA P-256 with the
+    // CA-certified long-term key.  PQC = ML-DSA-87 with the RSU's authority key,
+    // cross-certified by that same ECDSA identity so the vehicle can bind it.
+    const SecuritySuite suite = GetSecuritySuite();
+    std::vector<uint8_t> handshakeSig;
+    std::vector<uint8_t> authPub;
+    std::vector<uint8_t> authPubBindSig;
+
+    auto __hs0 = std::chrono::high_resolution_clock::now();
+    if (suite == SUITE_PQC)
+    {
+        if (rsuIndex >= g_pqcRsuSigKeys.size() ||
+            g_pqcRsuSigKeys[rsuIndex].secretKey.empty())
+        {
+            std::cerr << "[FullModePQC] CHAN_ACK: RSU " << rsuIndex
+                      << " has no ML-DSA-87 authority key\n";
+            return;
+        }
+        handshakeSig = CryptoMlDsa87Sign(g_pqcRsuSigKeys[rsuIndex].secretKey, sigHash);
+        authPub      = g_pqcRsuSigKeys[rsuIndex].publicKey;
+
+        std::vector<uint8_t> bindData;
+        bindData.push_back((rsuIndex >> 24) & 0xFF); bindData.push_back((rsuIndex >> 16) & 0xFF);
+        bindData.push_back((rsuIndex >>  8) & 0xFF); bindData.push_back( rsuIndex        & 0xFF);
+        bindData.insert(bindData.end(), authPub.begin(), authPub.end());
+        authPubBindSig = CryptoEcdsaSign(g_rsuPrivKeys[rsuIndex], CryptoSha256(bindData));
+        if (authPubBindSig.size() != 64) return;
+    }
+    else
+    {
+        handshakeSig = CryptoEcdsaSign(g_rsuPrivKeys[rsuIndex], sigHash);
+    }
+    auto __hs1 = std::chrono::high_resolution_clock::now();
+    std::cout << "[Latency] CHAN_ACK  rsu_edge/" << rsuIndex << "  sign  "
+              << std::chrono::duration<double, std::milli>(__hs1 - __hs0).count() << "\n";
+
+    if (handshakeSig.empty() || handshakeSig.size() != SuiteAuthSigBytes()) return;
 
     std::memcpy(ackTag.nonceR,       nonceR.data(),                  32);
     std::memcpy(ackTag.rsuLtPub,     g_rsuPubKeys[rsuIndex].data(),  64);
     std::memcpy(ackTag.certSig,      g_rsuCertSigs[rsuIndex].data(), 64);
-    std::memcpy(ackTag.handshakeSig, handshakeSig.data(),            64);
 
-    Ptr<Packet> ackPkt = Create<Packet>(1);
+    ackTag.sigScheme       = static_cast<uint8_t>(suite);
+    ackTag.handshakeSigLen = static_cast<uint16_t>(handshakeSig.size());
+    std::memcpy(ackTag.handshakeSig, handshakeSig.data(), ackTag.handshakeSigLen);
+    if (!authPub.empty())
+    {
+        ackTag.authPubLen = static_cast<uint16_t>(authPub.size());
+        std::memcpy(ackTag.authPub,        authPub.data(),        ackTag.authPubLen);
+        std::memcpy(ackTag.authPubBindSig, authPubBindSig.data(), 64);
+    }
+
+    // Real airtime: KEM ciphertext + nonce + certificate + handshake signature
+    // (+ the ML-DSA key and its cross-cert under PQC).  See §2.3 of
+    // docs/PQC_vs_Classical_Comparison_README.md for why the old
+    // Create<Packet>(1) made every congestion comparison vacuous.
+    Ptr<Packet> ackPkt =
+        Create<Packet>(1 + SecurityWireOverheadBytes(static_cast<uint32_t>(CHAN_ACK)));
     SybilPacketTag metaTag(rsuIndex, rsuIndex, vehicleId,
                            static_cast<uint32_t>(CHAN_ACK), g_seq++);
     ackPkt->AddPacketTag(metaTag);
@@ -11247,9 +11468,46 @@ HandleChanAck(uint32_t vehicleIndex, const ChanAckTag& ack)
     sigData.insert(sigData.end(), hs.nonceV.begin(), hs.nonceV.end());
     sigData.insert(sigData.end(), ack.nonceR, ack.nonceR + 32);
     std::vector<uint8_t> sigHash = CryptoSha256(sigData);
-    std::vector<uint8_t> handshakeSig(ack.handshakeSig, ack.handshakeSig + 64);
+    std::vector<uint8_t> handshakeSig(ack.handshakeSig,
+                                      ack.handshakeSig + ack.handshakeSigLen);
 
-    if (!CryptoEcdsaVerify(rsuLtPub, sigHash, handshakeSig))
+    // Suite-dependent verification, dispatched on the scheme the RSU declared.
+    // PQC additionally binds the ML-DSA-87 key to the CA-certified ECDSA identity
+    // before it is trusted, so an attacker cannot substitute its own authority key.
+    bool sigOk = false;
+    auto __hv0 = std::chrono::high_resolution_clock::now();
+    if (ack.sigScheme == static_cast<uint8_t>(SUITE_PQC))
+    {
+        std::vector<uint8_t> authPub(ack.authPub, ack.authPub + ack.authPubLen);
+        std::vector<uint8_t> bindSig(ack.authPubBindSig, ack.authPubBindSig + 64);
+
+        std::vector<uint8_t> bindData;
+        bindData.push_back((rsuId >> 24) & 0xFF); bindData.push_back((rsuId >> 16) & 0xFF);
+        bindData.push_back((rsuId >>  8) & 0xFF); bindData.push_back( rsuId        & 0xFF);
+        bindData.insert(bindData.end(), authPub.begin(), authPub.end());
+
+        const bool bindOk =
+            !authPub.empty() &&
+            CryptoEcdsaVerify(rsuLtPub, CryptoSha256(bindData), bindSig);
+        if (!bindOk)
+        {
+            std::cout << "[Security] CHAN_ACK: ML-DSA-87 key binding INVALID"
+                      << "  Vehicle=" << vehicleIndex
+                      << "  RSU=" << rsuId << std::endl;
+            state.pending.erase(it);
+            return;
+        }
+        sigOk = CryptoMlDsa87Verify(authPub, sigHash, handshakeSig);
+    }
+    else
+    {
+        sigOk = CryptoEcdsaVerify(rsuLtPub, sigHash, handshakeSig);
+    }
+    auto __hv1 = std::chrono::high_resolution_clock::now();
+    std::cout << "[Latency] CHAN_ACK  vehicle/" << vehicleIndex << "  verify  "
+              << std::chrono::duration<double, std::milli>(__hv1 - __hv0).count() << "\n";
+
+    if (!sigOk)
     {
         std::cout << "[Security] CHAN_ACK: handshake signature INVALID"
                   << "  Vehicle=" << vehicleIndex
@@ -11375,7 +11633,10 @@ SendChanHello(uint32_t vehicleIndex, uint32_t rsuIndex)
         std::memcpy(helloTag.kyberPublicKey, kyberKeys.publicKey.data(), kyberKeys.publicKey.size());
     std::memcpy(helloTag.nonceV,  nonceV.data(), 32);
 
-    Ptr<Packet> pkt = Create<Packet>(1);
+    // Real airtime: the vehicle's KEM public key + nonce.  1568 B under ML-KEM-1024
+    // against 64 B under ECDH-P256, and 0 with security off.
+    Ptr<Packet> pkt =
+        Create<Packet>(1 + SecurityWireOverheadBytes(static_cast<uint32_t>(CHAN_HELLO)));
     SybilPacketTag metaTag(vehicleIndex, vehicleIndex, rsuIndex,
                            static_cast<uint32_t>(CHAN_HELLO), g_seq++);
     pkt->AddPacketTag(metaTag);
@@ -11486,8 +11747,9 @@ struct BufferedBeacon
     SybilPacketTag       tag;
     BsmCoreData          bsm;
     std::vector<uint8_t> digest;      ///< SHA3-256 over the serialized BSM
-    std::vector<uint8_t> signature;   ///< FN-DSA-1024 signature
-    std::vector<uint8_t> senderPubKey;///< embedded FN-DSA-1024 public key
+    std::vector<uint8_t> signature;   ///< FN-DSA-1024 (PQC) or ECDSA P-256 (classical)
+    std::vector<uint8_t> senderPubKey;///< embedded verification key
+    uint8_t              scheme = 0;  ///< SecuritySuite that produced the signature
     bool                 hasSignature = false;
     uint32_t             triggerSeq = 0;
 };
@@ -11530,12 +11792,14 @@ BufferBeaconForWindowVerification(uint32_t observerVehicleId,
     V2VSignatureTag sigTag;
     if (packet->PeekPacketTag(sigTag))
     {
+        // Copy only the bytes the sender's suite actually used — an ECDSA beacon
+        // fills 64/64 of the FN-DSA-sized buffers, and handing the trailing zero
+        // padding to the verifier would fail every classical-arm signature.
         entry.hasSignature = true;
-        entry.digest    = CryptoSha3_256(SerializeBsmForSigning(bsm));
-        entry.senderPubKey.assign(sigTag.pub_key,
-                                  sigTag.pub_key + V2VSignatureTag::KEY_BYTES);
-        entry.signature.assign(sigTag.sig,
-                               sigTag.sig + V2VSignatureTag::SIG_BYTES);
+        entry.scheme       = sigTag.scheme;
+        entry.digest       = CryptoSha3_256(SerializeBsmForSigning(bsm));
+        entry.senderPubKey.assign(sigTag.pub_key, sigTag.pub_key + sigTag.keyLen);
+        entry.signature.assign  (sigTag.sig,     sigTag.sig     + sigTag.sigLen);
     }
 
     g_beaconWindowBuffer[observerVehicleId][tag.GetClaimedNodeId()]
@@ -11643,12 +11907,16 @@ FlushBeaconVerificationWindow()
             std::vector<std::vector<uint8_t>> digests;
             std::vector<std::vector<uint8_t>> signatures;
             std::vector<uint8_t> senderPubKey;
+            uint8_t              batchScheme = static_cast<uint8_t>(SUITE_NONE);
             for (const BufferedBeacon& b : beacons)
             {
                 if (!b.hasSignature)
                     continue;
                 if (senderPubKey.empty())
+                {
                     senderPubKey = b.senderPubKey;
+                    batchScheme  = b.scheme;
+                }
                 digests.push_back(b.digest);
                 signatures.push_back(b.signature);
             }
@@ -11658,8 +11926,25 @@ FlushBeaconVerificationWindow()
             if (!digests.empty() && CryptoMechanismActive())
             {
                 auto __t0 = std::chrono::high_resolution_clock::now();
-                batchOk = CryptoFnDsa1024BatchVerify(senderPubKey, digests,
-                                                     signatures, failedCount);
+                // Dispatch on the scheme the SENDER used, not the local suite:
+                // during the classical arm every beacon is ECDSA, during the PQC
+                // arm every beacon is FN-DSA, and a mismatch means a forgery
+                // attempt rather than a configuration error.
+                if (batchScheme == static_cast<uint8_t>(SUITE_CLASSICAL))
+                {
+                    failedCount = 0;
+                    for (std::size_t k = 0; k < digests.size(); ++k)
+                    {
+                        if (!CryptoEcdsaVerify(senderPubKey, digests[k], signatures[k]))
+                            ++failedCount;
+                    }
+                    batchOk = (failedCount == 0);
+                }
+                else
+                {
+                    batchOk = CryptoFnDsa1024BatchVerify(senderPubKey, digests,
+                                                         signatures, failedCount);
+                }
                 auto __t1 = std::chrono::high_resolution_clock::now();
                 double __ms =
                     std::chrono::duration<double, std::milli>(__t1 - __t0).count();
@@ -12858,6 +13143,19 @@ LogReceivedPacket(const std::string& receiverRole,
     bool isV2VBroadcast = hasTag && tag.GetMessageType() == static_cast<uint32_t>(V2V_BEACON);
     bool countForPDR    = !isV2VBroadcast || receiverRole == "vehicle";
 
+    // ...and only once per (sender, sequence, receiver).  A broadcast egresses all
+    // 7 DSRC-channel interfaces, so the same beacon arrives at a neighbour up to 7
+    // times while the sender counted one transmission; without this the numerator
+    // is inflated ~6.3x and PDR exceeds 1.  See the de-duplication note in
+    // sybil_metrics.h for why only M1 needs this and M2/M3/M4 must be left alone.
+    if (countForPDR && hasTag &&
+        MetricsPdrIsDuplicateDelivery(tag.GetRealNodeId(),
+                                      tag.GetSequenceNumber(),
+                                      receiverId))
+    {
+        countForPDR = false;
+    }
+
     bool isSybil = hasTag && (tag.GetRealNodeId() != tag.GetClaimedNodeId());
     // Identity-level ground truth for full-mode LLM detector metrics: a claimed id is
     // "actually sybil" if any beacon under it carried a real!=claimed id (impersonation or
@@ -14051,6 +14349,8 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getDouble("rsuReportInterval",               rsuReportInterval);
     getBool  ("sybil_attack_enabled",            sybil_attack_enabled);
     getUint  ("sybil_attack_type",               sybil_attack_type);
+    getUint  ("sybilIdentitiesPerAttacker",      g_sybilIdentitiesPerAttacker);
+    getUint  ("maliciousControllerCount",        g_maliciousControllerCount);
     getUint  ("sybil_attack_percentage",         sybil_attack_percentage);
     getUint  ("sybil_attacker_level",            sybil_attacker_level);
     getBool  ("controller_malicious_assumption", controller_malicious_assumption);
@@ -14168,10 +14468,15 @@ main(int argc, char* argv[])
     cmd.AddValue("sybil_attack_type",          "Attack variant 0-6, or 7=sequential 1->2->3->4 dataset mode (see sybil_attacks.h)",sybil_attack_type);
     cmd.AddValue("sybil_attack_percentage",    "% of eligible nodes that are attackers", sybil_attack_percentage);
     cmd.AddValue("sybil_attacker_level",        "Attacker sophistication 1=basic 2=standard 3=stealth 4=advanced", sybil_attacker_level);
+    cmd.AddValue("sybilIdentitiesPerAttacker", "Experiment 1 iota: simultaneous Sybil identities per attacker (Type 2), clamped to 5. 0 = derive from sybil_attacker_level (legacy default)", g_sybilIdentitiesPerAttacker);
+    cmd.AddValue("maliciousControllerCount",   "Experiment 1: explicit number of compromised SDN controllers f; also enables proportional controller compromise under attack variants other than type 6. 0 = legacy behaviour", g_maliciousControllerCount);
     cmd.AddValue("controller_malicious_assumption","Force SDN controller malicious",     controller_malicious_assumption);
     cmd.AddValue("solution_mode",              "Solution mode: 1=FLEMDS FL 2=RSSI 3=ML placeholder 4=lightweight 5=full 6=no detection 7=adaptive dual-mode (Eq 3.11 selector)",solution_mode);
     // A1 dual-mode selector (Eq 3.11) knobs — only consulted when solution_mode=7.
-    cmd.AddValue("lambdaLo", "A1 adaptive: low-threat boundary Λlo (escalate to Full when flagged-vehicle fraction >= this) [default 0.02]", g_lambdaLo);
+    cmd.AddValue("lambdaLo", "A1 adaptive: low-threat boundary Λlo — DIS-engage to Lightweight when windowed Λ < this [default 0.02, paper value]", g_lambdaLo);
+    cmd.AddValue("lambdaHi", "A1 adaptive: high-threat boundary Λhi — escalate to Full when windowed Λ >= this. Must be > lambdaLo (hysteresis band) [default 0.15]", g_lambdaHi);
+    cmd.AddValue("lambdaWindow", "A1 adaptive: Λ observation window W in seconds; an identity leaves the Λ numerator/denominator after being unseen this long [default 10]", g_lambdaWindowSec);
+    cmd.AddValue("modeDwell", "A1 adaptive: minimum sim-seconds between mode switches (anti-chatter) [default 5]", g_modeDwellSec);
     cmd.AddValue("rhoMin",   "A1 adaptive: min OBU compute ρmin for ML (Lightweight if ρv<ρmin) [default 0.20]", g_rhoMin);
     cmd.AddValue("rhoTh",    "A1 adaptive: RSU spare-capacity threshold ρth (Full needs ρr>=ρth) [default 0.20]", g_rhoTh);
     cmd.AddValue("rhoV",     "A1 adaptive: modeled OBU capacity ρv [default 1.0 = sufficient]", g_rhoV);
@@ -14215,6 +14520,7 @@ main(int argc, char* argv[])
     cmd.AddValue("controllerPeerCorroborate", "v6: k peer RSUs whose over-the-air observation corroborates a controller-asserted identity", controllerPeerCorroborate);
     cmd.AddValue("controllerS6Threshold",     "v6: theta_6 on the per-controller uncorroborated-assertion fraction S6", controllerS6Threshold);
     cmd.AddValue("controllerS6MinSamples",    "v6: minimum assertions before a controller can be flagged", controllerS6MinSamples);
+    cmd.AddValue("controllerScoreGenuine",    "v6: also score the legitimate controller->RSU command path (false = phantom injections only, leaves TN=0 and MCC undefined)", controllerScoreGenuine);
     cmd.AddValue("controllerDetectWindowSec", "v6: S6 evaluation window length in seconds", controllerDetectWindowSec);
     cmd.AddValue("sdnAttestationGraceReports", "Report epochs an identity may stay unattested before counting against the RSU", sdnAttestationGraceReports);
     cmd.AddValue("rsuTrustWindowInterval", "Seconds per Eq. 3.9 RSU approval-anomaly evaluation window", rsuTrustWindowInterval);
@@ -14235,6 +14541,7 @@ main(int argc, char* argv[])
     cmd.AddValue("ablateMitigation", "Ablation E1(iii): 'none' = detection still fires and is scored but Algorithm 4 RevokeEntity is never called (Sybil identities persist). Empty = full mitigation pipeline", ablateMitigation);
     cmd.AddValue("rsuRevocationThreshold", "Ablation E1/E2: t in the t-of-n RSU co-authorisation of Eq 3.47, decoupled from controllerRegistrationThreshold. 1 = single-signer. 0 = legacy coupling", rsuRevocationThreshold);
     cmd.AddValue("rsuEndorserPoolSize", "Ablation E2: n, the active signer set the t signatures are drawn from (top-n by omega). 0 = every eligible RSU", rsuEndorserPoolSize);
+    cmd.AddValue("revocationBulletinResyncSec", "Periodic full-list revocation bulletin re-broadcast interval (s); closes the vehicle-tier coverage gap for nodes out of range during the original debounce round. 0 = disable (legacy single-shot)", revocationBulletinResyncSec);
     cmd.AddValue("rsuEndorserPolicy", "Ablation E3: dynamic = Table 3.4 trust-gated three-state endorser lifecycle; static = every RSU signs manifests permanently regardless of trust history", rsuEndorserPolicy);
     cmd.AddValue("maliciousRsuForgeRevocation", "Ablation E2/E3 adversary: a compromised RSU fabricates single-signer revocation manifests naming LEGITIMATE vehicles. Required for E2 to have any signal", maliciousRsuForgeRevocation);
     cmd.AddValue("maliciousRsuForgeInterval", "Seconds between forgery attempts per compromised RSU [default 5]", maliciousRsuForgeInterval);
@@ -14279,6 +14586,13 @@ main(int argc, char* argv[])
     cmd.AddValue("scenarioId",          "Scenario label for run_meta.json (default: auto)", g_scenarioId);
     
     cmd.Parse(argc, argv);
+
+    // --seed only fed the attacker-selection/fanout hash (below); ns-3's own
+    // RngSeedManager was never set, so every stochastic ns-3 component (WiFi
+    // propagation/loss, jitter, contention) silently ran on ns-3's built-in
+    // default seed regardless of --seed. Two runs differing only by --seed
+    // were therefore bit-identical, not independent Monte Carlo trials.
+    ns3::RngSeedManager::SetSeed(g_runSeed);
 
     // Redirect every per-run CSV log under --outputDir so a parallel sweep can
     // keep each run's communication log in its own folder. The directory must
@@ -14331,6 +14645,55 @@ main(int argc, char* argv[])
         NS_FATAL_ERROR("--rsuRevocationThreshold t=" << rsuRevocationThreshold
                        << " exceeds --rsuEndorserPoolSize n=" << rsuEndorserPoolSize
                        << "; t-of-n quorum is unreachable by construction");
+    }
+
+    // ── Security-suite manifest ────────────────────────────────────────────
+    // Every run states which arm of the none/classical/PQC comparison it is and
+    // exactly what that arm charges per message class, so a dataset folder is
+    // self-describing and the three arms can be joined without guessing from
+    // flags.  Written before Simulator::Run() because the sizes are constant for
+    // the run.  (Under --solution_mode=7 the adaptive selector can move the
+    // suite mid-run; that mode is out of scope for this comparison.)
+    {
+        std::cout << "[SecuritySuite] arm=" << SecuritySuiteName()
+                  << "  SecEnabled=" << (g_secEnabled ? "true" : "false")
+                  << "  solution_mode=" << solution_mode
+                  << "  full_crypto_profile=" << full_crypto_profile
+                  << "  liboqs=" << (CryptoPqcAvailable() ? "linked" : "absent")
+                  << "\n[SecuritySuite] beacon_sig=" << SuiteBeaconSigBytes()
+                  << "B beacon_pub=" << SuiteBeaconPubBytes()
+                  << "B auth_sig="   << SuiteAuthSigBytes()
+                  << "B kem_pub="    << SuiteKemPubBytes()
+                  << "B kem_ct="     << SuiteKemCtBytes() << "B"
+                  << "  wire_overhead: beacon=" << SecurityWireOverheadBytes(V2V_BEACON)
+                  << "B chan_hello=" << SecurityWireOverheadBytes(CHAN_HELLO)
+                  << "B chan_ack="   << SecurityWireOverheadBytes(CHAN_ACK) << "B"
+                  << std::endl;
+
+        if (full_crypto_profile == 2 && !CryptoPqcAvailable())
+        {
+            std::cerr << "[SecuritySuite] FATAL-ish: --full_crypto_profile=2 requested but "
+                         "liboqs is NOT linked; this run is CLASSICAL and must not be "
+                         "reported as the PQC arm.\n";
+        }
+
+        const std::string suiteCsv =
+            (outputDir.empty() ? std::string("sybil-attack/outputs") : outputDir)
+            + "/metrics_S_security_profile.csv";
+        std::ofstream sf(suiteCsv.c_str());
+        sf << "security_suite,sec_enabled,solution_mode,full_crypto_profile,liboqs_linked,"
+              "beacon_sig_bytes,beacon_pub_bytes,auth_sig_bytes,auth_pub_bytes,"
+              "kem_pub_bytes,kem_ct_bytes,"
+              "wire_overhead_v2v_beacon,wire_overhead_chan_hello,wire_overhead_chan_ack\n"
+           << SecuritySuiteName() << ","
+           << (g_secEnabled ? 1 : 0) << "," << solution_mode << ","
+           << full_crypto_profile << "," << (CryptoPqcAvailable() ? 1 : 0) << ","
+           << SuiteBeaconSigBytes() << "," << SuiteBeaconPubBytes() << ","
+           << SuiteAuthSigBytes()   << "," << SuiteAuthPubBytes()   << ","
+           << SuiteKemPubBytes()    << "," << SuiteKemCtBytes()     << ","
+           << SecurityWireOverheadBytes(V2V_BEACON) << ","
+           << SecurityWireOverheadBytes(CHAN_HELLO) << ","
+           << SecurityWireOverheadBytes(CHAN_ACK) << "\n";
     }
     if (!ablateMitigation.empty() || rsuRevocationThreshold > 0 ||
         rsuEndorserPoolSize > 0 || rsuEndorserPolicy != "dynamic" ||
@@ -14428,6 +14791,46 @@ main(int argc, char* argv[])
     if (N_Controllers == 0) N_Controllers = 1;
     controllerRegistrationThreshold =
         std::min(std::max(1u, controllerRegistrationThreshold), N_Controllers);
+
+    // Diagnostic only (no behaviour change): make the REAL RSU-tier revocation
+    // quorum visible at startup. The old "[Metrics] ... Threshold=2-of-3" banner
+    // is an unrelated M5/M6 metrics-module default and never reflected this
+    // value, so a run that silently collapsed to single-signer (e.g. default
+    // N_Controllers=1 with --rsuRevocationThreshold left at 0 = legacy coupling
+    // via controllerRegistrationThreshold) printed a reassuring but false
+    // banner. Warn explicitly when that collapse looks unintentional.
+    {
+        uint32_t realT = GetRsuRevocationThreshold();
+        uint32_t realN = GetRsuEndorserPoolSize();
+        std::cout << "[RevocationQuorum] RSU-tier t-of-n = " << realT << "-of-"
+                  << (realN > 0 ? realN : N_RSUs)
+                  << " (rsuRevocationThreshold=" << rsuRevocationThreshold
+                  << (rsuRevocationThreshold == 0 ? " [legacy-coupled to controllerRegistrationThreshold]" : "")
+                  << ")" << std::endl;
+        if (realT <= 1 && N_RSUs > 1 && rsuRevocationThreshold == 0)
+        {
+            std::cout << "[RevocationQuorum] WARNING: t=" << realT
+                      << " single-signer quorum was NOT explicitly requested "
+                         "(--rsuRevocationThreshold=0 legacy coupling collapsed to 1, "
+                         "likely because N_Controllers=" << N_Controllers
+                      << "). Pass --rsuRevocationThreshold=3 (paper spec) explicitly "
+                         "if that is not intended." << std::endl;
+        }
+    }
+    // A1 hysteresis sanity: Λhi must sit strictly above Λlo or the band collapses
+    // back to the single-threshold latch this fix exists to remove.
+    g_lambdaLo = std::min(1.0, std::max(0.0, g_lambdaLo));
+    g_lambdaHi = std::min(1.0, std::max(0.0, g_lambdaHi));
+    if (g_lambdaHi <= g_lambdaLo)
+    {
+        std::cerr << "[A1Selector] WARNING: lambdaHi (" << g_lambdaHi << ") <= lambdaLo ("
+                  << g_lambdaLo << "); hysteresis band is empty. Raising lambdaHi to "
+                  << std::min(1.0, g_lambdaLo + 0.05) << ".\n";
+        g_lambdaHi = std::min(1.0, g_lambdaLo + 0.05);
+    }
+    g_lambdaWindowSec = std::max(g_modeSelectInterval, g_lambdaWindowSec);
+    g_modeDwellSec    = std::max(0.0, g_modeDwellSec);
+
     rsuTrustEndorseThreshold = std::min(1.0, std::max(0.0, rsuTrustEndorseThreshold));
     rsuTrustRemoveThreshold = std::min(rsuTrustEndorseThreshold,
                                        std::max(0.0, rsuTrustRemoveThreshold));
@@ -14632,11 +15035,17 @@ main(int argc, char* argv[])
         InitializeControllerLogCsv();
     }
     OpenPersistentCsvHandles();
-    InitializeMetricsCsvFiles();
 
     g_secMetrics = Create<SecurityEvaluationMetrics>();
     if (!outputDir.empty())
         g_secMetrics->SetOutputDir(outputDir);   // redirect M1-M10 + summary with --outputDir
+
+    // MUST run after SetOutputDir: it writes the M1-M4 headers, and SetOutputDir
+    // is what points metricsPdrCsv & co at --outputDir.  With the old ordering the
+    // headers went to the default sybil-attack/outputs/ paths while the data rows
+    // went to the run folder, so every per-run M1-M4 CSV was headerless and could
+    // not be read back by name.
+    InitializeMetricsCsvFiles();
     g_secMetrics->Initialize(N_Vehicles, N_RSUs, solution_mode);
 
     // -----------------------------------------------------------------------
@@ -15217,9 +15626,13 @@ main(int argc, char* argv[])
             {
                 std::ofstream sel((outputDir + "/mode_selector_log.csv").c_str(),
                                   std::ios::trunc);
-                sel << "time_s,lambda,rho_v,rho_r,full_engaged,engaged_time_cum_s\n";
+                sel << "time_s,lambda,rho_v,rho_r,full_engaged,engaged_time_cum_s,"
+                       "switch_count,dwell_blocked\n";
             }
             std::cout << "[A1Selector] ADAPTIVE dual-mode ARMED: Lambda_lo=" << g_lambdaLo
+                      << " Lambda_hi=" << g_lambdaHi
+                      << " Lambda_window=" << g_lambdaWindowSec << "s"
+                      << " dwell=" << g_modeDwellSec << "s"
                       << " rho_min=" << g_rhoMin << " rho_th=" << g_rhoTh
                       << " rho_v=" << g_rhoV << " rho_r=" << g_rhoR
                       << " select_interval=" << g_modeSelectInterval << "s\n" << std::flush;
@@ -15250,11 +15663,16 @@ main(int argc, char* argv[])
     // v6 control-plane detector (malicious SDN controller).  Only meaningful
     // when the controller tier is under attack; the assertion path it scores
     // exists solely under sybil_attack_type=6.
+    // A non-zero g_maliciousControllerCount (Experiment 1) means the controller
+    // tier is deliberately compromised even though the vehicle-tier variant is
+    // not type 6, so the v6 detector must engage or the controller-tier attack
+    // lands unmeasured.  Default 0 leaves this condition unchanged.
     bool v6DetectActive = controllerDetectEnabled &&
                           sybil_attack_enabled &&
                           (sybil_attack_type == 6u ||
                            sybil_attack_type == 9u ||
-                           controller_malicious_assumption);
+                           controller_malicious_assumption ||
+                           g_maliciousControllerCount > 0u);
     if (v6DetectActive)
     {
         ControllerDetectionInit(outputDir, N_RSUs);
@@ -15270,6 +15688,12 @@ main(int argc, char* argv[])
     else
     {
         controllerDetectEnabled = false;   // keep every other run path untouched
+    }
+
+    if (FullCryptoMechanismActive() && revocationBulletinResyncSec > 0.0)
+    {
+        Simulator::Schedule(Seconds(revocationBulletinResyncSec),
+                            &PeriodicRevocationBulletinResync);
     }
 
     Simulator::Run();
@@ -15342,6 +15766,37 @@ main(int argc, char* argv[])
 
     WriteMetricsRow(simTime);
     WriteFinalSummary();
+
+    // Appended after WriteFinalSummary (which lives in sybil_metrics.h and
+    // cannot see g_attackOnsetTime/g_runSeed/g_vehicleFanout — those are
+    // declared later, in sybil_attacks.h). Purely additive rows; nothing
+    // above is rewritten or reordered.
+    {
+        double fanoutSum = 0.0;
+        uint32_t fanoutCount = 0;
+        for (uint32_t f : g_vehicleFanout)
+        {
+            if (f > 0u) { fanoutSum += static_cast<double>(f); fanoutCount++; }
+        }
+        double meanIntensity = (fanoutCount > 0) ? fanoutSum / fanoutCount : 0.0;
+
+        uint64_t revCount = GetM7CorrectRevocationCount();
+        double meanExposureWindowSec =
+            (revCount > 0)
+                ? (GetM7CorrectRevocationDetTimeSumSec() -
+                   static_cast<double>(revCount) * g_attackOnsetTime) /
+                      static_cast<double>(revCount)
+                : 0.0;
+
+        std::ofstream out(g_metricsOutDir + "/metrics_summary.csv", std::ios::app);
+        out << "attack_intensity_iota," << meanIntensity
+            << ",Mean identities-per-attacker (fanout) among active Sybil attackers\n"
+            << "M7_mean_exposure_window_sec," << meanExposureWindowSec
+            << ",Mean Xi(e) = t_contain - t_inject over confirmed-Sybil revocations "
+               "(t_inject = g_attackOnsetTime)\n"
+            << "seed," << g_runSeed
+            << ",RNG seed for reproducible attacker selection and fanout draws\n";
+    }
 
     // RSU-tier revocation enforcement: how much attack traffic the blacklist actually
     // stopped. Before the RSU-tier drop this was structurally zero — the blacklist only

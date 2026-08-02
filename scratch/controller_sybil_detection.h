@@ -73,6 +73,14 @@ double   controllerS6Threshold     = 0.50;   ///< theta_6 on the uncorroborated 
 uint32_t controllerS6MinSamples    = 20;     ///< min assertions before a controller can be flagged
 double   controllerDetectWindowSec = 3.0;    ///< S6 evaluation period
 
+// Score the LEGITIMATE controller->RSU command path as well as the phantom
+// injection path.  Without this only phantom assertions ever reach the
+// confusion matrix, so TN (and the genuine-assertion half of FP) stay
+// structurally 0 and MCC is undefined however long the run lasts — the
+// denominator sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN)) has a zero margin.
+// Set false to reproduce pre-fix numbers (recall/precision only, MCC N/A).
+bool     controllerScoreGenuine    = true;   ///< score genuine assertions too
+
 // ---------------------------------------------------------------------------
 // Wireless-observation provenance.
 //

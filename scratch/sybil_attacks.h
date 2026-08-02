@@ -46,6 +46,13 @@ extern bool     controller_malicious_assumption;
 extern double   rsuReportInterval;
 extern uint32_t N_Controllers;   ///< needed for per-controller v6 compromise flags
 
+// Experiment 1 (rho_a x iota).  Both default to 0, which means "legacy
+// behaviour" — the budget keeps deriving from sybil_attacker_level and the
+// controller-compromise gate keeps its original condition — so no pre-existing
+// scenario, ablation or dataset run is affected.
+extern uint32_t g_sybilIdentitiesPerAttacker;   ///< iota override; 0 = derive from attacker level
+extern uint32_t g_maliciousControllerCount;     ///< explicit f; 0 = derive from attack percentage
+
 // ---------------------------------------------------------------------------
 // Per-node and per-infrastructure attack state.
 // Defined here (static = internal linkage within the single .cc TU).
@@ -390,10 +397,18 @@ DeclareAttackers()
     {
         uint32_t nAttackers = N_Vehicles * sybil_attack_percentage / 100u;
         // Build a list of (hash, nodeIndex) pairs and sort ascending by hash.
+        // g_runSeed is mixed into the hash (not just the node index) so
+        // --seed actually varies WHICH nodes are attackers between runs;
+        // previously this hash ignored g_runSeed entirely, so every run at a
+        // given N_Vehicles/percentage picked the identical attacker set
+        // regardless of --seed. The rank-then-take-lowest-N selection still
+        // guarantees exactly floor(N * percentage / 100) attackers for any
+        // seed, so this preserves the count invariant the comment above
+        // relies on.
         std::vector<std::pair<uint32_t, uint32_t>> ranked;
         ranked.reserve(N_Vehicles);
         for (uint32_t i = 0; i < N_Vehicles; ++i)
-            ranked.push_back({ (i * 37u + 11u) % 100u, i });
+            ranked.push_back({ (i * 37u + 11u + g_runSeed * 7u) % 100u, i });
         std::sort(ranked.begin(), ranked.end());
         // Mark the first nAttackers nodes (lowest hash = "most likely attacker").
         for (uint32_t k = 0; k < nAttackers && k < N_Vehicles; ++k)
@@ -435,7 +450,13 @@ DeclareAttackers()
     //      liveness:  t_c <= n_c - f    (honest set alone can still reach quorum)
     // hold, which together require f <= (n_c - 1) / 2.  Above that ceiling no
     // threshold value satisfies both and the tier is unprotectable by quorum.
-    if (g_activeAttackType == ATTACK_MALICIOUS_SDN_CONTROLLER || controller_malicious_assumption)
+    // g_maliciousControllerCount (Experiment 1) widens this gate so the SAME
+    // proportional compromise already implemented here also applies under
+    // attack variants other than Type 6.  It defaults to 0, which leaves both
+    // the gate condition and the derived count exactly as they were.
+    if (g_activeAttackType == ATTACK_MALICIOUS_SDN_CONTROLLER ||
+        controller_malicious_assumption ||
+        g_maliciousControllerCount > 0u)
     {
         uint32_t nControllers = std::max(1u, N_Controllers);
         uint32_t nMalicious   = nControllers * sybil_attack_percentage / 100u;
@@ -443,6 +464,10 @@ DeclareAttackers()
             nMalicious = 1u;
         if (controller_malicious_assumption && nMalicious == 0u)
             nMalicious = 1u;                       // explicit override always compromises one
+        // Explicit count wins outright when set, so a sweep can pin f directly
+        // rather than inherit the floor-division formula above.
+        if (g_maliciousControllerCount > 0u)
+            nMalicious = g_maliciousControllerCount;
         if (nMalicious > nControllers)
             nMalicious = nControllers;
 
@@ -520,10 +545,20 @@ static const double g_attackOnsetTime = 2.0;
 
 // Maximum identity budgets.  The active budget is chosen from
 // sybil_attacker_level by the helpers below.
-static const uint32_t N_SYBIL_SIMULTANEOUS_MAX = 4;
-static const double   SIMULTANEOUS_SLOT_OFFSETS[N_SYBIL_SIMULTANEOUS_MAX] =
+//
+// N_SYBIL_SIMULTANEOUS_MAX is the ID-NAMESPACE STRIDE and deliberately stays 4:
+// it is baked into the advanced-attacker Sybil ID arithmetic in
+// SimultaneousSybilId() below, so changing it would renumber every Type-2
+// identity and break comparison against existing runs.
+//
+// N_SYBIL_SIMULTANEOUS_CEILING is a separate ARRAY-SIZING ceiling, raised to 5
+// so Experiment 1 can pin iota=5.  Slots 0-3 keep their original values, so any
+// configuration with iota <= 4 behaves exactly as it did before.
+static const uint32_t N_SYBIL_SIMULTANEOUS_MAX      = 4;
+static const uint32_t N_SYBIL_SIMULTANEOUS_CEILING = 5;
+static const double   SIMULTANEOUS_SLOT_OFFSETS[N_SYBIL_SIMULTANEOUS_CEILING] =
 {
-    0.002, 0.006, 0.011, 0.017
+    0.002, 0.006, 0.011, 0.017, 0.023
 };
 
 // Type 3 (Insider Direct Non-Simultaneous): the attacker holds ONE fabricated
@@ -565,6 +600,12 @@ OutsiderNeighborBudget()
 inline uint32_t
 SimultaneousSybilBudget()
 {
+    // Experiment 1: an explicit iota overrides the attacker-level budget.
+    // Clamped to the array ceiling so slot indexing can never run off the
+    // SIMULTANEOUS_SLOT_OFFSETS / kBaseOff* / kDrift* tables.
+    if (g_sybilIdentitiesPerAttacker > 0u)
+        return std::min(g_sybilIdentitiesPerAttacker, N_SYBIL_SIMULTANEOUS_CEILING);
+
     static const uint32_t budget[4] = {2u, 3u, 3u, 4u};
     return budget[AttackLevel() - 1u];
 }
@@ -572,6 +613,23 @@ SimultaneousSybilBudget()
 inline uint32_t
 NonSimultaneousSybilBudget()
 {
+    // Experiment 1: same iota override as SimultaneousSybilBudget().  Clamped
+    // to N_SYBIL_NON_SIMULTANEOUS_MAX — the rotation offset templates are
+    // indexed with "% N_SYBIL_NON_SIMULTANEOUS_MAX" so a larger raw budget
+    // would just wrap/reuse offsets rather than overflow, but the clamp keeps
+    // the reported budget consistent with what actually gets a distinct
+    // spawn-offset template.
+    if (g_sybilIdentitiesPerAttacker > 0u)
+    {
+        uint32_t requested = g_sybilIdentitiesPerAttacker;
+        uint32_t clamped   = std::min(requested, N_SYBIL_NON_SIMULTANEOUS_MAX);
+        if (clamped != requested)
+            std::cerr << "[sybil_attacks] INFO: sybilIdentitiesPerAttacker=" << requested
+                      << " clamped to " << clamped << " for v3 (non-simultaneous) — "
+                      << "N_SYBIL_NON_SIMULTANEOUS_MAX ceiling.\n";
+        return clamped;
+    }
+
     static const uint32_t budget[4] = {3u, 4u, 4u, 5u};
     return budget[AttackLevel() - 1u];
 }
@@ -579,6 +637,25 @@ NonSimultaneousSybilBudget()
 inline uint32_t
 RsuSybilBudget()
 {
+    // Experiment 1: iota override, clamped to N_SYBIL_RSU_MAX.  This clamp is
+    // load-bearing, not cosmetic: N_SYBIL_RSU_MAX is also the ID stride between
+    // adjacent malicious RSUs' phantom-vehicle ID blocks
+    // (sybilId = N_Vehicles + 100 + rsuIndex*N_SYBIL_RSU_MAX + k). Letting the
+    // per-RSU phantom count exceed the stride would make RSU i's phantom IDs
+    // collide with RSU (i+1)'s block, corrupting ground-truth labels. Do not
+    // remove this clamp without also widening N_SYBIL_RSU_MAX to match.
+    if (g_sybilIdentitiesPerAttacker > 0u)
+    {
+        uint32_t requested = g_sybilIdentitiesPerAttacker;
+        uint32_t clamped   = std::min(requested, N_SYBIL_RSU_MAX);
+        if (clamped != requested)
+            std::cerr << "[sybil_attacks] INFO: sybilIdentitiesPerAttacker=" << requested
+                      << " clamped to " << clamped << " for v5 (malicious RSU) — "
+                      << "N_SYBIL_RSU_MAX is also the inter-RSU phantom-ID stride, "
+                      << "raising it further would collide adjacent RSUs' IDs.\n";
+        return clamped;
+    }
+
     static const uint32_t budget[4] = {2u, 3u, 4u, 5u};
     return budget[AttackLevel() - 1u];
 }
@@ -586,6 +663,22 @@ RsuSybilBudget()
 inline uint32_t
 SdnSybilBudget()
 {
+    // Experiment 1: iota override, clamped to N_SYBIL_SDN_MAX. Only one
+    // controller injects per run (rsuIndex==0 gate), so there is no
+    // inter-injector stride-collision risk analogous to RsuSybilBudget() —
+    // the clamp here only guards the fixed-size phantom-ID block reserved at
+    // N_Vehicles+150.. so it stays inside its own namespace.
+    if (g_sybilIdentitiesPerAttacker > 0u)
+    {
+        uint32_t requested = g_sybilIdentitiesPerAttacker;
+        uint32_t clamped   = std::min(requested, N_SYBIL_SDN_MAX);
+        if (clamped != requested)
+            std::cerr << "[sybil_attacks] INFO: sybilIdentitiesPerAttacker=" << requested
+                      << " clamped to " << clamped << " for v6 (malicious controller) — "
+                      << "N_SYBIL_SDN_MAX ceiling.\n";
+        return clamped;
+    }
+
     static const uint32_t budget[4] = {1u, 3u, 3u, 4u};
     return budget[AttackLevel() - 1u];
 }
@@ -625,6 +718,20 @@ SimultaneousSlotOffset(uint32_t sybilSlot, uint32_t cycle, uint32_t vehicleIndex
     return base + 0.0015 * static_cast<double>((cycle + vehicleIndex + sybilSlot) % 2u);
 }
 
+// Per-cycle stride for the advanced (level-4) rotating ID namespace.  Returns
+// N_SYBIL_SIMULTANEOUS_MAX=4 for every historical configuration, so existing
+// runs renumber nothing.  It only widens to the ceiling when Experiment 1 pins
+// iota=5, where a stride of 4 would make cycle*4+4 collide with (cycle+1)*4+0 —
+// two identities from different cycles sharing one ID, which would silently
+// corrupt the ground-truth labels rather than fail loudly.
+inline uint32_t
+SimultaneousIdStride()
+{
+    return (SimultaneousSybilBudget() > N_SYBIL_SIMULTANEOUS_MAX)
+               ? N_SYBIL_SIMULTANEOUS_CEILING
+               : N_SYBIL_SIMULTANEOUS_MAX;
+}
+
 inline uint32_t
 SimultaneousSybilId(uint32_t vehicleIndex, uint32_t sybilSlot, uint32_t cycle)
 {
@@ -635,7 +742,7 @@ SimultaneousSybilId(uint32_t vehicleIndex, uint32_t sybilSlot, uint32_t cycle)
     // burst. The same physical transmitter still emits them, but lightweight
     // history-based rules get less repeated evidence for every fake identity.
     return N_Vehicles + 20u + vehicleIndex * 100u +
-           20u + cycle * N_SYBIL_SIMULTANEOUS_MAX + sybilSlot;
+           20u + cycle * SimultaneousIdStride() + sybilSlot;
 }
 
 inline bool
@@ -1111,10 +1218,13 @@ BroadcastSimultaneousSybilBeacon(uint32_t vehicleIndex,
     // mismatch (>25m) and f[7]~1.0 → trivial 100% recall.  New values keep
     // effective mismatch ~6-8m (below the 8.56m always-detect boundary) so
     // f[8] beacon-count accumulation drives the TP→FN transition.
-    static const double kBaseOffX[N_SYBIL_SIMULTANEOUS_MAX] = {  +5.0,  -5.0,  +4.0,  -5.5 };
-    static const double kBaseOffY[N_SYBIL_SIMULTANEOUS_MAX] = {  +3.0,  -3.5,  +3.0,  +4.0 };
-    static const double kDriftX[N_SYBIL_SIMULTANEOUS_MAX]   = {  +0.7,  +0.4,  -0.3,  +0.2 };
-    static const double kDriftY[N_SYBIL_SIMULTANEOUS_MAX]   = {  +0.2,  -0.5,  +0.6,  -0.4 };
+    // Slot 4 exists only for Experiment 1's iota=5 and follows the same
+    // magnitude convention as slots 0-3 (effective mismatch ~6-8 m, below the
+    // 8.56 m always-detect boundary).  Slots 0-3 are unchanged.
+    static const double kBaseOffX[N_SYBIL_SIMULTANEOUS_CEILING] = {  +5.0,  -5.0,  +4.0,  -5.5,  +4.5 };
+    static const double kBaseOffY[N_SYBIL_SIMULTANEOUS_CEILING] = {  +3.0,  -3.5,  +3.0,  +4.0,  -4.5 };
+    static const double kDriftX[N_SYBIL_SIMULTANEOUS_CEILING]   = {  +0.7,  +0.4,  -0.3,  +0.2,  -0.6 };
+    static const double kDriftY[N_SYBIL_SIMULTANEOUS_CEILING]   = {  +0.2,  -0.5,  +0.6,  -0.4,  +0.5 };
     double elapsed = std::max(0.0, Simulator::Now().GetSeconds() - g_attackOnsetTime);
     double offX = kBaseOffX[sybilSlot] * ClaimedOffsetScale() +
                   kDriftX[sybilSlot] * MobilityDriftScale() * elapsed;

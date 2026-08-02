@@ -43,11 +43,23 @@ static const uint32_t MAX_V2RSU_NEIGHBOR_OBSERVATIONS = 4;
 // ML-KEM-1024 (Kyber-1024, FIPS 203): session key encapsulation.
 static const uint32_t MLKEM1024_PUBLIC_KEY_BYTES = 1568;
 static const uint32_t MLKEM1024_CIPHERTEXT_BYTES = 1568;
+// ML-DSA-87 (Dilithium5, FIPS 204): authority + handshake signatures.
+static const uint32_t MLDSA87_PUB_BYTES = 2592;
 // FN-DSA-1024 (Falcon-1024, FIPS 206): per-beacon V2V signatures.
 // Padded variant → constant 1280-byte signature, so the tag stays fixed-size.
 static const uint32_t FNDSA1024_PUB_BYTES = 1793;
 static const uint32_t FNDSA1024_SEC_BYTES = 2305;
 static const uint32_t FNDSA1024_SIG_BYTES = 1280;
+
+// Classical (NIST P-256) counterparts, used by the classical arm of the
+// three-arm security comparison.  Raw x||y encoding, no DER wrapper — this is
+// what CryptoEcdsaSign/CryptoEcdhKeygen actually produce.
+static const uint32_t P256_PUB_BYTES = 64;
+static const uint32_t P256_SIG_BYTES = 64;
+
+// Nonce / certificate sizes shared by both signed arms.
+static const uint32_t HANDSHAKE_NONCE_BYTES = 32;
+static const uint32_t CERT_SIG_BYTES        = 64;   // CA ECDSA sig, both arms
 
 // Window-aligned batch verification (methodology Eq. batch_verify).
 // W is the detection sliding-window length in beacons; the batch flush fires
@@ -399,17 +411,27 @@ SerializeBsmForSigning(const BsmCoreData& bsm)
 // ---------------------------------------------------------------------------
 // V2VSignatureTag — attached to every V2V beacon.
 //
-// Carries the sender's FN-DSA-1024 (Falcon-1024, FIPS 206) public key
-// (1793 bytes) and the signature (1280 bytes, padded variant → constant size)
-// over SHA3-256(serialized BSM fields), per methodology Eq. beacon_sign.
-// Receivers use the embedded public key to verify without prior key lookup.
+// Carries the sender's beacon verification key and the signature over
+// SHA3-256(serialized BSM fields), per methodology Eq. beacon_sign.  Receivers
+// use the embedded public key to verify without a prior key lookup.
+//
+// SUITE-DEPENDENT.  `scheme` says which algorithm produced the pair, so the
+// batch verifier can dispatch correctly:
+//   SUITE_CLASSICAL → ECDSA P-256      (  64 B key,   64 B sig)
+//   SUITE_PQC       → FN-DSA-1024      (1793 B key, 1280 B sig)
+// The buffers stay at the FN-DSA maximum so the class is fixed-size; keyLen and
+// sigLen give the bytes actually in use, and only those are serialised.
+//
+// This tag is simulator-side metadata and costs no airtime by itself — the real
+// wire cost is charged by SecurityWireOverheadBytes(V2V_BEACON) at packet
+// creation time.  Keep the two in step when editing either.
 // ---------------------------------------------------------------------------
 
 class V2VSignatureTag : public Tag
 {
   public:
-    static constexpr uint32_t KEY_BYTES = FNDSA1024_PUB_BYTES;  // FN-DSA-1024 public key
-    static constexpr uint32_t SIG_BYTES = FNDSA1024_SIG_BYTES;  // FN-DSA-1024 signature
+    static constexpr uint32_t KEY_BYTES = FNDSA1024_PUB_BYTES;  // buffer capacity
+    static constexpr uint32_t SIG_BYTES = FNDSA1024_SIG_BYTES;  // buffer capacity
 
     V2VSignatureTag()
     {
@@ -426,24 +448,38 @@ class V2VSignatureTag : public Tag
     }
     TypeId GetInstanceTypeId() const override { return V2VSignatureTag::GetTypeId(); }
 
-    uint32_t GetSerializedSize() const override { return KEY_BYTES + SIG_BYTES; }
+    uint32_t GetSerializedSize() const override { return 1 + 2 + 2 + keyLen + sigLen; }
 
     void Serialize(TagBuffer i) const override
     {
-        i.Write(pub_key, KEY_BYTES);
-        i.Write(sig,     SIG_BYTES);
+        i.WriteU8 (scheme);
+        i.WriteU16(keyLen);
+        i.WriteU16(sigLen);
+        i.Write(pub_key, keyLen);
+        i.Write(sig,     sigLen);
     }
 
     void Deserialize(TagBuffer i) override
     {
-        i.Read(pub_key, KEY_BYTES);
-        i.Read(sig,     SIG_BYTES);
+        scheme = i.ReadU8();
+        keyLen = i.ReadU16();
+        sigLen = i.ReadU16();
+        if (keyLen > KEY_BYTES) keyLen = KEY_BYTES;
+        if (sigLen > SIG_BYTES) sigLen = SIG_BYTES;
+        i.Read(pub_key, keyLen);
+        i.Read(sig,     sigLen);
     }
 
-    void Print(std::ostream& os) const override { os << "V2VSignatureTag"; }
+    void Print(std::ostream& os) const override
+    {
+        os << "V2VSignatureTag scheme=" << static_cast<uint32_t>(scheme);
+    }
 
-    uint8_t pub_key[KEY_BYTES];
-    uint8_t sig    [SIG_BYTES];
+    uint8_t  scheme = 0;                 ///< SecuritySuite value that signed this beacon
+    uint16_t keyLen = 0;
+    uint16_t sigLen = 0;
+    uint8_t  pub_key[KEY_BYTES];
+    uint8_t  sig    [SIG_BYTES];
 };
 
 // ---------------------------------------------------------------------------
@@ -549,17 +585,36 @@ class ChanHelloTag : public Tag
 };
 
 // ---------------------------------------------------------------------------
-// ChanAckTag — RSU → Vehicle (292 bytes)
+// ChanAckTag — RSU → Vehicle
 //
 // Carries:
-//   ecdhPub      — RSU's ephemeral ECDH public key (64 B)
+//   ecdhPub      — RSU's ephemeral ECDH public key (64 B, classical arm)
+//   kyberCiphertext — ML-KEM-1024 encapsulation (1568 B, PQC arm)
 //   nonceR       — RSU's random nonce (32 B)
-//   rsuLtPub     — RSU's long-term public key extracted from its certificate (64 B)
+//   rsuLtPub     — RSU's long-term ECDSA public key from its certificate (64 B)
 //   certSig      — CA signature over SHA256(rsu_id(4B)||rsu_lt_pub(64B)) (64 B)
-//   handshakeSig — RSU signature over SHA256(ecdh_V||ecdh_R||nonce_V||nonce_R) (64 B)
+//   handshakeSig — RSU signature over SHA256(kex_V||kex_R||nonce_V||nonce_R)
 //
-// Vehicle verifies certSig using g_caPubKey, then verifies handshakeSig using
-// rsuLtPub.  After both checks pass it runs ECDH and derives the session key.
+// SUITE-DEPENDENT handshake signature.  This used to be ECDSA P-256 in BOTH
+// arms — only the key-agreement half switched to ML-KEM — so the PQC arm was a
+// hybrid whose authentication was still classically breakable and whose
+// signature cost never appeared in any measurement.
+//
+//   SUITE_CLASSICAL  handshakeSig = ECDSA P-256   (64 B), verified with rsuLtPub
+//   SUITE_PQC        handshakeSig = ML-DSA-87   (4627 B), verified with authPub
+//
+// Under PQC the RSU's ML-DSA-87 verification key (authPub, 2592 B) travels in
+// the ACK and is bound to the already-CA-certified ECDSA identity by
+// authPubBindSig = ECDSA_{sk_rsu}( SHA256(rsu_id || authPub) ).  That is a
+// cross-certification / key-transition construction: the classical CA root
+// stays authoritative for identity while the handshake authentication itself is
+// quantum-safe.  Issuing PQC certificates from a PQC root CA is out of scope —
+// the CA private key is not available inside the simulator (only g_caPubKey is
+// loaded), and a PQC PKI is a separate question from PQC transport cost.
+//
+// Buffers are fixed at the PQC maximum; the *Len fields give the bytes in use
+// and only those are serialised.  Airtime is charged separately by
+// SecurityWireOverheadBytes(CHAN_ACK).
 // ---------------------------------------------------------------------------
 
 class ChanAckTag : public Tag
@@ -567,15 +622,23 @@ class ChanAckTag : public Tag
   public:
     static constexpr uint32_t ECDH_BYTES  = 64;
     static constexpr uint32_t NONCE_BYTES = 32;
-    static constexpr uint32_t SIG_BYTES   = 64;
+    static constexpr uint32_t SIG_BYTES   = 64;    // classical / cert signatures
+    static constexpr uint32_t AUTH_SIG_CAP = MLDSA87_SIG_BYTES;  // 4627
+    static constexpr uint32_t AUTH_PUB_CAP = MLDSA87_PUB_BYTES;  // 2592
 
     uint32_t rsuId = 0;
     uint8_t  ecdhPub      [ECDH_BYTES]  = {};  // RSU ephemeral pub
     uint8_t  kyberCiphertext[MLKEM1024_CIPHERTEXT_BYTES] = {};
     uint8_t  nonceR       [NONCE_BYTES] = {};  // RSU nonce
-    uint8_t  rsuLtPub     [ECDH_BYTES]  = {};  // RSU long-term pub (from cert)
+    uint8_t  rsuLtPub     [ECDH_BYTES]  = {};  // RSU long-term ECDSA pub (from cert)
     uint8_t  certSig      [SIG_BYTES]   = {};  // CA sig over (rsu_id||rsuLtPub)
-    uint8_t  handshakeSig [SIG_BYTES]   = {};  // RSU sig over (ecdh_V||ecdh_R||nV||nR)
+
+    uint8_t  sigScheme = 0;                    ///< SecuritySuite that signed the handshake
+    uint16_t handshakeSigLen = 0;
+    uint16_t authPubLen      = 0;
+    uint8_t  handshakeSig  [AUTH_SIG_CAP] = {};  // ECDSA (64) or ML-DSA-87 (4627)
+    uint8_t  authPub       [AUTH_PUB_CAP] = {};  // ML-DSA-87 verification key, PQC only
+    uint8_t  authPubBindSig[SIG_BYTES]    = {};  // ECDSA_sk_rsu(SHA256(rsuId||authPub))
 
     static TypeId GetTypeId()
     {
@@ -587,7 +650,9 @@ class ChanAckTag : public Tag
     TypeId   GetInstanceTypeId() const override { return ChanAckTag::GetTypeId(); }
     uint32_t GetSerializedSize()  const override
     {
-        return 4 + ECDH_BYTES + MLKEM1024_CIPHERTEXT_BYTES + NONCE_BYTES + ECDH_BYTES + SIG_BYTES + SIG_BYTES;
+        return 4 + ECDH_BYTES + MLKEM1024_CIPHERTEXT_BYTES + NONCE_BYTES
+               + ECDH_BYTES + SIG_BYTES
+               + 1 + 2 + 2 + handshakeSigLen + authPubLen + SIG_BYTES;
     }
 
     void Serialize(TagBuffer i) const override
@@ -598,7 +663,12 @@ class ChanAckTag : public Tag
         i.Write(nonceR,       NONCE_BYTES);
         i.Write(rsuLtPub,     ECDH_BYTES);
         i.Write(certSig,      SIG_BYTES);
-        i.Write(handshakeSig, SIG_BYTES);
+        i.WriteU8 (sigScheme);
+        i.WriteU16(handshakeSigLen);
+        i.WriteU16(authPubLen);
+        i.Write(handshakeSig,   handshakeSigLen);
+        i.Write(authPub,        authPubLen);
+        i.Write(authPubBindSig, SIG_BYTES);
     }
     void Deserialize(TagBuffer i) override
     {
@@ -608,11 +678,19 @@ class ChanAckTag : public Tag
         i.Read(nonceR,       NONCE_BYTES);
         i.Read(rsuLtPub,     ECDH_BYTES);
         i.Read(certSig,      SIG_BYTES);
-        i.Read(handshakeSig, SIG_BYTES);
+        sigScheme       = i.ReadU8();
+        handshakeSigLen = i.ReadU16();
+        authPubLen      = i.ReadU16();
+        if (handshakeSigLen > AUTH_SIG_CAP) handshakeSigLen = AUTH_SIG_CAP;
+        if (authPubLen      > AUTH_PUB_CAP) authPubLen      = AUTH_PUB_CAP;
+        i.Read(handshakeSig,   handshakeSigLen);
+        i.Read(authPub,        authPubLen);
+        i.Read(authPubBindSig, SIG_BYTES);
     }
     void Print(std::ostream& os) const override
     {
-        os << "ChanAckTag rsuId=" << rsuId;
+        os << "ChanAckTag rsuId=" << rsuId
+           << " sigScheme=" << static_cast<uint32_t>(sigScheme);
     }
 };
 
@@ -1601,6 +1679,176 @@ FullCryptoMechanismActive()
     return GetCryptoMechanismMode() == CRYPTO_MECHANISM_FULL;
 }
 
+// ===========================================================================
+// Security suite — the single source of truth for the three-arm comparison
+// (no security / classical / post-quantum).
+//
+// Before this existed, `--full_crypto_profile` only switched the KEM and the
+// authority signature.  Beacons signed with FN-DSA-1024 in BOTH profiles, the
+// handshake signature was ECDSA in BOTH profiles, and none of the key material
+// was ever charged as airtime, so a profile-1-vs-2 run measured almost nothing.
+// Everything that differs between arms now routes through the accessors below.
+//
+//   SUITE_NONE       --SecEnabled=false            (plain network, no crypto)
+//   SUITE_CLASSICAL  --full_crypto_profile=1       ECDH/ECDSA P-256
+//   SUITE_PQC        --full_crypto_profile=2       ML-KEM-1024 / ML-DSA-87 / FN-DSA-1024
+//
+// See docs/PQC_vs_Classical_Comparison_README.md.
+// ===========================================================================
+
+enum SecuritySuite
+{
+    SUITE_NONE      = 0,
+    SUITE_CLASSICAL = 1,
+    SUITE_PQC       = 2
+};
+
+// DEFINED in Sybil-Developing-Improved.cc.  True only when profile 2 is
+// requested AND liboqs is actually linked, so a build without liboqs degrades
+// to the classical suite instead of silently claiming PQC.
+bool FullPqcProfileActive();
+
+inline SecuritySuite
+GetSecuritySuite()
+{
+    if (!CryptoMechanismActive())
+        return SUITE_NONE;
+    return FullPqcProfileActive() ? SUITE_PQC : SUITE_CLASSICAL;
+}
+
+inline const char*
+SecuritySuiteName()
+{
+    switch (GetSecuritySuite())
+    {
+    case SUITE_PQC:       return "pqc";
+    case SUITE_CLASSICAL: return "classical";
+    default:              return "none";
+    }
+}
+
+// ── Per-suite primitive sizes, in RAW bytes as they go on the wire ─────────
+// These drive both the packet sizing (SecurityWireOverheadBytes) and the M8
+// analytic accounting, so the two can never disagree.
+
+inline uint32_t SuiteBeaconSigBytes()
+{
+    switch (GetSecuritySuite())
+    {
+    case SUITE_PQC:       return FNDSA1024_SIG_BYTES;   // 1280
+    case SUITE_CLASSICAL: return P256_SIG_BYTES;        //   64
+    default:              return 0;
+    }
+}
+
+inline uint32_t SuiteBeaconPubBytes()
+{
+    switch (GetSecuritySuite())
+    {
+    case SUITE_PQC:       return FNDSA1024_PUB_BYTES;   // 1793
+    case SUITE_CLASSICAL: return P256_PUB_BYTES;        //   64
+    default:              return 0;
+    }
+}
+
+/// Authority / handshake signature: ML-DSA-87 vs ECDSA P-256.
+inline uint32_t SuiteAuthSigBytes()
+{
+    switch (GetSecuritySuite())
+    {
+    case SUITE_PQC:       return MLDSA87_SIG_BYTES;     // 4627
+    case SUITE_CLASSICAL: return P256_SIG_BYTES;        //   64
+    default:              return 0;
+    }
+}
+
+inline uint32_t SuiteAuthPubBytes()
+{
+    switch (GetSecuritySuite())
+    {
+    case SUITE_PQC:       return MLDSA87_PUB_BYTES;     // 2592
+    case SUITE_CLASSICAL: return P256_PUB_BYTES;        //   64
+    default:              return 0;
+    }
+}
+
+/// Key-establishment public key: ML-KEM-1024 encapsulation key vs ECDH pub.
+inline uint32_t SuiteKemPubBytes()
+{
+    switch (GetSecuritySuite())
+    {
+    case SUITE_PQC:       return MLKEM1024_PUBLIC_KEY_BYTES;  // 1568
+    case SUITE_CLASSICAL: return P256_PUB_BYTES;              //   64
+    default:              return 0;
+    }
+}
+
+/// Key-establishment ciphertext: ML-KEM-1024 ct vs the ECDH ephemeral pub.
+inline uint32_t SuiteKemCtBytes()
+{
+    switch (GetSecuritySuite())
+    {
+    case SUITE_PQC:       return MLKEM1024_CIPHERTEXT_BYTES;  // 1568
+    case SUITE_CLASSICAL: return P256_PUB_BYTES;              //   64
+    default:              return 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecurityWireOverheadBytes — cryptographic bytes a message class must be
+// charged for, ON TOP of its application payload.
+//
+// WHY THIS EXISTS.  Key material and signatures travel in ns-3 PacketTags,
+// and PacketTags are simulator-side metadata: they are never serialised onto
+// the wire and are excluded from Packet::GetSize().  So ML-KEM-1024's 1568-byte
+// ciphertext and FN-DSA's 1280-byte signature used to cost exactly zero
+// airtime, and PDR / latency / channel contention could not see the difference
+// between the arms.  Callers add this to the packet size at Create<Packet>()
+// time so ns-3 models the real transmission.
+//
+// Under SUITE_NONE every branch returns 0 and packet sizes collapse to the
+// plain-network baseline, which is exactly what the third arm should measure.
+// ---------------------------------------------------------------------------
+inline uint32_t
+SecurityWireOverheadBytes(uint32_t messageType)
+{
+    if (GetSecuritySuite() == SUITE_NONE)
+        return 0;
+
+    const uint32_t pqcKeyTransport =
+        (GetSecuritySuite() == SUITE_PQC)
+            ? (SuiteAuthPubBytes() + CERT_SIG_BYTES)   // ML-DSA pub + its ECDSA cross-cert
+            : 0u;
+
+    switch (messageType)
+    {
+    case V2V_BEACON:   // signature + embedded verification key
+        return SuiteBeaconSigBytes() + SuiteBeaconPubBytes();
+
+    case CHAN_HELLO:   // vehicle KEM public key + nonce
+        return SuiteKemPubBytes() + HANDSHAKE_NONCE_BYTES;
+
+    case CHAN_ACK:     // KEM ciphertext + nonce + RSU cert + handshake sig.
+                       // The PQC arm also ships the ML-DSA verification key and
+                       // the ECDSA cross-certificate binding it (see SendChanAck).
+        return SuiteKemCtBytes() + HANDSHAKE_NONCE_BYTES
+               + P256_PUB_BYTES + CERT_SIG_BYTES        // classical identity cert
+               + SuiteAuthSigBytes()
+               + pqcKeyTransport;
+
+    default:
+        // Everything else is already honest and must NOT be charged again here.
+        //
+        // V2CTRL_HELLO / CTRL2V_ACK serialise their whole tag (KEM key material
+        // included) and encrypt it, then build the packet from the resulting
+        // ciphertext — Create<Packet>(cipher.data(), cipher.size()).  Registration
+        // and V2I-AUTH do the same, and their payloads carry hex-encoded
+        // signatures, so the PQC expansion is already on the wire.  Adding an
+        // overhead term for those message types would double-count it.
+        return 0;
+    }
+}
+
 // Vehicle ECDSA key material — DEFINED in Sybil-Developing-Improved.cc,
 // populated by LoadVehicleKeys() before Simulator::Run().
 extern std::vector<std::vector<uint8_t>> g_vehiclePrivKeys;  // 32 bytes each
@@ -1738,7 +1986,13 @@ inline void
 SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
                  uint16_t destinationPort, Ptr<TxInfo> tx)
 {
-    Ptr<Packet> packet = Create<Packet>(tx->packetSize);
+    // Charge the security bytes as real airtime.  Under SUITE_NONE this adds 0
+    // and the packet is exactly the plain-network baseline size; the classical
+    // arm adds 128 B to a beacon and the PQC arm 3073 B.  Without this the key
+    // material rides in PacketTags, which ns-3 never puts on the wire, and no
+    // congestion/PDR difference between the three arms can exist.
+    Ptr<Packet> packet =
+        Create<Packet>(tx->packetSize + SecurityWireOverheadBytes(tx->messageType));
     SybilPacketTag tag(tx->realNodeId, tx->claimedNodeId,
                        tx->destinationId, tx->messageType, tx->sequenceNumber,
                        tx->claimedX, tx->claimedY, tx->claimedZ,
@@ -1759,41 +2013,73 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
         }
         packet->AddPacketTag(BsmCoreDataTag(bsm));
 
-        // --- V2V Signature — FN-DSA-1024, methodology Eq. beacon_sign ---
-        //   sigma_b(v_i, t_j) = FN-DSA-1024.Sign( sk_{v_i}, H(m_b(v_i, t_j)) )
+        // --- V2V Signature — methodology Eq. beacon_sign ---
+        //   sigma_b(v_i, t_j) = Sign( sk_{v_i}, H(m_b(v_i, t_j)) )
         // where H is SHA3-256 over the serialized BSM core fields.
+        //
+        // SUITE-DEPENDENT signer.  This used to call FN-DSA-1024 unconditionally,
+        // so the "classical" arm was already paying post-quantum cost on the
+        // highest-volume message class and the comparison understated the real
+        // PQC delta.  Both key sets are loaded per vehicle by LoadVehicleKeys():
+        // ECDSA P-256 from CSV fields 1-2, FN-DSA-1024 from fields 4-5.
         uint32_t senderIdx = tx->realNodeId;
-        if (CryptoMechanismActive() &&
+        const SecuritySuite suite = GetSecuritySuite();
+
+        const bool pqcKeysReady =
             senderIdx < g_vehicleBeaconPrivKeys.size() &&
-            !g_vehicleBeaconPrivKeys[senderIdx].empty())
+            !g_vehicleBeaconPrivKeys[senderIdx].empty();
+        const bool classicalKeysReady =
+            senderIdx < g_vehiclePrivKeys.size() &&
+            !g_vehiclePrivKeys[senderIdx].empty();
+
+        if (suite != SUITE_NONE &&
+            ((suite == SUITE_PQC && pqcKeysReady) ||
+             (suite == SUITE_CLASSICAL && classicalKeysReady)))
         {
             std::vector<uint8_t> payload  = SerializeBsmForSigning(bsm);
-            std::vector<uint8_t> hash     = CryptoSha3_256(payload);
+            std::vector<uint8_t> hash     = CryptoSha3_256(payload);   // 32 B, both arms
+
+            const std::vector<uint8_t>& signKey =
+                (suite == SUITE_PQC) ? g_vehicleBeaconPrivKeys[senderIdx]
+                                     : g_vehiclePrivKeys[senderIdx];
+            const std::vector<uint8_t>& verifyKey =
+                (suite == SUITE_PQC) ? g_vehicleBeaconPubKeys[senderIdx]
+                                     : g_vehiclePubKeys[senderIdx];
+
             auto __t0 = std::chrono::high_resolution_clock::now();
             std::vector<uint8_t> sigBytes =
-                CryptoFnDsa1024Sign(g_vehicleBeaconPrivKeys[senderIdx], hash);
+                (suite == SUITE_PQC) ? CryptoFnDsa1024Sign(signKey, hash)
+                                     : CryptoEcdsaSign(signKey, hash);
             auto __t1 = std::chrono::high_resolution_clock::now();
             double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
             std::cout << "[Latency] V2V_BEACON  vehicle/" << senderIdx
                       << "  sign  " << __ms << "\n";
-            if (sigBytes.size() == V2VSignatureTag::SIG_BYTES &&
-                g_vehicleBeaconPubKeys[senderIdx].size() == V2VSignatureTag::KEY_BYTES)
+
+            if (sigBytes.size() == SuiteBeaconSigBytes() &&
+                verifyKey.size() == SuiteBeaconPubBytes())
             {
                 V2VSignatureTag sigTag;
-                std::memcpy(sigTag.pub_key, g_vehicleBeaconPubKeys[senderIdx].data(),
-                            V2VSignatureTag::KEY_BYTES);
-                std::memcpy(sigTag.sig,     sigBytes.data(),
-                            V2VSignatureTag::SIG_BYTES);
+                sigTag.scheme = static_cast<uint8_t>(suite);
+                sigTag.keyLen = static_cast<uint16_t>(verifyKey.size());
+                sigTag.sigLen = static_cast<uint16_t>(sigBytes.size());
+                std::memcpy(sigTag.pub_key, verifyKey.data(), sigTag.keyLen);
+                std::memcpy(sigTag.sig,     sigBytes.data(),  sigTag.sigLen);
                 packet->AddPacketTag(sigTag);
             }
         }
-        else if (!CryptoMechanismActive())
+        else if (suite == SUITE_NONE)
         {
             std::cout << "[Latency] V2V_BEACON  vehicle/" << senderIdx
                       << "  sign  0.000\n";
         }
     }
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
+
+    // M11 chi_sybil: offered channel load. A frame whose claimed identity is not
+    // the real transmitter is a fake-identity announcement. Counted once per
+    // SendTo, so the ratio measures airtime the attacker consumes regardless of
+    // how many receivers the frame reaches.
+    MetricsOnChannelLoad(tx->claimedNodeId != tx->realNodeId, tx->packetSize);
 
     // V2V broadcast in VANETs is a local-neighbour service, not a network-wide
     // broadcast to every vehicle in the simulation.  For PDR, count only nearby
@@ -1832,4 +2118,7 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
         }
     }
     MetricsOnTransmitForMessage(tx->messageType, expectedDeliveries);
+    // Eq 3.67 PAR / Eq 3.68 chi_sybil are transmit-side by definition (their
+    // denominators are N_tx and N_beacon); see sybil_metrics.h.
+    MetricsOnTransmitIdentity(tx->messageType, tx->realNodeId, tx->claimedNodeId);
 }
