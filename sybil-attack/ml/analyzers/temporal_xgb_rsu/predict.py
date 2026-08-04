@@ -110,13 +110,20 @@ def build_global_context(b_sorted, window_size, window_step, first_seen_override
 
 
 def build_feature_table(beacons_df, window_size=WINDOW_SIZE_S, window_step=WINDOW_STEP_S,
-                        min_beacons=MIN_BEACONS_WINDOW,
+                        min_beacons=None,
                         first_seen_override=None, cum_before=None, grid_anchor=None):
     """`first_seen_override` (cid -> global earliest receive_time) and `cum_before`
     (cid -> deduped-beacon count with receive_time < the slice start) let the daemon feed
     a BOUNDED recent slice yet keep the two cumulative features — claimed_id_age_s and
     claimed_id_beacons_seen_so_far — globally exact. Both None => verbatim offline path
-    (the slice is the full history, so the slice's own first-seen/count are global)."""
+    (the slice is the full history, so the slice's own first-seen/count are global).
+
+    `min_beacons` defaults to the MODULE GLOBAL (not a def-time bound constant) so a
+    caller can rebind MIN_BEACONS_WINDOW and have it take effect — the D-stack ladder
+    lowers it to 1 to test whether the two-beacon floor is what starves p̄_temp of the
+    short-lived v3 rotation identities."""
+    if min_beacons is None:
+        min_beacons = MIN_BEACONS_WINDOW
     b = beacons_df.sort_values("receive_time").reset_index(drop=True)
     context, starts = build_global_context(b, window_size, window_step,
                                            first_seen_override=first_seen_override,

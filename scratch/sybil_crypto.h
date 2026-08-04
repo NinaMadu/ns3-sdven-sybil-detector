@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <iostream>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -159,17 +160,40 @@ CryptoEcdsaSign(const std::vector<uint8_t> &priv_bytes,
 //              false → invalid or error
 // ---------------------------------------------------------------------------
 
+// Diagnostics for the classical-verify false-positive investigation: OpenSSL
+// distinguishes "signature checked out false" (0) from "an internal error
+// occurred, verification could not be completed" (-1 / null returns). The
+// original implementation collapsed both into a single `false`, so a
+// transient OpenSSL-level fault (bad point encoding, allocation failure under
+// load) was indistinguishable from -- and silently counted as evidence of --
+// a genuine spoofed/corrupted beacon. These counters make that distinction
+// visible; g_ecdsaVerifyErrors rising alongside SUSPICION_INVALID_V2V_SIGNATURE
+// flags on legitimate vehicles points at the environment, not the crypto.
+static uint64_t g_ecdsaVerifyCalls  = 0;
+static uint64_t g_ecdsaVerifyErrors = 0;
+
 inline bool
 CryptoEcdsaVerify(const std::vector<uint8_t> &pub_bytes,
                   const std::vector<uint8_t> &hash,
                   const std::vector<uint8_t> &sig)
 {
+    ++g_ecdsaVerifyCalls;
     if (pub_bytes.size() != 64 || hash.size() != 32 || sig.size() != 64)
+    {
+        ++g_ecdsaVerifyErrors;
+        std::cerr << "[CryptoError] ECDSA verify: bad input length (pub="
+                  << pub_bytes.size() << " hash=" << hash.size()
+                  << " sig=" << sig.size() << ")\n";
         return false;
+    }
 
     EC_KEY *key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
     if (!key)
+    {
+        ++g_ecdsaVerifyErrors;
+        std::cerr << "[CryptoError] ECDSA verify: EC_KEY_new_by_curve_name failed\n";
         return false;
+    }
 
     // Rebuild uncompressed point: 0x04 || x(32) || y(32)
     std::vector<uint8_t> uncompressed(65);
@@ -178,25 +202,72 @@ CryptoEcdsaVerify(const std::vector<uint8_t> &pub_bytes,
 
     const EC_GROUP *group = EC_KEY_get0_group(key);
     EC_POINT *pub_point = EC_POINT_new(group);
+    if (!pub_point)
+    {
+        ++g_ecdsaVerifyErrors;
+        std::cerr << "[CryptoError] ECDSA verify: EC_POINT_new failed\n";
+        EC_KEY_free(key);
+        return false;
+    }
     if (EC_POINT_oct2point(group, pub_point, uncompressed.data(), 65, nullptr) != 1)
     {
+        // A genuinely off-curve/malformed public key IS meaningful evidence
+        // (this is what a corrupted or hostile key would look like), so this
+        // one case is deliberately NOT counted as an environment error.
         EC_POINT_free(pub_point);
         EC_KEY_free(key);
         return false;
     }
-    EC_KEY_set_public_key(key, pub_point);
+    if (EC_KEY_set_public_key(key, pub_point) != 1)
+    {
+        ++g_ecdsaVerifyErrors;
+        std::cerr << "[CryptoError] ECDSA verify: EC_KEY_set_public_key failed\n";
+        EC_POINT_free(pub_point);
+        EC_KEY_free(key);
+        return false;
+    }
     EC_POINT_free(pub_point);
 
     // Reconstruct ECDSA_SIG from raw r||s
     ECDSA_SIG *ecdsa_sig = ECDSA_SIG_new();
+    if (!ecdsa_sig)
+    {
+        ++g_ecdsaVerifyErrors;
+        std::cerr << "[CryptoError] ECDSA verify: ECDSA_SIG_new failed\n";
+        EC_KEY_free(key);
+        return false;
+    }
     BIGNUM *r = BN_bin2bn(sig.data(), 32, nullptr);
     BIGNUM *s = BN_bin2bn(sig.data() + 32, 32, nullptr);
+    if (!r || !s)
+    {
+        ++g_ecdsaVerifyErrors;
+        std::cerr << "[CryptoError] ECDSA verify: BN_bin2bn failed for r/s\n";
+        if (r) BN_free(r);
+        if (s) BN_free(s);
+        ECDSA_SIG_free(ecdsa_sig);
+        EC_KEY_free(key);
+        return false;
+    }
     ECDSA_SIG_set0(ecdsa_sig, r, s); // takes ownership of r and s
 
     int ok = ECDSA_do_verify(hash.data(), 32, ecdsa_sig, key);
 
     ECDSA_SIG_free(ecdsa_sig); // frees r and s
     EC_KEY_free(key);
+
+    if (ok < 0)
+    {
+        // A genuine OpenSSL-level fault during verification itself (distinct
+        // from ok==0, a clean "signature does not match"). Previously this
+        // silently became `false` -> SUSPICION_INVALID_V2V_SIGNATURE, exactly
+        // like a real forged/corrupted beacon.
+        ++g_ecdsaVerifyErrors;
+        std::cerr << "[CryptoError] ECDSA verify: ECDSA_do_verify returned "
+                  << ok << " (OpenSSL-internal error, not a genuine signature "
+                     "mismatch)\n";
+        return false;
+    }
 
     return (ok == 1);
 }

@@ -35,6 +35,26 @@ STREAM_LAMBDAS = {"fl_only":   [1.0, 0.0, 0.0],   # ŷ_i only
                   "rssi_only": [0.0, 0.0, 1.0]}   # p̄_rssi only
 
 
+def parse_blocks(block):
+    """Normalise an --ablate-analyzer value to a sorted list of φ-block names.
+
+    Accepts None / '' / 'none' (-> []), a single name, a comma-separated string
+    ('rssi,trust'), or any iterable of names. Raises ValueError on an unknown name so a
+    typo can never silently degrade to 'full head'."""
+    if block is None:
+        return []
+    if isinstance(block, str):
+        parts = [p.strip() for p in block.split(",")]
+    else:
+        parts = [str(p).strip() for p in block]
+    parts = [p for p in parts if p and p != "none"]
+    bad = sorted(set(parts) - set(_ABLATE_BLOCK_PREFIX))
+    if bad:
+        raise ValueError(f"unknown vehicle-tier φ-block(s) {bad} "
+                         f"(expected a subset of {sorted(_ABLATE_BLOCK_PREFIX)})")
+    return sorted(set(parts))
+
+
 class FusionHeadLive:
     """Eq 3.18 linear head applied to live φ (weights loaded, never refit)."""
 
@@ -50,23 +70,30 @@ class FusionHeadLive:
         return cls(d["phi_cols"], d["weight"], d["bias"], d["impute_fill"])
 
     def ablate_block(self, block):
-        """B1 leave-one-out: zero the named φ-block's weights, then renormalize the
-        surviving weights so ‖w‖ is preserved (identical to the offline
-        ablation/ml_layer/b1_vehicle_tier_contrib.ablate_weights). block ∈
-        {rssi,temp,trust}; None/'none'/'' is a no-op. Returns self for chaining."""
-        if not block or block == "none":
+        """Zero the named φ-block(s)' weights, then renormalize the survivors so ‖w‖ is
+        preserved (identical to the offline
+        ablation/ml_layer/b1_vehicle_tier_contrib.ablate_weights).
+
+        `block` is one of {rssi,temp,trust}, OR a comma-separated subset / iterable of
+        them. B1 (leave-one-out) passes a single name; the D-stack ladder passes two
+        ("rssi,trust" = the temporal-GRU-only condition D2). None/'none'/'' is a no-op.
+        Dropping ALL three is refused — there would be no head left to renormalize.
+        Returns self for chaining."""
+        blocks = parse_blocks(block)
+        if not blocks:
             return self
-        if block not in _ABLATE_BLOCK_PREFIX:
-            raise ValueError(f"ablate_block: unknown block {block!r} "
-                             f"(expected {list(_ABLATE_BLOCK_PREFIX)})")
-        prefix = _ABLATE_BLOCK_PREFIX[block]
-        mask = np.array([c.startswith(prefix) for c in self.phi_cols])
+        mask = np.zeros(len(self.phi_cols), dtype=bool)
+        for b in blocks:
+            prefix = _ABLATE_BLOCK_PREFIX[b]
+            mask |= np.array([c.startswith(prefix) for c in self.phi_cols])
         full_norm = np.linalg.norm(self.w)
         self.w = self.w.copy()
         self.w[mask] = 0.0
         surv_norm = np.linalg.norm(self.w)
-        if surv_norm > 0:                       # renormalize survivors to full magnitude
-            self.w *= full_norm / surv_norm
+        if surv_norm <= 0:
+            raise ValueError(f"ablate_block({block!r}) zeroed every weight — no φ-block "
+                             f"survives, so the Eq 3.18 head cannot be renormalized")
+        self.w *= full_norm / surv_norm         # renormalize survivors to full magnitude
         return self
 
     def apply(self, df):

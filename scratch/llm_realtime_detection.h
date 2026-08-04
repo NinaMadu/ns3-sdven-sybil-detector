@@ -28,6 +28,7 @@
 // =============================================================================
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -70,7 +71,18 @@ static int         g_maxLlmCandidates = 2000;// top-K by ŷ_ens adjudicated by t
 static int         g_maxIdentities = 0;    // hard ceiling on rows/window (0 = none)
 // ── B1/B2/C1 ablation knobs (empty = proposed/full pipeline; forwarded to the daemon) ──
 static std::string g_ablateAnalyzer = "";  // B1: "trust"|"rssi"|"temp" — zero that vehicle-tier
-                                           //     phi-block in the Eq 3.18 head (renormalised)
+                                           //     phi-block in the Eq 3.18 head (renormalised).
+                                           //     D-stack: a comma-separated subset ("rssi,trust"
+                                           //     = the temporal-GRU-only condition D2)
+static std::string g_mlflTau        = "";  // D-stack: per-condition ŷ_ens decision threshold for
+                                           //     the mlfl_only conditions (D2/D3/D4). Empty = the
+                                           //     daemon's own val-calibrated tau (C1's)
+static std::string g_llmConsensusConfig = ""; // D5/D6: consensus config JSON selecting the LoRA
+                                           //     adapter set. Empty = the frozen Stage-2 CENTRALLY
+                                           //     trained adapters (D5); a path swaps in the
+                                           //     Stage-3 LLM-FL federated adapters (D6)
+static int         g_txgbMinBeacons  = 0;  // D-stack: override the RSU temporal-XGB per-window
+                                           //     minimum beacon count (0 = leave the default 2)
 static std::string g_ablateStream   = "";  // B2: "fl_only"|"temp_only"|"rssi_only" — pin the
                                            //     Eq 3.20 lambda to a single evidence stream
 static std::string g_ablateLlm      = "";  // C1: "mlfl_only" — drop the LLM tier entirely and
@@ -97,6 +109,13 @@ static void (*g_verdictSink)(const std::vector<Verdict>&) = nullptr;
 // mode) => always score, i.e. no behavior change.
 static bool (*g_shouldScoreFn)() = nullptr;
 
+// M10 cost sink (supervisor Q23/Q24 follow-up). Called once per scoring window with
+// (simTimeSec, wallClockMs, verdictCount) so the .cc can write the FM-SDP half of
+// M_F's Ĉ_R into metrics_M10_complexity.csv. Without this the FM-SDP cost was
+// measured nowhere in C++ — only printed to the daemon's stdout log. nullptr => no
+// cost row is written (behaviour before this hook existed).
+static void (*g_costSink)(double, double, uint32_t) = nullptr;
+
 // ── config setters (optional; call before Init). [[maybe_unused]] because the .cc
 //    may configure none of them and just call Init() with defaults. ─────────────
 [[maybe_unused]] static void SetInterval(double s)      { g_interval = s; }
@@ -116,8 +135,12 @@ static bool (*g_shouldScoreFn)() = nullptr;
 [[maybe_unused]] static void SetAblateAnalyzer(const std::string& b) { g_ablateAnalyzer = b; }
 [[maybe_unused]] static void SetAblateStream(const std::string& s)   { g_ablateStream = s; }
 [[maybe_unused]] static void SetAblateLlm(const std::string& s)      { g_ablateLlm = s; }
+[[maybe_unused]] static void SetMlflTau(const std::string& s)        { g_mlflTau = s; }
+[[maybe_unused]] static void SetLlmConsensusConfig(const std::string& p) { g_llmConsensusConfig = p; }
+[[maybe_unused]] static void SetTxgbMinBeacons(int n)                { g_txgbMinBeacons = n; }
 [[maybe_unused]] static void SetVerdictSink(void (*cb)(const std::vector<Verdict>&)) { g_verdictSink = cb; }
 [[maybe_unused]] static void SetShouldScoreGate(bool (*fn)()) { g_shouldScoreFn = fn; }
+[[maybe_unused]] static void SetCostSink(void (*cb)(double, double, uint32_t)) { g_costSink = cb; }
 
 // ── launch the persistent daemon in the background ───────────────────────────
 static void LaunchDaemon()
@@ -139,6 +162,13 @@ static void LaunchDaemon()
         cmd << " --ablate-stream " << g_ablateStream;
     if (!g_ablateLlm.empty())
         cmd << " --ablate-llm " << g_ablateLlm;
+    // D-stack ladder knobs: likewise forwarded only when set.
+    if (!g_mlflTau.empty())
+        cmd << " --mlfl-tau " << g_mlflTau;
+    if (!g_llmConsensusConfig.empty())
+        cmd << " --consensus-config " << g_llmConsensusConfig;
+    if (g_txgbMinBeacons > 0)
+        cmd << " --txgb-min-beacons " << g_txgbMinBeacons;
     cmd << " > " << g_daemonLog << " 2>&1 &'";
     std::cout << "[LLMRealtime] launching detector daemon: " << g_script << "\n"
               << "              log -> " << g_daemonLog << "\n" << std::flush;
@@ -229,6 +259,11 @@ static void RunWindow()
         return;
     }
 
+    // M10: the sim BLOCKS on this round-trip, so wall-clock from the SCORE write to
+    // the END token IS the FM-SDP detection cost the simulation actually pays. Started
+    // here (not after the write) so socket + daemon queueing are inside the interval.
+    auto costT0 = std::chrono::high_resolution_clock::now();
+
     std::fprintf(g_conn, "SCORE %.3f\n", now);
     std::fflush(g_conn);
     if (std::ferror(g_conn))          // SIGPIPE is ignored, so a dead daemon shows here
@@ -278,7 +313,15 @@ static void RunWindow()
         return;
     }
 
-    std::cout << "[LLMRealtime] t=" << now << "s scored -> " << n << " verdicts\n" << std::flush;
+    // M10 FM-SDP cost row: emitted only on a COMPLETE window (gotEnd), so a lost-daemon
+    // partial window never contributes a truncated cost sample.
+    double costMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - costT0).count();
+    if (g_costSink)
+        g_costSink(now, costMs, static_cast<uint32_t>(n));
+
+    std::cout << "[LLMRealtime] t=" << now << "s scored -> " << n << " verdicts"
+              << " (" << costMs << " ms wall-clock, M10 fmsdp_llm_window)\n" << std::flush;
 
     // Option A: hand this window's verdicts to the .cc sink, which injects them into
     // g_computedDetectionEvidenceTables and runs the cross-RSU Eq 3.22 consensus. The

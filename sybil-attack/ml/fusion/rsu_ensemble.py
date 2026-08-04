@@ -89,7 +89,26 @@ def main():
     tx = pd.read_parquet(TEMP_XGB)[C.JOIN_KEY + ["p_bar_temp"]]
     rx = pd.read_parquet(RSSI_XGB)[C.JOIN_KEY + ["p_bar_rssi"]]
 
-    ev = fh.merge(tx, on=C.JOIN_KEY, how="left").merge(rx, on=C.JOIN_KEY, how="left")
+    # p_bar_temp: nearest-window join per (run_id, attack_percentage,
+    # claimed_node_id, split), tolerance = one window step either side.
+    # Investigated as a hypothesized "cadence mismatch" bug — it isn't one:
+    # both tables already sit on the identical 2s grid (verified directly
+    # against the parquet files). The real reason most windows lack an
+    # exact match is that 42% of vehicle-tier identities are NEVER observed
+    # by ANY RSU for the whole run (a physical RSU-coverage limit, the same
+    # phenomenon behind the Q32 revocation-bulletin coverage gap) — no join
+    # logic can manufacture a signal the RSU tier never received. Even an
+    # unlimited-tolerance nearest match only reaches 77.6% for that reason;
+    # tolerance is capped at one window step so this only ever borrows an
+    # ADJACENT real observation of the same identity, never a stale one
+    # from a different part of the run.
+    by_cols = [c for c in C.JOIN_KEY if c != "window_start_seconds"]
+    tx_sorted = tx.sort_values("window_start_seconds")
+    fh_sorted = fh.sort_values("window_start_seconds")
+    fh_with_tx = pd.merge_asof(
+        fh_sorted, tx_sorted, on="window_start_seconds", by=by_cols,
+        direction="nearest", tolerance=2.0)
+    ev = fh_with_tx.merge(rx, on=C.JOIN_KEY, how="left")
     ev = _label_from(ev)
     for t in TERMS:
         cov = ev[t].notna().mean() * 100

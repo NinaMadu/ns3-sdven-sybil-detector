@@ -100,6 +100,66 @@ uint32_t rssiMinSamples     = 8;      ///< Min samples per RSU before including 
 uint32_t rssiStreakRequired = 2;      ///< Consecutive windows to confirm Sybil.
 bool     sweepMode          = false;  ///< Suppress per-packet logging for fast threshold sweeps.
 bool     quietMode          = false;  ///< Suppress console output (CSV writes unaffected).
+/// Beacon channel policy — see BindSenderToChannel() in sybil_types.h.
+/// 0=legacy (7 duplicate copies), 1=CCH only, 2=spread one beacon per channel.
+uint32_t beaconChannelMode  = 2;
+/// Write the per-event evidence JSON sidecar (216k files / 2.5 GB per 300 s run).
+/// The same record is always in computed_detection_evidence_log.csv.
+bool     g_evidenceJsonFiles = true;
+/// Which detector the LIGHTWEIGHT tier's M5/M6 matrix scores — see sybil_metrics.h.
+/// 0 = legacy ComputeConfidence heuristic, 1 = the report's LW-SSD flag bank.
+uint32_t lwScoringMode      = 1;
+/// Whether the LW-SSD scoring feed may use the identity-range test
+/// `claimedId >= N_Vehicles` as its S^(out) token-registry stand-in.
+///
+/// 1 (default) = current, published behaviour.  0 = oracle-free evaluation: the
+/// identity-range test is dropped entirely and the behavioural signatures are
+/// recomputed over state that legitimate identities also populate.  See
+/// LwUnbiasedScoringActive() for the isolation contract — this affects the M5/M6
+/// scoring feed of MODE_LIGHTWEIGHT ONLY and never rec.suspicionFlags, so the
+/// evidence logs, consensus/revocation path, ML datasets and MODE_FULL are all
+/// bit-identical at either setting.
+uint32_t lwOracleGate       = 1;
+/// Eq 3.6 parameters for the ORACLE-FREE co-location rule only (lwOracleGate=0).
+/// The production single-observer rule keeps kRssiCoLocationEpsilonDb and is untouched.
+/// sigma=2.0 / gamma=0.6 puts the per-observer decision boundary at |dRSSI| ~ 2.02 dB,
+/// i.e. deliberately equivalent to the old hard 2 dB cut, so that any change in the
+/// measured numbers is attributable to the for-all quantifier and not to a re-tuned
+/// threshold.
+double   lwCoLocSigmaDb     = 2.0;   ///< sigma_ch, channel std dev (dB)
+double   lwCoLocGamma       = 0.6;   ///< gamma_co, kernel acceptance floor
+uint32_t lwCoLocMinObservers = 2;    ///< observers that must agree before flagging
+uint32_t lwCoLocMaxDisagree = 0;     ///< dissenting observers tolerated (0 = strict for-all)
+/// Co-location coincidence window for the ORACLE-FREE rule only (s).  The production
+/// rule keeps the kRssiCoLocationWindowSec constant.  Widening this is what gives the
+/// Eq 3.6 for-all quantifier something to quantify over: at 20 ms typically only ~2
+/// observers see both identities of a pair, so "for all k in O" is a weak constraint.
+double   lwCoLocWindowSec   = 0.020;
+/// Drop SUSPICION_RSSI_DISTANCE_MISMATCH from the D_LW disjunction.  Measured at
+/// identity level it fires on 14 legitimate vehicles and 0 Sybils — precision 0.000 —
+/// so it is a pure false-positive channel.  Default 0 keeps published behaviour;
+/// set 1 to score D_LW without it.
+uint32_t lwSsdDropRssiDistMismatch = 0;
+/// Which signatures may participate in the D_LW disjunction (Eq 3.13), as a bitmask
+/// over the SUSPICION_* bits.  Default = all bits set = published behaviour.
+/// Ablation values (bits from sybil_types.h): RSSI_COLOCATION=32,
+/// RSSI_DISTANCE_MISMATCH=256, TEMPORAL_BURST=16, TRAJECTORY_SHADOWING=64.
+/// Scoring feed only — never touches rec.suspicionFlags, so MODE_FULL is unaffected.
+uint32_t lwSsdSignatureMask = 0xFFFFFFFFu;
+/// Sliding window (s) over which an LW-SSD identity flag stays valid.  0 = latch
+/// forever = published behaviour.  >0 makes D_LW a decaying verdict: an identity is
+/// 'flagged' only if some signature fired within the last lwFlagTtlSec seconds, and
+/// the underlying co-location / trajectory evidence must be RE-EARNED each window
+/// rather than latching.  LW-SSD scoring feed only -- MODE_FULL scores through
+/// RecordFullModeDecision and never reads any of this.
+double lwFlagTtlSec = 0.0;
+/// TIERED CONFIRMATION.  A flat OR-gate gives a precision-1.000 signature and a
+/// precision-0.02 signature an equal vote.  Signatures in lwTierAMask flag immediately;
+/// every other signature must be witnessed by lwTierBMinConfirm DISTINCT observers
+/// (within lwFlagTtlSec, when a window is set) before it may contribute to D_LW.
+/// Default lwTierBMinConfirm=1 disables the mechanism = published behaviour.
+uint32_t lwTierAMask       = 80u;   ///< 16 temporal_burst | 64 trajectory_shadowing
+uint32_t lwTierBMinConfirm = 1u;
 double rsuCoverageRange = 300.0;      ///< DSRC RSU coverage radius (metres).
 // M1 PDR (Eq 3.62) denominator: a V2V broadcast counts one intended delivery per
 // neighbour inside this radius.  This is the RELIABLE range, deliberately well
@@ -283,6 +343,20 @@ std::string ablateLlm = "";                  ///< Ablation C1 (LLM multi-agent t
                                              ///< "mlfl_only" drops the Eq 3.21 agents and the Eq 3.22
                                              ///< consensus, thresholding ŷ_ens (Eq 3.20) directly at a
                                              ///< val-calibrated scalar. "" = full LLM tier (proposed).
+std::string llmConsensusConfig = "";         ///< D-stack D5/D6: consensus config JSON selecting which
+                                             ///< LoRA adapter set the Eq 3.21 agents load. "" = the
+                                             ///< frozen Stage-2 CENTRALLY trained adapters (D5); a
+                                             ///< path swaps in the Stage-3 LLM-FL federated ones (D6).
+                                             ///< Nothing upstream of the decision layer changes.
+double   mlflTau = -1.0;                     ///< D-stack: explicit ŷ_ens decision threshold for the
+                                             ///< mlfl_only conditions (D2/D3/D4). Each rung has its
+                                             ///< own ŷ_ens distribution, so reusing C1's single tau
+                                             ///< would confound "component removed" with "threshold
+                                             ///< mis-calibrated". <0 = let the daemon calibrate.
+uint32_t txgbMinBeacons = 0;                 ///< D-stack: override the RSU temporal-XGB per-window
+                                             ///< minimum deduped-beacon count (default 2). 1 restores
+                                             ///< p̄_temp coverage for short-lived v3 rotation
+                                             ///< identities. 0 = leave the trained default.
 uint32_t p4SelfTestRealId = 0;               ///< >0: run the P4 FP-safety self-test on this REAL
                                              ///< vehicle id instead of the daemon (proves the
                                              ///< real-id corroboration branch: t=10 DEFERRED,
@@ -634,6 +708,11 @@ static std::map<std::string, RevocationManifestRecord> g_revocationManifestsByEn
 static std::vector<std::string> g_latestRevocationManifestCids;
 static std::vector<std::set<uint32_t> > g_rsuRevokedVehicleBlacklist;
 
+// Per-RSU set of revocation manifest CIDs this RSU has already applied, so the
+// periodic resync only pays for manifests it has not seen yet. Purely a
+// memo of work already done -- see SyncRsuRevocationManifestsFromIpfs.
+static std::vector<std::set<std::string> > g_rsuAppliedRevocationManifests;
+
 // Enforcement accounting for the RSU-tier revocation drop (see LogReceivedPacket).
 // Before this drop existed the blacklist only gated the V2RSU/V2I unicast channels,
 // which Sybil identities never use — so a revoked identity kept being ingested from
@@ -828,6 +907,53 @@ static std::vector<std::set<uint32_t> > g_sdnFirstSeenClaimedIdsByRsu;
 static std::vector<std::deque<TemporalNewIdentityEvent> > g_sdnTemporalNewIdEventsByRsu;
 static std::vector<std::deque<RssiIdentityObservation> > g_rssiCoLocationWindows;
 static std::vector<std::map<uint32_t, uint32_t> > g_rssiCoLocationFlags;
+
+// ---------------------------------------------------------------------------
+// Oracle-free (--lwOracleGate=0) LW-SSD scoring state.
+//
+// Deliberately SEPARATE from the tables above.  The production tables are only
+// ever fed identities with claimedId >= N_Vehicles, and that is load-bearing for
+// everything downstream: their flags reach rec.suspicionFlags, the evidence CSV,
+// the cross-RSU consensus, and the trust/RSSI/temporal analyzer datasets.  Letting
+// legitimate identities into them would change MODE_FULL's inputs.  So the
+// oracle-free evaluation keeps its own windows, populated only while
+// LwUnbiasedScoringActive(), and its results reach nothing but RecordLwSsdFlag.
+// ---------------------------------------------------------------------------
+static std::vector<std::deque<RssiIdentityObservation> > g_lwUbRssiCoLocationWindows;
+
+// Eq 3.6 for-all state — see RecordLwUnbiasedRssiCoLocationObservation.  A pair of
+// claimed identities is PENDING until enough observers agree (FLAGGED) or one
+// disagrees (REJECTED); terminal states release their observer set.
+struct LwCoLocPairState
+{
+    std::set<uint32_t> agreeObservers;   ///< cleared on transition to a terminal state
+    uint32_t           disagreeCount = 0;
+    uint8_t            state = 0;        ///< 0=pending, 1=flagged, 2=rejected
+};
+static std::map<uint64_t, LwCoLocPairState> g_lwUbCoLocPairs;
+static std::map<uint32_t, double>           g_lwUbCoLocFlags;  ///< claimedId -> last flag time
+
+// Per-signature attribution for the oracle-free feed: claimedId -> OR of every flag
+// that ever contributed to flagging it.  Evaluation-only; dumped at end of run so the
+// FP mass can be attributed to a specific rule instead of deduced from arm deltas.
+static std::map<uint32_t, uint32_t>         g_lwSsdFlagAttribution;
+
+// Denominator for the identity-level matrix: every claimed identity the lightweight
+// tier actually EVALUATED, flagged or not.  Without this the FN/TN counts would have
+// to assume the whole vehicle population was observed, which is not true in a short
+// run (the trace loads N_Vehicles but not all of them are in range of an observer).
+static std::set<uint32_t>                   g_lwSsdObservedIds;
+/// (claimedId<<32 | signature bit) -> observerIndex -> last witness time.
+static std::map<uint64_t, std::map<uint32_t, double> > g_lwTierBWitness;
+
+static std::vector<std::set<uint32_t> >                  g_lwUbRsuFirstSeenClaimedIds;
+static std::vector<std::deque<TemporalNewIdentityEvent> > g_lwUbRsuTemporalNewIdEvents;
+// Vehicle-tier S^(ind).  Separate from g_trajectoryShadowingFlags/Scores/Compared for the
+// same reason as above: those three are written into NeighborAwarenessRecord and reach the
+// ML datasets (trajShadowScore / trajShadowCompared columns).  The oracle-free evaluator
+// READS the shared g_vehicleTrajectoryWindows (which already contains every identity —
+// RecordTrajectoryShadowingObservation never gated its inserts) but writes only here.
+static std::vector<std::map<uint32_t, uint32_t> >        g_lwUbTrajectoryShadowingFlags;
 static std::vector<std::map<uint32_t, std::deque<TrajectorySample> > > g_vehicleTrajectoryWindows;
 static std::vector<std::map<uint32_t, uint32_t> > g_trajectoryShadowingFlags;
 // Continuous simDTW-proxy score (Eq 3.5) and whether enough aligned samples existed
@@ -877,6 +1003,23 @@ struct RsuTrustState
 };
 
 static std::vector<RsuTrustState> g_rsuTrustTable;
+
+// Bumped whenever any RSU's trust ROLE actually changes.  Endorser eligibility
+// (IsRsuTrustEndorser) is the only piece of mutable state the manifest verifiers
+// read, so anything that memoises a verification verdict must key on this epoch
+// as well as the CID -- otherwise a cached "accepted" could outlive the removal
+// of the RSU whose endorsement carried it.
+static uint64_t g_rsuTrustRoleEpoch = 0;
+
+static void
+SetRsuTrustRole(RsuTrustRole& slot, RsuTrustRole next)
+{
+    if (slot != next)
+    {
+        slot = next;
+        ++g_rsuTrustRoleEpoch;
+    }
+}
 
 // Per-(RSU, claimed identity) count of DISTINCT report epochs in which the RSU
 // asserted an identity that still carried no controller-issued token
@@ -931,6 +1074,13 @@ ResetAwarenessTables()
                                    std::deque<RssiIdentityObservation>());
     g_rssiCoLocationFlags.assign(N_Vehicles + N_RSUs,
                                  std::map<uint32_t, uint32_t>());
+    g_lwUbRssiCoLocationWindows.assign(N_Vehicles + N_RSUs,
+                                       std::deque<RssiIdentityObservation>());
+    g_lwUbCoLocPairs.clear();
+    g_lwUbCoLocFlags.clear();
+    g_lwUbRsuFirstSeenClaimedIds.assign(N_RSUs, std::set<uint32_t>());
+    g_lwUbRsuTemporalNewIdEvents.assign(N_RSUs, std::deque<TemporalNewIdentityEvent>());
+    g_lwUbTrajectoryShadowingFlags.assign(N_Vehicles, std::map<uint32_t, uint32_t>());
     g_vehicleTrajectoryWindows.assign(
         N_Vehicles, std::map<uint32_t, std::deque<TrajectorySample> >());
     g_trajectoryShadowingFlags.assign(N_Vehicles, std::map<uint32_t, uint32_t>());
@@ -1211,10 +1361,11 @@ EnsureRsuTrustTableInitialized()
         // the moment any later code path touched this table.
         if (g_rsuTrustTable[rsuId].removalTriggered)
         {
-            g_rsuTrustTable[rsuId].role = RSU_TRUST_REMOVED;
+            SetRsuTrustRole(g_rsuTrustTable[rsuId].role, RSU_TRUST_REMOVED);
             continue;
         }
-        g_rsuTrustTable[rsuId].role = RoleForRsuTrustScore(g_rsuTrustTable[rsuId].omega);
+        SetRsuTrustRole(g_rsuTrustTable[rsuId].role,
+                        RoleForRsuTrustScore(g_rsuTrustTable[rsuId].omega));
     }
     if (g_sdnUnattestedApprovalStreak.size() < N_RSUs)
         g_sdnUnattestedApprovalStreak.resize(N_RSUs);
@@ -1429,7 +1580,7 @@ UpdateRsuTrustFromApproval(uint32_t rsuIndex,
 
     state.lastUpdateTime = Simulator::Now().GetSeconds();
     if (!state.removalTriggered)
-        state.role = RoleForRsuTrustScore(state.omega);
+        SetRsuTrustRole(state.role, RoleForRsuTrustScore(state.omega));
 
     std::ostringstream status;
     status << reason
@@ -1654,7 +1805,7 @@ EvaluateRsuApprovalWindow()
                 s.omega = std::max(0.0, s.omega - rsuTrustPenalty);   // Eq. (3.40)
                 s.penaltyEvents++;
                 s.lastUpdateTime = Simulator::Now().GetSeconds();
-                s.role = RoleForRsuTrustScore(s.omega);
+                SetRsuTrustRole(s.role, RoleForRsuTrustScore(s.omega));
 
                 std::ostringstream status;
                 status << "windowed_s5"
@@ -1684,7 +1835,8 @@ EvaluateRsuApprovalWindow()
                 if ((rsuTrustImmediateRevoke || removeByDecay) && !s.removalTriggered)
                 {
                     s.removalTriggered = true;
-                    s.role = RSU_TRUST_REMOVED;   // terminal — see the flagged
+                    SetRsuTrustRole(s.role, RSU_TRUST_REMOVED);
+                                                  // terminal — see the flagged
                                                   // initialiser above
 
                     std::ostringstream evidence;
@@ -2295,8 +2447,14 @@ PublishTokenManifestEndorsementToIpfs(uint32_t rsuId,
         out << BuildTokenManifestEndorsementJson(rsuId, manifestBodyHashHex, signatureHex);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    // Gated like every other publisher: under --ipfsPublish=false there is no
+    // daemon to add to, so this only forked a shell + the Go ipfs binary
+    // (~197 ms measured, blocking the single-threaded event loop) to fail and
+    // fall through to the local:// path anyway.
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: token manifest endorsement IPFS publish failed. "
                   << "Endorsement JSON files are still written under " << dir << ".\n";
@@ -2525,10 +2683,16 @@ PublishIpfsPubsubNotice(const std::string& topic, const std::string& cid)
 {
     if (cid.empty())
         return;
-    std::string pubResult = RunCommandCapture(
-        "timeout 2s " + GetIpfsBinaryPath() + " pubsub pub " + topic + " " + cid +
-        " 2>/dev/null");
-    (void)pubResult;
+    // Under --ipfsPublish=false there is no daemon subscribed to anything, so
+    // this forked a shell + the Go ipfs binary purely to time out. The notice
+    // line is still emitted so the local:// event timeline is unchanged.
+    if (g_ipfsPublishEnabled)
+    {
+        std::string pubResult = RunCommandCapture(
+            "timeout 2s " + GetIpfsBinaryPath() + " pubsub pub " + topic + " " + cid +
+            " 2>/dev/null");
+        (void)pubResult;
+    }
     std::cout << "[IPFS_PUBSUB] topic=" << topic << " cid=" << cid << std::endl;
 }
 
@@ -2690,8 +2854,11 @@ PublishRegistrationEndorsementToIpfs(const std::string& registrationCid,
                                                 vehicleId, originRsuId, signatureHex);
     }
 
-    std::string cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
-    if (cid.empty() && !warnedIpfsUnavailable)
+    // Gated like every other publisher -- see PublishTokenManifestEndorsementToIpfs.
+    std::string cid;
+    if (g_ipfsPublishEnabled)
+        cid = RunCommandCapture(GetIpfsBinaryPath() + " add -Q " + path.str() + " 2>/dev/null");
+    if (g_ipfsPublishEnabled && cid.empty() && !warnedIpfsUnavailable)
     {
         std::cerr << "[IPFS] WARNING: registration endorsement IPFS publish failed. "
                   << "Endorsement JSON files are still written under " << dir << ".\n";
@@ -2927,7 +3094,26 @@ FetchJsonFromIpfsCid(const std::string& cid)
 
     const std::string localPrefix = "local://";
     if (cid.rfind(localPrefix, 0) == 0)
-        return ReadSmallTextFile(cid.substr(localPrefix.size()));
+    {
+        // Mirror of the IpfsCatCached memo for the --ipfsPublish=false path,
+        // which otherwise re-opened and re-read the same JSON from disk on
+        // every RSU resync tick.  Safe for the same reason: every local://
+        // record is written exactly once under a path that carries its own
+        // entity id + microsecond timestamp, and each publisher early-returns
+        // the existing CID rather than rewriting the file, so a path's content
+        // never changes within a run.  Empty reads are not cached, so a missing
+        // file stays retryable exactly as before.
+        static std::unordered_map<std::string, std::string> s_localReadCache;
+        std::unordered_map<std::string, std::string>::const_iterator it =
+            s_localReadCache.find(cid);
+        if (it != s_localReadCache.end())
+            return it->second;
+
+        std::string body = ReadSmallTextFile(cid.substr(localPrefix.size()));
+        if (!body.empty())
+            s_localReadCache.insert(std::make_pair(cid, body));
+        return body;
+    }
 
     return IpfsCatCached(cid);
 }
@@ -3071,7 +3257,7 @@ PublishUpdatedTokenManifest()
               << "/" << (FullCryptoMechanismActive() ? GetRsuThreshold(N_RSUs) : 0u)
               << std::endl;
 
-    if (FullCryptoMechanismActive())
+    if (FullCryptoMechanismActive() && g_ipfsPublishEnabled)
     {
         std::string pubResult = RunCommandCapture(
             "timeout 2s " + GetIpfsBinaryPath() +
@@ -3096,7 +3282,30 @@ SyncRsuTokenCommitmentsFromIpfs(uint32_t rsuId)
     if (!g_latestTokenManifestCid.empty())
     {
         std::string manifestJson = FetchJsonFromIpfsCid(g_latestTokenManifestCid);
-        if (!VerifyFullModeTokenManifestEndorsements(manifestJson))
+
+        // Endorsement verification is a pure function of the manifest bytes and
+        // the current endorser set, but it ran once per RSU per sync tick --
+        // 7,702 calls produced 5 distinct verdicts in a 90 s run, each one
+        // re-fetching every endorsement CID and re-running a real ECDSA/ML-DSA
+        // verify. Memoise on (CID, trust-role epoch) so a change in RSU trust
+        // still forces a full re-verify.
+        static std::map<std::pair<std::string, uint64_t>, bool> s_manifestVerdict;
+        const std::pair<std::string, uint64_t> verdictKey(g_latestTokenManifestCid,
+                                                          g_rsuTrustRoleEpoch);
+        std::map<std::pair<std::string, uint64_t>, bool>::const_iterator vIt =
+            s_manifestVerdict.find(verdictKey);
+        bool manifestOk;
+        if (vIt != s_manifestVerdict.end())
+        {
+            manifestOk = vIt->second;
+        }
+        else
+        {
+            manifestOk = VerifyFullModeTokenManifestEndorsements(manifestJson);
+            s_manifestVerdict[verdictKey] = manifestOk;
+        }
+
+        if (!manifestOk)
         {
             std::cerr << "[FullModeTokenManifest] RSU " << rsuId
                       << " rejected unendorsed manifest="
@@ -3104,8 +3313,20 @@ SyncRsuTokenCommitmentsFromIpfs(uint32_t rsuId)
         }
         else
         {
-        std::map<uint32_t, std::string> recordCids =
-            ParseTokenManifestRecordCids(manifestJson);
+        // Same manifest bytes -> same record list, so parse each CID once
+        // instead of once per RSU per tick. Keyed on the CID alone: unlike the
+        // verdict above this depends only on the immutable manifest content.
+        static std::map<std::string, std::map<uint32_t, std::string> > s_recordCidCache;
+        std::map<std::string, std::map<uint32_t, std::string> >::iterator rIt =
+            s_recordCidCache.find(g_latestTokenManifestCid);
+        if (rIt == s_recordCidCache.end())
+        {
+            rIt = s_recordCidCache
+                      .insert(std::make_pair(g_latestTokenManifestCid,
+                                             ParseTokenManifestRecordCids(manifestJson)))
+                      .first;
+        }
+        const std::map<uint32_t, std::string>& recordCids = rIt->second;
 
         for (auto it = recordCids.begin(); it != recordCids.end(); ++it)
         {
@@ -3473,6 +3694,17 @@ PublishComputedDetectionEvidenceToIpfs(const ComputedDetectionEvidenceRecord& re
          << "_t" << static_cast<uint64_t>(rec.observationTime * 1000000.0)
          << ".json";
 
+    // --evidenceJsonFiles=false skips the per-event JSON sidecar. A 300 s run
+    // writes 216,831 of these into ONE flat directory (2.5 GB) and the identical
+    // record is already in computed_detection_evidence_log.csv, so nothing is
+    // lost analytically. Flat-directory entry insertion is the prime suspect for
+    // the super-linear runtime growth (30 s -> 300 s cost 21.8x, not 10x).
+    //
+    // The CID string is still returned unchanged, so evidenceCids, the aggregate
+    // evidence hash and the revocation manifests keep their exact structure --
+    // only the file on disk is absent. Detection votes never read it (they test
+    // suspicionFlags), so M1-M11, MCC and PDR are unaffected.
+    if (g_evidenceJsonFiles)
     {
         std::ofstream out(path.str().c_str(), std::ios::out);
         out << BuildComputedDetectionEvidenceJson(rec);
@@ -3750,7 +3982,17 @@ BroadcastRevocationBulletin(uint32_t rsuId)
 
     Ptr<Socket> sock = CreateSenderSocket(g_rsuNodes.Get(rsuId));
     sock->SetAllowBroadcast(true);
+    // Same 7x fan-out applies to the bulletin — it is a limited broadcast on an
+    // unbound socket. Pinned by version so successive bulletin rounds rotate
+    // channels rather than all landing on one.
+    BindSenderToChannel(sock, bt.version);
     sock->SendTo(pkt, 0, InetSocketAddress(Ipv4Address("255.255.255.255"), VEHICLE_PORT));
+    // M11 channel-load: bulletins consume real airtime (payloadBytes above is
+    // the true wire size ns-3 models), so they must count toward the total
+    // offered-bytes denominator or M11 understates real channel utilization.
+    // Not a Sybil-identity transmission, so isSybilIdentity=false -- this
+    // only affects the denominator, not the Sybil-bytes numerator.
+    MetricsOnChannelLoad(false, payloadBytes);
     // Deliberately NOT counted in M1/M3/M4: the receive path returns before
     // MetricsOnReceive, so counting the transmit would depress PDR without a matching
     // delivery (the same denominator trap that makes a vehicle-side DROP unsafe).
@@ -3820,11 +4062,31 @@ SyncRsuRevocationManifestsFromIpfs(uint32_t rsuId)
     if (g_rsuRevokedVehicleBlacklist.size() < N_RSUs)
         g_rsuRevokedVehicleBlacklist.resize(N_RSUs);
 
+    // g_latestRevocationManifestCids is append-only, and this runs once per RSU
+    // every tokenCommitmentSyncInterval, so re-fetching + re-parsing EVERY
+    // manifest on every tick made the resync cost 64 x manifests-so-far per
+    // simulated second -- quadratic in run length, and the single largest
+    // growing term in the profile (8.3% of CPU in the first half of a 90 s run,
+    // 20.9% in the second).
+    //
+    // Skipping a manifest this RSU has already applied is exactly equivalent to
+    // re-running it: ApplyRevocationManifestJson's only effect is the guarded
+    // g_rsuRevokedVehicleBlacklist[rsuId].insert(entityId), and once that id is
+    // present the insert fails, the LKH re-key and table erases are skipped, and
+    // the function just returns true. Only SUCCESSES are recorded, so a manifest
+    // rejected for want of endorsements is still retried on every later tick --
+    // signer eligibility depends on mutable RSU trust and can turn acceptable.
+    if (g_rsuAppliedRevocationManifests.size() < N_RSUs)
+        g_rsuAppliedRevocationManifests.resize(N_RSUs);
+
     for (std::size_t i = 0; i < g_latestRevocationManifestCids.size(); ++i)
     {
         const std::string& cid = g_latestRevocationManifestCids[i];
+        if (g_rsuAppliedRevocationManifests[rsuId].count(cid))
+            continue;
         std::string json = FetchJsonFromIpfsCid(cid);
-        ApplyRevocationManifestJson(rsuId, cid, json);
+        if (ApplyRevocationManifestJson(rsuId, cid, json))
+            g_rsuAppliedRevocationManifests[rsuId].insert(cid);
     }
 
     if (tokenCommitmentSyncInterval > 0.0 &&
@@ -3905,11 +4167,14 @@ PublishFullModeRevocationManifest(const IsolationRecord& isolation)
         g_latestRevocationManifestCids.push_back(rec.manifestCid);
     }
 
-    std::string pubResult = RunCommandCapture(
-        "timeout 2s " + GetIpfsBinaryPath() +
-        " pubsub pub sybil-revocations " + rec.manifestCid +
-        " 2>/dev/null");
-    (void)pubResult;
+    if (g_ipfsPublishEnabled)
+    {
+        std::string pubResult = RunCommandCapture(
+            "timeout 2s " + GetIpfsBinaryPath() +
+            " pubsub pub sybil-revocations " + rec.manifestCid +
+            " 2>/dev/null");
+        (void)pubResult;
+    }
 
     for (uint32_t rsuId = 0; rsuId < N_RSUs; ++rsuId)
         Simulator::ScheduleNow(&SyncRsuRevocationManifestsFromIpfs, rsuId);
@@ -4107,6 +4372,19 @@ RevokeEntityCurrentCrypto(const std::string& entityType,
     rec.entityType = entityType;
     rec.entityId = entityId;
     rec.isolationTimestamp = Simulator::Now().GetSeconds();
+    // eq:pdr pre-/post-mitigation window split (Q40): this is the first point
+    // RevokeEntity actually completes, so PDR before/after this instant can be
+    // reported separately rather than as one pooled 300s number.
+    MarkFirstRevocationComplete(rec.isolationTimestamp);
+    // Q32 round-2 fix: source-side suppression backstop (SendTaggedPacket in
+    // sybil_types.h checks this set on every V2V beacon send). Vehicle-tier
+    // bulletin propagation alone cannot suppress a revoked identity for
+    // vehicles that never come within RSU range during the run -- confirmed
+    // empirically (a specific revoked identity kept transmitting to the end
+    // of the run under the bulletin-only fix). This closes that gap
+    // unconditionally, independent of network coverage.
+    if (entityType == "vehicle")
+        MarkClaimedIdGloballyRevoked(entityId);
     // g_attackOnsetTime is the deterministic scheduling constant every attack
     // window is gated behind (sybil_attacks.h); it is the correct t_inject for
     // single-attack-type runs. Phased sequential_all6 runs still fall back to
@@ -4229,14 +4507,21 @@ EvaluateTemporalBurstSignature(uint32_t rsuIndex,
                                double y,
                                std::vector<std::set<uint32_t> >& firstSeen,
                                std::vector<std::deque<TemporalNewIdentityEvent> >& events,
-                               const std::string& tier)
+                               const std::string& tier,
+                               bool applyRegistryGate = true)
 {
     if (rsuIndex >= N_RSUs || eventTime < kTemporalBurstWarmupSec)
         return SUSPICION_NONE;
 
     // Registered in-simulation vehicles are normal churn.  Out-of-registry IDs
     // are the token-registry abstraction used by the Type-3 detector.
-    if (claimedId < N_Vehicles)
+    //
+    // applyRegistryGate=false (--lwOracleGate=0, oracle-free LW-SSD scoring only)
+    // drops that test, so a legitimate vehicle entering this RSU's range for the
+    // first time is a new-identity event exactly like a fabricated one.  That is
+    // the point: it is what makes theta_n / theta_var a real decision boundary
+    // rather than a formality applied to identities already known to be Sybil.
+    if (applyRegistryGate && claimedId < N_Vehicles)
         return SUSPICION_NONE;
 
     if (firstSeen.size() < N_RSUs) firstSeen.resize(N_RSUs);
@@ -4275,13 +4560,19 @@ EvaluateTemporalBurstSignature(uint32_t rsuIndex,
     if (regionTimes.size() >= kTemporalBurstThetaN &&
         iatVar > kTemporalBurstThetaVar)
     {
-        std::cout << "[TemporalBurst] " << tier
-                  << " flagged RSU=" << rsuIndex
-                  << " cell=(" << ev.cellX << "," << ev.cellY << ")"
-                  << " newIds=" << regionTimes.size()
-                  << " varIAT=" << iatVar
-                  << " claimedId=" << claimedId
-                  << std::endl;
+        // The oracle-free path fires on legitimate arrivals too, by design, so it
+        // would flood the console on a 300 s run.  It is a scoring-only side
+        // channel; the flagged set lands in the M5/M6 matrix either way.
+        if (applyRegistryGate)
+        {
+            std::cout << "[TemporalBurst] " << tier
+                      << " flagged RSU=" << rsuIndex
+                      << " cell=(" << ev.cellX << "," << ev.cellY << ")"
+                      << " newIds=" << regionTimes.size()
+                      << " varIAT=" << iatVar
+                      << " claimedId=" << claimedId
+                      << std::endl;
+        }
         return SUSPICION_TEMPORAL_BURST;
     }
 
@@ -4299,6 +4590,8 @@ ObserverLabel(uint32_t observerIndex)
     return "observer/" + std::to_string(observerIndex);
 }
 
+// PRODUCTION co-location — single-observer, hard |dRSSI| threshold.  UNCHANGED:
+// its output reaches rec.suspicionFlags and therefore MODE_FULL and the ML datasets.
 static void
 RecordRssiCoLocationObservation(uint32_t observerIndex,
                                 uint32_t claimedId,
@@ -4347,6 +4640,128 @@ RecordRssiCoLocationObservation(uint32_t observerIndex,
     }
 
     window.push_back(current);
+}
+
+// ---------------------------------------------------------------------------
+// ORACLE-FREE co-location — the report's Eq 3.6 as actually written:
+//
+//     Phi_coloc(i,j) = exp( -(RSSI_ik - RSSI_jk)^2 / (2 sigma_ch^2) ) > gamma_co,
+//                      for ALL k in O
+//
+// Two differences from the production rule above, and the second is the point.
+//
+//  1. Gaussian kernel with an explicit channel variance, instead of a hard 2 dB cut.
+//  2. THE FOR-ALL QUANTIFIER.  The production rule flags a pair on evidence from ONE
+//     observer, but "two identities had similar RSSI at one receiver" only means
+//     "they were at a similar DISTANCE from that receiver" — utterly ordinary among
+//     genuine neighbours, and measured as ~59% FPR once the identity-range gate is
+//     removed.  Requiring agreement at every observer that saw both is what makes the
+//     rule discriminative: two Sybil identities sharing one radio match everywhere by
+//     construction, while two distinct vehicles are separated by geometry at some
+//     observer and are eliminated there.
+//
+// A pair is therefore a small state machine — PENDING accumulates agreeing observers,
+// one disagreement is fatal (REJECTED), enough agreement without dissent is FLAGGED.
+// Both terminal states drop their observer set, which is what bounds memory: in the
+// oracle-free population most pairs are rejected almost immediately.
+// ---------------------------------------------------------------------------
+static inline uint64_t
+LwCoLocPairKey(uint32_t a, uint32_t b)
+{
+    uint32_t lo = std::min(a, b);
+    uint32_t hi = std::max(a, b);
+    return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+}
+
+static void
+RecordLwUnbiasedRssiCoLocationObservation(uint32_t observerIndex,
+                                          uint32_t claimedId,
+                                          double rssiDbm)
+{
+    if (observerIndex >= g_lwUbRssiCoLocationWindows.size())
+        return;
+
+    double now = Simulator::Now().GetSeconds();
+    RssiIdentityObservation current;
+    current.timeSec = now;
+    current.claimedId = claimedId;
+    current.rssiDbm = rssiDbm;
+
+    auto& window = g_lwUbRssiCoLocationWindows[observerIndex];
+    while (!window.empty() &&
+           window.front().timeSec < now - lwCoLocWindowSec)
+    {
+        window.pop_front();
+    }
+
+    const double twoSigmaSq = 2.0 * lwCoLocSigmaDb * lwCoLocSigmaDb;
+
+    for (const auto& prev : window)
+    {
+        if (prev.claimedId == claimedId)
+            continue;
+
+        double dt = std::fabs(now - prev.timeSec);
+        if (dt > lwCoLocWindowSec)
+            continue;
+
+        LwCoLocPairState& pair = g_lwUbCoLocPairs[LwCoLocPairKey(claimedId, prev.claimedId)];
+        if (pair.state != 0)
+            continue;                       // already decided, in either direction
+
+        double drssi = rssiDbm - prev.rssiDbm;
+        double phi   = std::exp(-(drssi * drssi) / twoSigmaSq);
+
+        if (phi > lwCoLocGamma)
+        {
+            pair.agreeObservers.insert(observerIndex);
+            if (pair.agreeObservers.size() >= lwCoLocMinObservers)
+            {
+                // With a sliding window the pair must RE-EARN its verdict every
+                // window, so drop back to pending instead of latching terminal.
+                pair.state = (lwFlagTtlSec > 0.0) ? 0 : 1;
+                pair.agreeObservers.clear();
+                g_lwUbCoLocFlags[claimedId]      = now;
+                g_lwUbCoLocFlags[prev.claimedId] = now;
+            }
+        }
+        else
+        {
+            // Disagreement at this observer. Under the report's strict for-all this is
+            // immediately fatal; lwCoLocMaxDisagree > 0 relaxes it for the sensitivity
+            // sweep, since a real channel can produce one bad sample on a true pair.
+            pair.disagreeCount++;
+            if (pair.disagreeCount > lwCoLocMaxDisagree)
+            {
+                // Windowed mode resets the accumulation instead of rejecting the pair
+                // for the rest of the run -- a permanent reject is just stickiness in
+                // the other direction, and would freeze an early channel glitch in.
+                pair.agreeObservers.clear();
+                if (lwFlagTtlSec > 0.0) pair.disagreeCount = 0;
+                else                    pair.state = 2;
+            }
+        }
+    }
+
+    window.push_back(current);
+}
+
+// Network-wide by construction now — the for-all quantifier is evaluated across
+// observers, so the verdict is a property of the identity pair, not of one receiver.
+// observerIndex is accepted and ignored to keep the call sites symmetric with the
+// gated twin.
+static uint32_t
+GetLwUnbiasedRssiCoLocationFlags(uint32_t /*observerIndex*/, uint32_t claimedId)
+{
+    auto it = g_lwUbCoLocFlags.find(claimedId);
+    if (it == g_lwUbCoLocFlags.end())
+        return SUSPICION_NONE;
+    if (lwFlagTtlSec > 0.0 &&
+        (Simulator::Now().GetSeconds() - it->second) > lwFlagTtlSec)
+    {
+        return SUSPICION_NONE;      // evidence has aged out of the window
+    }
+    return SUSPICION_RSSI_COLOCATION;
 }
 
 static uint32_t
@@ -4501,6 +4916,114 @@ RecordTrajectoryShadowingObservation(uint32_t observerVehicleId,
     return EvaluateTrajectoryShadowing(observerVehicleId,
                                        claimedId,
                                        observableSourceId);
+}
+
+// ---------------------------------------------------------------------------
+// EvaluateLwUnbiasedTrajectoryShadowing — oracle-free S^(ind) (Eq 3.8), scoring only.
+//
+// Same kernel as EvaluateTrajectoryShadowing with two differences:
+//   * the identity-range gates (`claimedId < N_Vehicles`, `observableSourceId >=
+//     N_Vehicles`) are dropped, so a legitimate identity can be compared and can be
+//     wrongly flagged — the false-positive channel the gated version cannot express.
+//     `observableSourceId == claimedId` is KEPT: it is not an oracle but the report's
+//     own precondition, that S^(ind) applies to FORWARDED messages only.  A vehicle
+//     beaconing for itself carries source == claimed (SybilPacketTag defaults
+//     observableSourceId to realNodeId), so it is correctly out of scope.
+//   * it is READ-ONLY with respect to every shared table.  It reads
+//     g_vehicleTrajectoryWindows, which already holds all identities, and writes only
+//     g_lwUbTrajectoryShadowingFlags.  It does NOT touch g_trajectoryShadowingFlags,
+//     g_trajectoryShadowingScores or g_trajectoryShadowingCompared, so trajShadowScore
+//     / trajShadowCompared in the ML datasets are unchanged.
+// ---------------------------------------------------------------------------
+static uint32_t
+EvaluateLwUnbiasedTrajectoryShadowing(uint32_t observerVehicleId,
+                                      uint32_t claimedId,
+                                      uint32_t observableSourceId)
+{
+    if (observerVehicleId >= g_vehicleTrajectoryWindows.size() ||
+        observerVehicleId >= g_lwUbTrajectoryShadowingFlags.size())
+    {
+        return SUSPICION_NONE;
+    }
+
+    if (observableSourceId == claimedId)
+        return SUSPICION_NONE;
+
+    // Latch mode only: once shadowing has been demonstrated the verdict stands even
+    // after the trajectories diverge.  Under a sliding window (lwFlagTtlSec > 0) the
+    // pair is re-evaluated on every observation instead, so shadowing must still be
+    // true NOW for the identity to stay flagged.
+    if (lwFlagTtlSec <= 0.0)
+    {
+        auto prior = g_lwUbTrajectoryShadowingFlags[observerVehicleId].find(claimedId);
+        if (prior != g_lwUbTrajectoryShadowingFlags[observerVehicleId].end() &&
+            prior->second != SUSPICION_NONE)
+        {
+            return prior->second;
+        }
+    }
+
+    auto& observerWindows = g_vehicleTrajectoryWindows[observerVehicleId];
+    auto claimedIt = observerWindows.find(claimedId);
+    auto sourceIt = observerWindows.find(observableSourceId);
+    if (claimedIt == observerWindows.end() || sourceIt == observerWindows.end())
+        return SUSPICION_NONE;
+
+    const auto& claimedSamples = claimedIt->second;
+    const auto& sourceSamples = sourceIt->second;
+    if (claimedSamples.size() < kTrajectoryMinAlignedSamples ||
+        sourceSamples.size() < kTrajectoryMinAlignedSamples)
+    {
+        return SUSPICION_NONE;
+    }
+
+    uint32_t matched = 0;
+    double totalDistance = 0.0;
+    double totalSpeedDiff = 0.0;
+    double totalHeadingDiff = 0.0;
+
+    for (const auto& claimed : claimedSamples)
+    {
+        const TrajectorySample* best = nullptr;
+        double bestDt = kTrajectoryAlignmentSec;
+        for (const auto& source : sourceSamples)
+        {
+            double dt = std::fabs(claimed.timeSec - source.timeSec);
+            if (dt <= bestDt)
+            {
+                bestDt = dt;
+                best = &source;
+            }
+        }
+
+        if (!best)
+            continue;
+
+        double dx = claimed.x - best->x;
+        double dy = claimed.y - best->y;
+        totalDistance += std::sqrt(dx * dx + dy * dy);
+        totalSpeedDiff += std::fabs(claimed.speed - best->speed);
+        totalHeadingDiff += HeadingDifferenceDegrees(claimed.heading, best->heading);
+        matched++;
+    }
+
+    if (matched < kTrajectoryMinAlignedSamples)
+        return SUSPICION_NONE;
+
+    double avgDistance = totalDistance / static_cast<double>(matched);
+    double avgSpeedDiff = totalSpeedDiff / static_cast<double>(matched);
+    double avgHeadingDiff = totalHeadingDiff / static_cast<double>(matched);
+
+    if (avgDistance <= kTrajectoryThetaDistanceM &&
+        avgSpeedDiff <= kTrajectoryThetaSpeedMps &&
+        avgHeadingDiff <= kTrajectoryThetaHeadingDeg)
+    {
+        g_lwUbTrajectoryShadowingFlags[observerVehicleId][claimedId] |=
+            SUSPICION_TRAJECTORY_SHADOWING;
+        return SUSPICION_TRAJECTORY_SHADOWING;
+    }
+
+    return SUSPICION_NONE;
 }
 
 static uint32_t
@@ -4748,6 +5271,259 @@ LightweightDecisionModeActive()
     return EffectiveMode() == MODE_LIGHTWEIGHT;
 }
 
+// ---------------------------------------------------------------------------
+// LwUnbiasedScoringActive — the ONLY switch guarding the oracle-free LW-SSD path.
+//
+// ISOLATION CONTRACT.  Every oracle-free code path in this file is guarded by this
+// predicate, and all three conjuncts matter:
+//   * lwScoringMode == 1  — mode 0 scores the legacy ComputeConfidence heuristic,
+//     which never reads the suspicion bank, so there is nothing to de-bias.
+//   * lwOracleGate == 0   — opt-in; the default reproduces published runs exactly.
+//   * LightweightDecisionModeActive() — MODE_LIGHTWEIGHT only (or an adaptive cycle
+//     that has resolved to it).  In MODE_FULL this is false, so the parallel windows
+//     are never populated, the extra work is never done, and the trust / RSSI /
+//     temporal analyzer inputs keep the exact distributions they were trained on.
+// ---------------------------------------------------------------------------
+// Tier-B corroboration gate — see lwTierAMask.  Scoring feed only.
+static uint32_t
+ApplyTieredConfirmation(uint32_t flags, uint32_t claimedId, uint32_t observerIndex)
+{
+    if (lwTierBMinConfirm <= 1u || flags == SUSPICION_NONE)
+        return flags;
+
+    uint32_t out   = flags & lwTierAMask;      // tier A: trusted, flags on sight
+    uint32_t tierB = flags & ~lwTierAMask;
+    if (tierB == 0u)
+        return out;
+
+    double now = Simulator::Now().GetSeconds();
+    for (uint32_t b = 0; b < 32u; ++b)
+    {
+        uint32_t bit = 1u << b;
+        if ((tierB & bit) == 0u)
+            continue;
+        uint64_t key = (static_cast<uint64_t>(claimedId) << 32) | bit;
+        std::map<uint32_t, double>& w = g_lwTierBWitness[key];
+        w[observerIndex] = now;
+        if (lwFlagTtlSec > 0.0)
+        {
+            for (std::map<uint32_t, double>::iterator it = w.begin(); it != w.end(); )
+            {
+                if ((now - it->second) > lwFlagTtlSec) w.erase(it++);
+                else ++it;
+            }
+        }
+        if (w.size() >= lwTierBMinConfirm)
+            out |= bit;
+    }
+    return out;
+}
+
+static bool
+LwUnbiasedScoringActive()
+{
+    return lwScoringMode == 1u && lwOracleGate == 0u && LightweightDecisionModeActive();
+}
+
+// ---------------------------------------------------------------------------
+// WriteLwSsdFlagAttributionCsv — per-signature TP/FP for the Eq 3.13 OR-gate.
+//
+// D_LW is a disjunction, so the aggregate M5/M6 matrix cannot say WHICH rule produced
+// the false positives; that previously had to be inferred from the difference between
+// the gated and oracle-free arms.  This attributes it directly.
+//
+// Unit is the IDENTITY, not the packet: one row per claimed id that D_LW flagged at
+// least once, credited to every signature that contributed.  Because a flagged id is
+// sticky in the M5/M6 matrix, identities are the causal unit — packet counts are just
+// each identity's flag multiplied by how much it happened to transmit.  Percentages in
+// M5/M6 will therefore not match these counts and are not meant to.
+//
+// The sybil/legit split uses claimedId >= N_Vehicles, which IS the ground-truth oracle
+// — legitimately so: this file is evaluation output, never an input to any detector.
+// ---------------------------------------------------------------------------
+static void
+WriteLwSsdFlagAttributionCsv()
+{
+    if (g_lwSsdFlagAttribution.empty())
+        return;
+
+    struct FlagRow { const char* name; uint32_t bit; };
+    static const FlagRow kRows[] = {
+        {"id_mismatch_registry_miss",  SUSPICION_ID_MISMATCH},
+        {"rssi_colocation",            SUSPICION_RSSI_COLOCATION},
+        {"temporal_burst",             SUSPICION_TEMPORAL_BURST},
+        {"trajectory_shadowing",       SUSPICION_TRAJECTORY_SHADOWING},
+        {"range_anomaly",              SUSPICION_RANGE_ANOMALY},
+        {"rssi_distance_mismatch",     SUSPICION_RSSI_DISTANCE_MISMATCH},
+        {"invalid_v2v_signature",      SUSPICION_INVALID_V2V_SIGNATURE},
+    };
+
+    std::ofstream f((outputDir + "/lwssd_flag_attribution.csv").c_str());
+    f << "signature,identities_flagged,identities_sybil,identities_legit,"
+         "precision_identity,lw_scoring_mode,lw_oracle_gate\n";
+
+    for (const auto& row : kRows)
+    {
+        uint32_t sybil = 0, legit = 0;
+        for (const auto& kv : g_lwSsdFlagAttribution)
+        {
+            if ((kv.second & row.bit) == 0)
+                continue;
+            if (kv.first >= N_Vehicles) sybil++; else legit++;
+        }
+        uint32_t total = sybil + legit;
+        double prec = (total == 0) ? 0.0 : static_cast<double>(sybil) / total;
+        f << row.name << "," << total << "," << sybil << "," << legit << ","
+          << prec << "," << lwScoringMode << "," << lwOracleGate << "\n";
+    }
+
+    uint32_t anySybil = 0, anyLegit = 0;
+    for (const auto& kv : g_lwSsdFlagAttribution)
+        if (kv.first >= N_Vehicles) anySybil++; else anyLegit++;
+    double anyPrec = (anySybil + anyLegit == 0)
+                     ? 0.0
+                     : static_cast<double>(anySybil) / (anySybil + anyLegit);
+    f << "ANY_D_LW," << (anySybil + anyLegit) << "," << anySybil << "," << anyLegit
+      << "," << anyPrec << "," << lwScoringMode << "," << lwOracleGate << "\n";
+
+    std::cout << "[LW-SSD] flag attribution written: " << outputDir
+              << "/lwssd_flag_attribution.csv  (" << (anySybil + anyLegit)
+              << " identities flagged: " << anySybil << " sybil / " << anyLegit
+              << " legit)" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// WriteLwSsdIdentityMatrixCsv — M5/M6 for the lightweight tier at IDENTITY grain.
+//
+// WHY THIS EXISTS.  D_LW's decision is "revoke this identity", but the M5/M6 matrix
+// counts one row per received PACKET, so every identity's verdict is weighted by how
+// much it happened to transmit and by how many receivers overheard it.  Those weights
+// are wildly unequal: legitimate vehicles are long-lived and densely overheard while
+// Sybil identities are short-lived, so a measured run had 59 false-positive identities
+// out of 259 (FPR 0.23) show up as 477k of 825k false-positive packet-rows (FPR 0.58),
+// and identity precision 0.805 present as packet precision 0.026.
+//
+// Neither number is wrong; they answer different questions.  The packet matrix answers
+// "how much traffic did the tier misjudge", which is the right unit for the mitigation
+// and PDR story.  This one answers "how many identities did the tier misjudge", which
+// is the right unit for a detector whose output is a per-identity revocation, and it is
+// the one comparable with the full-mode detector's per-identity verdicts.  Report both,
+// labelled — do not quote one as if it were the other.
+//
+// Denominators come from g_lwSsdObservedIds (identities the tier actually evaluated),
+// not from N_Vehicles, so an identity never in range of any observer is excluded rather
+// than silently counted as a true negative.
+// ---------------------------------------------------------------------------
+static void
+WriteLwSsdIdentityMatrixCsv()
+{
+    if (g_lwSsdObservedIds.empty())
+        return;
+
+    uint32_t tp = 0, fp = 0, fn = 0, tn = 0;
+    for (uint32_t id : g_lwSsdObservedIds)
+    {
+        bool isSybil   = (id >= N_Vehicles);   // ground truth — evaluation only
+        bool isFlagged = (g_lwSsdFlagAttribution.find(id) != g_lwSsdFlagAttribution.end());
+        if      ( isSybil &&  isFlagged) tp++;
+        else if (!isSybil &&  isFlagged) fp++;
+        else if ( isSybil && !isFlagged) fn++;
+        else                             tn++;
+    }
+
+    double denom = std::sqrt(static_cast<double>(tp + fp) * (tp + fn) *
+                             static_cast<double>(tn + fp) * (tn + fn));
+    double mcc = (denom > 0.0)
+                 ? (static_cast<double>(tp) * tn - static_cast<double>(fp) * fn) / denom
+                 : 0.0;
+    double precision = (tp + fp > 0) ? static_cast<double>(tp) / (tp + fp) : 0.0;
+    double recall    = (tp + fn > 0) ? static_cast<double>(tp) / (tp + fn) : 0.0;
+    double fpr       = (fp + tn > 0) ? static_cast<double>(fp) / (fp + tn) : 0.0;
+    double f1        = (precision + recall > 0.0)
+                       ? 2.0 * precision * recall / (precision + recall) : 0.0;
+
+    std::ofstream f((outputDir + "/metrics_M5_M6_identity.csv").c_str());
+    f << "unit,TP,FP,FN,TN,MCC,Precision,Recall,FPR,F1,"
+         "identities_observed,lw_scoring_mode,lw_oracle_gate,"
+         "coloc_min_observers,coloc_max_disagree,coloc_window_sec,drop_rssi_dist_mismatch,"
+         "signature_mask,flag_ttl_sec\n";
+    f << "identity," << tp << "," << fp << "," << fn << "," << tn << ","
+      << mcc << "," << precision << "," << recall << "," << fpr << "," << f1 << ","
+      << g_lwSsdObservedIds.size() << "," << lwScoringMode << "," << lwOracleGate << ","
+      << lwCoLocMinObservers << "," << lwCoLocMaxDisagree << "," << lwCoLocWindowSec << ","
+      << lwSsdDropRssiDistMismatch << "," << lwSsdSignatureMask << ","
+      << lwFlagTtlSec << "\n";
+
+    std::cout << "[LW-SSD] identity matrix: TP=" << tp << " FP=" << fp
+              << " FN=" << fn << " TN=" << tn
+              << "  MCC=" << mcc << " P=" << precision << " R=" << recall
+              << " FPR=" << fpr << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// RecordLwSsdVehicleTierFlag — the OBU half of the Eq 3.13 OR-gate.
+//
+// Until now D_LW was fed only from RecordComputedDetectionEvidence, i.e. beacons
+// sniffed at an RSU.  Table 3.2 puts the co-location (v2) and indirect (v4)
+// signatures at "Vehicle / RSU", and the vehicle tier is the larger observer
+// population (N_Vehicles observers vs N_RSUs), so scoring only the RSU half caps
+// recall at whatever the RSUs happen to overhear — measured 35 distinct identities
+// in a 36 s run.  v4 was never scored at all: EvaluateTrajectoryShadowing runs at
+// this tier and its result was written to the neighbour record and then dropped.
+//
+// ISOLATION.  Same contract as the RSU half: this reads flags that
+// UpdateVehicleNeighborRecord has already computed for its own purposes and adds
+// nothing to record.suspicionFlags, so vehicle_neighbor_table_log.csv,
+// rssi_verification_log.csv, the V2RSU reports built from those records and every
+// ML dataset are untouched.  Gated on MODE_LIGHTWEIGHT, so MODE_FULL never
+// reaches it.
+// ---------------------------------------------------------------------------
+static void
+RecordLwSsdVehicleTierFlag(uint32_t observerVehicleId,
+                           uint32_t claimedId,
+                           uint32_t observableSourceId,
+                           uint32_t recordSuspicionFlags)
+{
+    if (!g_secMetrics || lwScoringMode != 1u || !LightweightDecisionModeActive())
+        return;
+
+    uint32_t observableFlags;
+    if (lwOracleGate != 0u)
+    {
+        // Mirror of the RSU branch: behavioural bank as computed, plus the
+        // registry-miss stand-in for S^(out).  An OBU checks a claimed id against
+        // its own cached token registry exactly as an RSU does.
+        observableFlags = recordSuspicionFlags;
+        if (claimedId >= N_Vehicles)
+            observableFlags |= SUSPICION_ID_MISMATCH;
+    }
+    else
+    {
+        // Oracle-free: no identity-range test.  The record's own co-location bit
+        // came from the gated table, so re-derive both behavioural signatures from
+        // the g_lwUb* state instead, and keep only the never-gated bits from the
+        // record itself.
+        observableFlags = recordSuspicionFlags &
+                          (SUSPICION_RANGE_ANOMALY | SUSPICION_RSSI_DISTANCE_MISMATCH);
+        observableFlags |= GetLwUnbiasedRssiCoLocationFlags(observerVehicleId, claimedId);
+        observableFlags |= EvaluateLwUnbiasedTrajectoryShadowing(observerVehicleId,
+                                                                 claimedId,
+                                                                 observableSourceId);
+    }
+
+    observableFlags &= lwSsdSignatureMask;
+    if (lwSsdDropRssiDistMismatch != 0u)
+        observableFlags &= ~SUSPICION_RSSI_DISTANCE_MISMATCH;
+
+    observableFlags = ApplyTieredConfirmation(observableFlags, claimedId, observerVehicleId);
+    g_lwSsdObservedIds.insert(claimedId);
+    if (observableFlags != SUSPICION_NONE)
+    {
+        g_lwSsdFlagAttribution[claimedId] |= observableFlags;
+        g_secMetrics->RecordLwSsdFlag(claimedId);
+    }
+}
+
 // External linkage: GetSecuritySuite() in sybil_types.h calls this, so it cannot
 // have internal linkage (an inline function may not reference a static entity).
 bool
@@ -4992,6 +5768,22 @@ RecordLightweightDecision(uint32_t claimedId,
     if (!LightweightDecisionModeActive() || !g_secMetrics)
         return;
 
+    // SECOND ORACLE, suppressed under --lwOracleGate=0.  Every caller of this
+    // function picks its targets with IsOutOfRegistrySybilIdentity /
+    // IsRegistryMissClaimedIdentity, i.e. `claimedId >= N_Vehicles || realId !=
+    // claimedId` — the M5/M6 label itself.  The decision then inserts into
+    // m_explicitLightweightFlags, which hard-forces isFlagged=true for every later
+    // packet from that identity (sybil_metrics.h), so leaving it live would pin
+    // recall at ~1 however the behavioural bank scores.
+    //
+    // Only the ACCOUNTING is dropped.  This wrapper has no mitigation side effect —
+    // the packet was already rejected, and ShouldBlockLightweightGlobalRecord has
+    // already returned its verdict — so blocking, packet flow, PDR and M3 are
+    // unchanged.  Cost: the oracle-free run loses this path's M7/M8 contributions
+    // too, so report M7/M8 from a gated run.
+    if (LwUnbiasedScoringActive())
+        return;
+
     g_secMetrics->RecordExplicitLightweightDecision(
         claimedId,
         isActuallySybil,
@@ -5011,6 +5803,12 @@ RecordLightweightMiss(uint32_t claimedId,
                       const std::string& evidence)
 {
     if (!LightweightDecisionModeActive() || !g_secMetrics)
+        return;
+
+    // Counterpart of the suppression in RecordLightweightDecision: this records the
+    // FN half of the same ground-truth-selected decision, so it must go with it or
+    // the oracle-free matrix would keep the misses without the hits.
+    if (LwUnbiasedScoringActive())
         return;
 
     g_secMetrics->RecordExplicitLightweightMiss(claimedId,
@@ -5228,6 +6026,8 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
 
     uint32_t claimedId = tag.GetClaimedNodeId();
     RecordRssiCoLocationObservation(observerIndex, claimedId, signalNoise.signal);
+    if (LwUnbiasedScoringActive())
+        RecordLwUnbiasedRssiCoLocationObservation(observerIndex, claimedId, signalNoise.signal);
 
     if (observerIndex >= N_Vehicles)
     {
@@ -5244,11 +6044,26 @@ WifiMonitorSnifferRx(uint32_t observerIndex,
                     BsmCoreData bsm = bsmTag.GetBsm();
                     std::vector<uint8_t> payload = SerializeBsmForSigning(bsm);
                     std::vector<uint8_t> hash = CryptoSha3_256(payload);
+                    // Slice to the advertised lengths and dispatch on the SENDER's
+                    // scheme — see the matching fix in the RSU immediate-verify path.
+                    // This result becomes SUSPICION_INVALID_V2V_SIGNATURE in
+                    // RecordComputedDetectionEvidence below, so calling the FN-DSA
+                    // verifier on an ECDSA-signed beacon made that flag fire on 40.5%
+                    // of LEGITIMATE vehicles in the classical (lightweight) arm — the
+                    // single source of false positives in the LW-SSD bank.
+                    // MODE_FULL unaffected: SUITE_PQC still takes the FN-DSA branch.
+                    const std::size_t eKeyLen =
+                        std::min<std::size_t>(sigTag.keyLen, V2VSignatureTag::KEY_BYTES);
+                    const std::size_t eSigLen =
+                        std::min<std::size_t>(sigTag.sigLen, V2VSignatureTag::SIG_BYTES);
                     std::vector<uint8_t> pubKey(sigTag.pub_key,
-                                                sigTag.pub_key + V2VSignatureTag::KEY_BYTES);
+                                                sigTag.pub_key + eKeyLen);
                     std::vector<uint8_t> sigBytes(sigTag.sig,
-                                                  sigTag.sig + V2VSignatureTag::SIG_BYTES);
-                    sigValid = CryptoFnDsa1024Verify(pubKey, hash, sigBytes);
+                                                  sigTag.sig + eSigLen);
+                    sigValid =
+                        (sigTag.scheme == static_cast<uint8_t>(SUITE_CLASSICAL))
+                            ? CryptoEcdsaVerify(pubKey, hash, sigBytes)
+                            : CryptoFnDsa1024Verify(pubKey, hash, sigBytes);
                 }
 
 
@@ -6631,6 +7446,36 @@ DistanceBetween(const Vector& a, const Vector& b)
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+// M10 wall-clock for MODE_FULL's RSU-tier detection cost (LW-SSD suspicion
+// computation + weighted consensus, confirmed to both execute every cycle in
+// M_F).  RAII so the measured interval covers every early-return path inside
+// RecordComputedDetectionEvidence, not just the one that reaches consensus.
+struct M10FullModeTimer
+{
+    bool active;
+    std::chrono::high_resolution_clock::time_point start;
+    uint32_t rsuIndex;
+    double   nowSec;
+
+    M10FullModeTimer(bool isActive, uint32_t rsu, double t)
+        : active(isActive), rsuIndex(rsu), nowSec(t)
+    {
+        if (active)
+            start = std::chrono::high_resolution_clock::now();
+    }
+
+    ~M10FullModeTimer()
+    {
+        if (!active || !g_secMetrics)
+            return;
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - start)
+                        .count();
+        g_secMetrics->RecordFullModeDetectionCost(nowSec, N_Vehicles + rsuIndex,
+                                                   "RSU", ms);
+    }
+};
+
 static void
 RecordComputedDetectionEvidence(uint32_t rsuIndex,
                                 const SybilPacketTag& tag,
@@ -6643,6 +7488,9 @@ RecordComputedDetectionEvidence(uint32_t rsuIndex,
         return;
     if (rsuIndex >= N_RSUs || rsuIndex >= g_rsuNodes.GetN())
         return;
+
+    M10FullModeTimer m10Timer(FullCryptoMechanismActive(), rsuIndex,
+                              Simulator::Now().GetSeconds());
 
     ComputedDetectionEvidenceRecord rec;
     rec.rsuId = rsuIndex;
@@ -6707,6 +7555,78 @@ RecordComputedDetectionEvidence(uint32_t rsuIndex,
         SignWithCurrentRsuKeyHex(rsuIndex,
                                  rec.evidenceVectorHashHex + "|" +
                                      std::to_string(rec.revocationTimestamp));
+
+    // ---------------------------------------------------------------------------
+    // LW-SSD scoring feed (MODE_LIGHTWEIGHT only — M_F is bit-identical either way).
+    //
+    // The report defines D_LW as an OR-gate over this suspicion bank, but the bank
+    // cannot be scored as-is: SUSPICION_ID_MISMATCH is set partly by
+    //     rec.realVehicleId != rec.claimedVehicleId
+    // which is SIMULATION GROUND TRUTH — the exact predicate the M5/M6 label uses
+    // (isActuallySybil, sybil_metrics.h). Scoring that bit yields MCC = 1.0 by
+    // construction. SybilDetector::ComputeConfidence avoids it deliberately and says
+    // so in its own comment.
+    //
+    // So the scoring feed uses the OBSERVABLE subset: every behavioural signature,
+    // plus only the registry-miss half of ID_MISMATCH (claimedVehicleId >= N_Vehicles
+    // is something an RSU can actually check against its token registry).
+    //
+    // rec.suspicionFlags itself is NOT modified here — the consensus/revocation path,
+    // the evidence CSV, the IPFS records and M_F behaviour all see the original bank.
+    //
+    // --lwOracleGate=0 (oracle-free) takes the branch below instead.  claimedVehicleId
+    // >= N_Vehicles is only "observable" on the assumption that the RSU can separate
+    // registered from unregistered identities, but in this simulation EVERY variant
+    // fabricates ids >= N_Vehicles + 20 (sybil_attacks.h), so that predicate IS the
+    // M5/M6 label and D_LW cannot score below MCC ~1 no matter what the behavioural
+    // rules do.  The oracle-free branch drops the identity-range test entirely and
+    // scores the behavioural bank alone, recomputed over the g_lwUb* windows that
+    // legitimate identities also populate.  Both branches write only to
+    // RecordLwSsdFlag.
+    // ---------------------------------------------------------------------------
+    if (g_secMetrics && lwScoringMode == 1u && LightweightDecisionModeActive())
+    {
+        uint32_t observableFlags;
+        if (lwOracleGate != 0u)
+        {
+            observableFlags = rec.suspicionFlags & ~SUSPICION_ID_MISMATCH;
+            if (rec.claimedVehicleId >= N_Vehicles)
+                observableFlags |= SUSPICION_ID_MISMATCH;   // registry miss IS observable
+        }
+        else
+        {
+            // Keep only the bits that were never identity-range gated to begin with,
+            // then re-derive the two RSU-tier behavioural signatures without the gate.
+            observableFlags = rec.suspicionFlags &
+                              (SUSPICION_INVALID_V2V_SIGNATURE |
+                               SUSPICION_RANGE_ANOMALY |
+                               SUSPICION_RSSI_DISTANCE_MISMATCH);
+            observableFlags |= GetLwUnbiasedRssiCoLocationFlags(observerIndex,
+                                                               rec.claimedVehicleId);
+            observableFlags |= EvaluateTemporalBurstSignature(
+                rsuIndex,
+                rec.claimedVehicleId,
+                rec.observationTime,
+                rec.bsm.positionX,
+                rec.bsm.positionY,
+                g_lwUbRsuFirstSeenClaimedIds,
+                g_lwUbRsuTemporalNewIdEvents,
+                "LW_SSD_ORACLE_FREE",
+                /*applyRegistryGate=*/false);
+        }
+        observableFlags &= lwSsdSignatureMask;
+        if (lwSsdDropRssiDistMismatch != 0u)
+            observableFlags &= ~SUSPICION_RSSI_DISTANCE_MISMATCH;
+
+        observableFlags = ApplyTieredConfirmation(observableFlags,
+                                                  rec.claimedVehicleId, observerIndex);
+        g_lwSsdObservedIds.insert(rec.claimedVehicleId);
+        if (observableFlags != SUSPICION_NONE)
+        {
+            g_lwSsdFlagAttribution[rec.claimedVehicleId] |= observableFlags;
+            g_secMetrics->RecordLwSsdFlag(rec.claimedVehicleId);
+        }
+    }
 
     // A1 Λ bookkeeping (mode 7 only — zero effect on modes 4/5/6).  This MUST run
     // before the SUSPICION_NONE early-return below: the unflagged observations are
@@ -6821,6 +7741,17 @@ ApplyLlmRevoke(PendingLlmRevoke r)
 {
     RevokeEntityCurrentCrypto(r.entityType, r.entityId, r.authorityId,
                               r.attackVariant, r.evidenceCids, r.aggregatedHashHex);
+}
+
+// M10 cost sink for the FM-SDP half of M_F's Ĉ_R (supervisor Q23/Q24 follow-up).
+// One row per completed scoring window; the LW-SSD half is recorded separately by
+// M10FullModeTimer, so metrics_M10_complexity.csv carries BOTH components of the
+// combined cost M_F actually incurs, tagged and never pre-summed.
+static void
+RecordLLMWindowCost(double simTimeSec, double wallClockMs, uint32_t verdictCount)
+{
+    if (g_secMetrics)
+        g_secMetrics->RecordFullModeLlmCost(simTimeSec, wallClockMs, verdictCount);
 }
 
 static void
@@ -11231,6 +12162,13 @@ UpdateVehicleNeighborRecord(uint32_t observerVehicleId,
     record.trajShadowCompared = GetTrajectoryShadowingCompared(observerVehicleId, observedClaimedId);
     record.dirty = true;
 
+    // OBU half of the Eq 3.13 OR-gate.  Reads the flags computed above; adds nothing
+    // to record.suspicionFlags, so everything written below this line is unchanged.
+    RecordLwSsdVehicleTierFlag(observerVehicleId,
+                               observedClaimedId,
+                               observableSourceId,
+                               record.suspicionFlags);
+
     LogRssiVerification(observerVehicleId, observedClaimedId,
                         record.observedRealId, record);
 
@@ -13024,14 +13962,31 @@ LogReceivedPacket(const std::string& receiverRole,
         {
             std::vector<uint8_t> payload  = SerializeBsmForSigning(bsm);
             std::vector<uint8_t> hash     = CryptoSha3_256(payload);
-            std::vector<uint8_t> pubKey(sigTag.pub_key,
-                                        sigTag.pub_key + V2VSignatureTag::KEY_BYTES);
-            std::vector<uint8_t> sigBytes(sigTag.sig,
-                                          sigTag.sig   + V2VSignatureTag::SIG_BYTES);
+            // Slice to the ADVERTISED lengths, not the buffer capacity. The tag is
+            // sized for FN-DSA-1024 (1793 B key / 1280 B sig) but a classical beacon
+            // fills only the first 64/64 B, and the trailing zero padding would fail
+            // verification on its own.
+            const std::size_t vKeyLen =
+                std::min<std::size_t>(sigTag.keyLen, V2VSignatureTag::KEY_BYTES);
+            const std::size_t vSigLen =
+                std::min<std::size_t>(sigTag.sigLen, V2VSignatureTag::SIG_BYTES);
+            std::vector<uint8_t> pubKey(sigTag.pub_key, sigTag.pub_key + vKeyLen);
+            std::vector<uint8_t> sigBytes(sigTag.sig,   sigTag.sig     + vSigLen);
             if (CryptoMechanismActive())
             {
                 auto __t0 = std::chrono::high_resolution_clock::now();
-                v2vSigValid = CryptoFnDsa1024Verify(pubKey, hash, sigBytes);
+                // Dispatch on the scheme the SENDER used — the same rule the batched
+                // vehicle-side path in FlushBeaconVerificationWindow already applies.
+                // This branch called CryptoFnDsa1024Verify unconditionally, so in the
+                // classical (lightweight) arm every ECDSA-signed beacon failed, and
+                // 40.5% of SUSPICION_INVALID_V2V_SIGNATURE flags landed on LEGITIMATE
+                // vehicles — the sole source of false positives in the LW-SSD bank.
+                // MODE_FULL is unaffected: under SUITE_PQC this takes the FN-DSA branch
+                // exactly as before, and there keyLen/sigLen equal the buffer capacity.
+                v2vSigValid =
+                    (sigTag.scheme == static_cast<uint8_t>(SUITE_CLASSICAL))
+                        ? CryptoEcdsaVerify(pubKey, hash, sigBytes)
+                        : CryptoFnDsa1024Verify(pubKey, hash, sigBytes);
                 auto __t1 = std::chrono::high_resolution_clock::now();
                 double __ms = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
                 std::cout << "[Latency] V2V_BEACON  " << receiverRole << "/" << receiverId
@@ -13218,7 +14173,13 @@ ReceivePacket(std::string receiverRole, uint32_t receiverId,
                           + 10.0 * RssiSybilDetector::kPathLossExp
                           * std::log10(dist);
                 rssiDbm = RssiSybilDetector::kTxPowerDbm - pl;
-                static std::mt19937 rng_r(std::random_device{}());
+                // Seeded from --seed, NOT std::random_device: this draw feeds the
+                // Rayleigh term on the RSSI handed to RssiSybilDetector, so an
+                // entropy seed here made SUSPICION_RSSI_DISTANCE_MISMATCH -- and
+                // therefore evidence rows, revocations and traffic -- differ on
+                // every run of an identical command line, bypassing the
+                // RngSeedManager::SetSeed(g_runSeed) that exists for exactly this.
+                static std::mt19937 rng_r(static_cast<std::mt19937::result_type>(g_runSeed));
                 static std::uniform_real_distribution<double> uni(0.0, 1.0);
                 double sigma_ch = 0.7071;
                 double rayleighGain =
@@ -14399,6 +15360,9 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getStr("ablateAnalyzer",                     ablateAnalyzer);
     getStr("ablateStream",                       ablateStream);
     getStr("ablateLlm",                          ablateLlm);
+    getStr("llmConsensusConfig",                 llmConsensusConfig);
+    getDouble("mlflTau",                         mlflTau);
+    getUint("txgbMinBeacons",                    txgbMinBeacons);
     getDouble("detectLatency",                   detectLatencySec);
     getDouble("vehicleSpacing",                  vehicleSpacing);
     getDouble("minVehicleSpeed",                 minVehicleSpeed);
@@ -14534,9 +15498,12 @@ main(int argc, char* argv[])
     cmd.AddValue("llmMaxCandidates", "Full-mode throughput: max identities/window (top-K by ŷ_ens) adjudicated by the LLM; raise for dense-attack runs", llmMaxCandidates);
     cmd.AddValue("llmMaxIdentities", "Full-mode throughput: hard ceiling on identities considered per window (0 = none)", llmMaxIdentities);
     cmd.AddValue("llmDetectInterval", "Full-mode: sim-seconds between LLM detection windows (default 10; lower it for short runs so every attack phase gets scored)", llmDetectInterval);
-    cmd.AddValue("ablateAnalyzer", "Ablation B1: drop one vehicle-tier analyzer from the Eq 3.18 fusion head — trust|rssi|temp (empty = full head)", ablateAnalyzer);
+    cmd.AddValue("ablateAnalyzer", "Ablation B1 / D-stack: drop vehicle-tier analyzer(s) from the Eq 3.18 fusion head — a comma-separated subset of trust|rssi|temp (e.g. 'rssi,trust' = temporal-GRU only; empty = full head)", ablateAnalyzer);
     cmd.AddValue("ablateStream", "Ablation B2: pin the Eq 3.20 RSU ensemble to one evidence stream — fl_only|temp_only|rssi_only (empty = jointly-tuned lambda)", ablateStream);
     cmd.AddValue("ablateLlm", "Ablation C1: drop the LLM tier and threshold Eq 3.20 y_hat_ens directly — mlfl_only (empty = full LLM multi-agent tier)", ablateLlm);
+    cmd.AddValue("llmConsensusConfig", "D-stack D5/D6: path to a consensus config JSON selecting the Eq 3.21 LoRA adapter set (empty = frozen Stage-2 CENTRALLY trained adapters = D5; a Stage-3 LLM-FL config = D6)", llmConsensusConfig);
+    cmd.AddValue("mlflTau", "D-stack: explicit y_hat_ens decision threshold for the ablateLlm=mlfl_only conditions; each rung needs its own calibrated tau (negative = let the daemon calibrate)", mlflTau);
+    cmd.AddValue("txgbMinBeacons", "D-stack: RSU temporal-XGB per-window minimum deduped-beacon count (0 = the trained default of 2; 1 restores p_bar_temp coverage for short-lived v3 rotation identities)", txgbMinBeacons);
     // ── Group E: security-infrastructure ablations (§5.2.5) ────────────────
     cmd.AddValue("ablateMitigation", "Ablation E1(iii): 'none' = detection still fires and is scored but Algorithm 4 RevokeEntity is never called (Sybil identities persist). Empty = full mitigation pipeline", ablateMitigation);
     cmd.AddValue("rsuRevocationThreshold", "Ablation E1/E2: t in the t-of-n RSU co-authorisation of Eq 3.47, decoupled from controllerRegistrationThreshold. 1 = single-signer. 0 = legacy coupling", rsuRevocationThreshold);
@@ -14571,6 +15538,20 @@ main(int argc, char* argv[])
     cmd.AddValue("rssiStreak",         "Consecutive windows to confirm Sybil [default 2]",  rssiStreakRequired);
     cmd.AddValue("sweepMode",           "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
     cmd.AddValue("quietMode",           "Suppress all console output; CSV writes are unaffected", quietMode);
+    cmd.AddValue("beaconChannelMode",   "Beacon channel policy: 0=legacy (one beacon egresses all 7 DSRC channels, 7.33x measured duplication), 1=CCH only (ch178, DSRC/WAVE standard), 2=spread one beacon per channel round-robin [default 2]", beaconChannelMode);
+    cmd.AddValue("evidenceJsonFiles",   "Write the per-event evidence JSON sidecar under ipfs-computed-detection-evidence/ (216k files / 2.5GB per 300s run). false keeps the identical record in computed_detection_evidence_log.csv and leaves all metrics unchanged [default true]", g_evidenceJsonFiles);
+    cmd.AddValue("lwScoringMode",       "Which detector the LIGHTWEIGHT tier's M5/M6 matrix scores: 0=legacy ComputeConfidence (registry-miss + arrival-rate heuristic), 1=the report's LW-SSD Eq 3.13 OR-gate over the observable suspicion bank. MODE_LIGHTWEIGHT only; MODE_FULL is unaffected either way [default 1]", lwScoringMode);
+    cmd.AddValue("lwTierAMask",         "Signatures that flag immediately; all others need lwTierBMinConfirm distinct witnesses [default 80 = temporal|trajectory]", lwTierAMask);
+    cmd.AddValue("lwTierBMinConfirm",   "Distinct observers that must witness a tier-B signature before it counts; 1 = disabled (published behaviour) [default 1]", lwTierBMinConfirm);
+    cmd.AddValue("lwFlagTtlSec",        "Sliding window (s) over which an LW-SSD identity flag stays valid; 0 = latch forever (published behaviour). Fixes the sticky-flag decay that drove FPR to 0.53 over 180s. LW-SSD scoring only [default 0]", lwFlagTtlSec);
+    cmd.AddValue("lwSsdSignatureMask", "Bitmask of SUSPICION_* bits allowed into the D_LW disjunction, for per-signature ablation (colocation=32, temporal_burst=16, trajectory=64, rssi_dist_mismatch=256). LW-SSD scoring feed only [default all bits]", lwSsdSignatureMask);
+    cmd.AddValue("lwCoLocWindowSec",    "Coincidence window (s) for the ORACLE-FREE co-location rule only; widening it lets more observers vote on each pair, which is what gives the Eq 3.6 for-all quantifier force [default 0.020]", lwCoLocWindowSec);
+    cmd.AddValue("lwSsdDropRssiDistMismatch", "Drop SUSPICION_RSSI_DISTANCE_MISMATCH from the D_LW disjunction (measured identity precision 0.000 — pure FP channel): 0=keep (published), 1=drop [default 0]", lwSsdDropRssiDistMismatch);
+    cmd.AddValue("lwCoLocSigmaDb",      "Eq 3.6 sigma_ch (dB) for the ORACLE-FREE co-location rule only [default 2.0]", lwCoLocSigmaDb);
+    cmd.AddValue("lwCoLocGamma",        "Eq 3.6 gamma_co kernel acceptance floor, oracle-free rule only [default 0.6]", lwCoLocGamma);
+    cmd.AddValue("lwCoLocMinObservers", "Observers that must agree before an oracle-free co-location pair is flagged [default 2]", lwCoLocMinObservers);
+    cmd.AddValue("lwCoLocMaxDisagree",  "Dissenting observers tolerated before an oracle-free co-location pair is rejected; 0 = the report's strict for-all over k in O [default 0]", lwCoLocMaxDisagree);
+    cmd.AddValue("lwOracleGate",        "Whether LW-SSD scoring may use the identity-range test claimedId>=N_Vehicles as its S^(out) token-registry stand-in: 1=yes (published behaviour), 0=oracle-free (drop it and score the behavioural signatures alone, recomputed over windows legitimate identities also populate). Requires lwScoringMode=1; MODE_LIGHTWEIGHT scoring only — rec.suspicionFlags, the evidence logs, consensus/revocation, the ML datasets and MODE_FULL are bit-identical either way [default 1]", lwOracleGate);
     cmd.AddValue("ipfsPublish",         "Fork `ipfs add` per evidence/isolation/revocation record [default false]. Off = local:// CIDs, no per-record subprocess fork (prevents the high-percentage fork/OOM crash)", g_ipfsPublishEnabled);
     cmd.AddValue("outputDir",           "Base directory for per-run CSV logs (must exist) [default sybil-attack/outputs]", outputDir);
     // Dataset generation v2
@@ -14858,6 +15839,7 @@ main(int argc, char* argv[])
     g_llmRevocationTrack.clear();
     g_groundTruthSybilIds.clear();
     g_rsuRevokedVehicleBlacklist.assign(N_RSUs, std::set<uint32_t>());
+    g_rsuAppliedRevocationManifests.assign(N_RSUs, std::set<std::string>());
     g_rsuRevocationDroppedPackets = 0;
     g_rsuRevocationDroppedIds.clear();
     g_vehicleRevokedIdBlacklist.assign(N_Vehicles, std::set<uint32_t>());
@@ -15013,7 +15995,9 @@ main(int argc, char* argv[])
            << "  \"sybil_attack_percentage\":" << sybil_attack_percentage << ",\n"
            << "  \"N_Vehicles\": "      << N_Vehicles             << ",\n"
            << "  \"N_RSUs\": "          << N_RSUs                 << ",\n"
-           << "  \"N_Controllers\": "   << N_Controllers          << "\n"
+           << "  \"N_Controllers\": "   << N_Controllers          << ",\n"
+           << "  \"lw_scoring_mode\": " << lwScoringMode          << ",\n"
+           << "  \"lw_oracle_gate\": "  << lwOracleGate           << "\n"
            << "}\n";
     }
 
@@ -15046,6 +16030,10 @@ main(int argc, char* argv[])
     // went to the run folder, so every per-run M1-M4 CSV was headerless and could
     // not be read back by name.
     InitializeMetricsCsvFiles();
+    // Adaptive-mode M5/M6 fix: make the metrics gates follow the Eq 3.11 selector's
+    // CURRENT choice instead of the run-level mode. Identity for modes 4/5/6, so
+    // non-adaptive runs are unchanged. Must be set BEFORE Initialize.
+    g_effectiveModeHook = &EffectiveMode;
     g_secMetrics->Initialize(N_Vehicles, N_RSUs, solution_mode);
 
     // -----------------------------------------------------------------------
@@ -15514,6 +16502,35 @@ main(int argc, char* argv[])
               << ", Percentage=" << sybil_attack_percentage << "%"
               << ", AttackerLevel=" << sybil_attacker_level << std::endl;
 
+    // LW-SSD scoring banner.  --lwOracleGate=0 changes what the M5/M6 matrix means,
+    // so say so loudly, and say equally loudly when it was asked for but is inert.
+    if (lwOracleGate == 0u)
+    {
+        if (solution_mode != MODE_LIGHTWEIGHT && solution_mode != MODE_ADAPTIVE)
+        {
+            std::cout << "[LW-SSD] WARNING: --lwOracleGate=0 IGNORED — it applies to the "
+                         "lightweight scoring feed only, and solution_mode=" << solution_mode
+                      << " is not 4 (lightweight) or 7 (adaptive). This run is unchanged."
+                      << std::endl;
+        }
+        else if (lwScoringMode != 1u)
+        {
+            std::cout << "[LW-SSD] WARNING: --lwOracleGate=0 IGNORED — it requires "
+                         "--lwScoringMode=1 (the Eq 3.13 OR-gate); got "
+                      << lwScoringMode << "." << std::endl;
+        }
+        else
+        {
+            std::cout << "[LW-SSD] ORACLE-FREE scoring ENABLED. D_LW drops the "
+                         "claimedId>=N_Vehicles identity-range test and scores the "
+                         "behavioural bank alone (co-location, temporal burst, range "
+                         "anomaly, RSSI-distance mismatch, invalid V2V signature). "
+                         "M5/M6/M7/M8 are NOT comparable with a --lwOracleGate=1 run; "
+                         "everything outside the scoring feed is bit-identical."
+                      << std::endl;
+        }
+    }
+
     if (g_activeAttackType != ATTACK_NONE)
     {
         std::cout << "Attacker vehicles: ";
@@ -15566,6 +16583,9 @@ main(int argc, char* argv[])
                   << " max_llm_candidates=" << llmMaxCandidates
                   << " detect_latency=" << detectLatencySec << "s"
                   << " -> verdicts drive isolation+manifest+blacklist\n" << std::flush;
+        // M10: register the FM-SDP cost sink for BOTH branches (self-test included) so a
+        // window's cost is never silently unmeasured.
+        LLMRealtimeDetector::SetCostSink(&RecordLLMWindowCost);
         if (p4SelfTestRealId > 0)
         {
             // P4 FP-safety self-test: skip the daemon, drive the sink with a synthetic real-id
@@ -15584,11 +16604,33 @@ main(int argc, char* argv[])
             LLMRealtimeDetector::SetMaxIdentities(static_cast<int>(llmMaxIdentities));
             // B1/B2 ablations. Reject a typo loudly: silently falling back to the full
             // pipeline would make a degraded condition indistinguishable from the baseline.
-            if (!ablateAnalyzer.empty() && ablateAnalyzer != "trust"
-                && ablateAnalyzer != "rssi" && ablateAnalyzer != "temp")
+            // B1 passes ONE block; the D-stack ladder passes a comma-separated subset
+            // ("rssi,trust" = D2, temporal-GRU only). Dropping all three is refused —
+            // nothing would survive for the Eq 3.18 head to renormalise onto.
+            if (!ablateAnalyzer.empty())
             {
-                NS_FATAL_ERROR("--ablateAnalyzer must be trust|rssi|temp (got '"
-                               << ablateAnalyzer << "')");
+                std::set<std::string> dropped;
+                std::stringstream ss(ablateAnalyzer);
+                std::string tok;
+                while (std::getline(ss, tok, ','))
+                {
+                    tok.erase(0, tok.find_first_not_of(" \t"));
+                    tok.erase(tok.find_last_not_of(" \t") + 1);
+                    if (tok.empty())
+                        continue;
+                    if (tok != "trust" && tok != "rssi" && tok != "temp")
+                    {
+                        NS_FATAL_ERROR("--ablateAnalyzer takes a comma-separated subset of "
+                                       "trust|rssi|temp (got '" << ablateAnalyzer
+                                       << "', bad token '" << tok << "')");
+                    }
+                    dropped.insert(tok);
+                }
+                if (dropped.size() >= 3)
+                {
+                    NS_FATAL_ERROR("--ablateAnalyzer='" << ablateAnalyzer << "' drops every "
+                                   "vehicle-tier phi-block; the Eq 3.18 head would be empty");
+                }
             }
             if (!ablateStream.empty() && ablateStream != "fl_only"
                 && ablateStream != "temp_only" && ablateStream != "rssi_only")
@@ -15601,17 +16643,39 @@ main(int argc, char* argv[])
                 NS_FATAL_ERROR("--ablateLlm must be mlfl_only (got '"
                                << ablateLlm << "')");
             }
-            if (!ablateAnalyzer.empty() || !ablateStream.empty() || !ablateLlm.empty())
+            // D5/D6: the adapter-set selector. Fail loudly on a missing file — silently
+            // falling back to the central adapters would make D6 a duplicate of D5.
+            if (!llmConsensusConfig.empty())
+            {
+                std::ifstream probe(llmConsensusConfig.c_str());
+                if (!probe.good())
+                {
+                    NS_FATAL_ERROR("--llmConsensusConfig='" << llmConsensusConfig
+                                   << "' does not exist or is unreadable");
+                }
+            }
+            if (!ablateAnalyzer.empty() || !ablateStream.empty() || !ablateLlm.empty()
+                || !llmConsensusConfig.empty() || txgbMinBeacons > 0 || mlflTau >= 0.0)
             {
                 std::cout << "[LLMRealtime] ABLATION active:"
                           << " analyzer_dropped=" << (ablateAnalyzer.empty() ? "none" : ablateAnalyzer)
                           << " ensemble_stream=" << (ablateStream.empty() ? "tuned-lambda" : ablateStream)
                           << " llm_tier=" << (ablateLlm.empty() ? "full-3-agent-consensus" : ablateLlm)
+                          << " llm_adapters=" << (llmConsensusConfig.empty()
+                                                  ? "central-stage2-frozen" : llmConsensusConfig)
+                          << " txgb_min_beacons=" << (txgbMinBeacons > 0 ? std::to_string(txgbMinBeacons)
+                                                                         : std::string("default(2)"))
+                          << " mlfl_tau=" << (mlflTau >= 0.0 ? std::to_string(mlflTau)
+                                                             : std::string("daemon-calibrated"))
                           << "\n" << std::flush;
             }
             LLMRealtimeDetector::SetAblateAnalyzer(ablateAnalyzer);
             LLMRealtimeDetector::SetAblateStream(ablateStream);
             LLMRealtimeDetector::SetAblateLlm(ablateLlm);
+            LLMRealtimeDetector::SetLlmConsensusConfig(llmConsensusConfig);
+            LLMRealtimeDetector::SetTxgbMinBeacons(static_cast<int>(txgbMinBeacons));
+            if (mlflTau >= 0.0)
+                LLMRealtimeDetector::SetMlflTau(std::to_string(mlflTau));
             LLMRealtimeDetector::SetDetectLatency(detectLatencySec);
             LLMRealtimeDetector::Init(llmDetectInterval);
         }
@@ -15696,8 +16760,39 @@ main(int argc, char* argv[])
                             &PeriodicRevocationBulletinResync);
     }
 
+    // --quietMode: detach std::cout for the duration of the event loop only.
+    //
+    // A 300 s run emits ~1.3 GB of per-packet console trace; a sample of the M_L
+    // log shows [RECV] 1,595,377 / [RssiDistanceMismatch] 570,418 / [Latency]
+    // 569,163 / [SEND] 351,683 lines — >99% of the volume, all inside Run().
+    //
+    // Detaching the streambuf puts cout in badbit, so basic_ostream::sentry
+    // reports not-good and every operator<< returns BEFORE formatting. That is
+    // why this is cheaper than redirecting to /dev/null, which still pays the
+    // integer/float formatting cost on every one of those millions of lines.
+    //
+    // Scoped to Run() deliberately: the [SecuritySuite]/[Solution] banners above
+    // and the metrics summary below still print, so the log stays self-describing.
+    // std::cerr is untouched — warnings and FATAL-ish lines are never suppressed.
+    std::streambuf* savedCoutBuf = 0;
+    if (quietMode)
+    {
+        std::cout << "[Quiet] --quietMode=true: per-event console trace suppressed "
+                     "for the simulation loop (CSV/log writes are unaffected)."
+                  << std::endl;
+        savedCoutBuf = std::cout.rdbuf(0);
+    }
+
     Simulator::Run();
+
+    if (savedCoutBuf)
+    {
+        std::cout.rdbuf(savedCoutBuf);
+        std::cout.clear();
+    }
     Simulator::Destroy();
+    WriteLwSsdFlagAttributionCsv();
+    WriteLwSsdIdentityMatrixCsv();
     if (v6DetectActive)
         ControllerDetectionFinalize(simTime, N_Controllers);
     if ((FullSolutionModeActive() || AdaptiveSolutionModeActive()) && p4SelfTestRealId == 0)
@@ -15795,7 +16890,14 @@ main(int argc, char* argv[])
             << ",Mean Xi(e) = t_contain - t_inject over confirmed-Sybil revocations "
                "(t_inject = g_attackOnsetTime)\n"
             << "seed," << g_runSeed
-            << ",RNG seed for reproducible attacker selection and fanout draws\n";
+            << ",RNG seed for reproducible attacker selection and fanout draws\n"
+            << "ecdsa_verify_calls," << g_ecdsaVerifyCalls
+            << ",Total CryptoEcdsaVerify invocations (classical-mode V2V beacon checks)\n"
+            << "ecdsa_verify_errors," << g_ecdsaVerifyErrors
+            << ",OpenSSL-internal errors during ECDSA verify (distinct from genuine "
+               "invalid signatures) -- a nonzero rate here means invalid_v2v_signature "
+               "revocations may include environment/resource faults, not real forged "
+               "beacons; see [CryptoError] lines in the run log for detail\n";
     }
 
     // RSU-tier revocation enforcement: how much attack traffic the blacklist actually

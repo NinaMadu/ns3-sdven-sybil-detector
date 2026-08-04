@@ -1976,6 +1976,83 @@ CreateSenderSocket(Ptr<Node> node)
     return Socket::CreateSocket(node, UdpSocketFactory::GetTypeId());
 }
 
+// ---------------------------------------------------------------------------
+// Beacon channel policy — fixes the 7x broadcast duplication.
+//
+// Every node carries 7 wifi devices (ch172..184), each on its own YansWifiChannel
+// and its own /22 subnet.  A beacon goes to the LIMITED broadcast address
+// 255.255.255.255, and UdpSocketImpl::DoSendTo handles that case itself — it
+// never reaches Ipv4L3Protocol's routing.  Its loop is:
+//
+//     for (uint32_t i = 0; i < ipv4->GetNInterfaces (); i++) {
+//         if (m_boundnetdevice && ipv4->GetNetDevice (i) != m_boundnetdevice)
+//             continue;                       // <-- the ONLY filter it honours
+//         m_udp->Send (p->Copy (), addri, dest, ...);
+//     }
+//
+// With no bound net device that is SEVEN frames per SendTo, one per channel, and
+// every neighbour receives the same beacon up to 7 times.  Measured duplication:
+// 7.33x on the 300 s M_L run (9,632,917 raw receptions -> 1,314,719 unique).
+//
+// THE FIX needs no ns-3 change: BindToNetDevice() on the chosen wifi device, so
+// the loop above skips the other six.  Note that binding the socket's SOURCE
+// ADDRESS does NOT work — DoSendTo overwrites the source per interface with that
+// interface's own primary address and ignores m_endPoint's local address on this
+// path.  Receivers stay bound to Ipv4Address::GetAny(), so they still hear the
+// beacon on whichever of their devices is tuned to that channel.
+//
+//   0 = legacy   : unbound source -> 7 copies (pre-fix behaviour, for A/B runs)
+//   1 = cch_only : every beacon on ch178, the DSRC/WAVE control channel
+//   2 = spread   : beacon k on device (k % 7) — all 7 channels stay in use, but
+//                  each beacon is transmitted exactly once (default)
+//
+// Device install order in Sybil-Developing-Improved.cc is
+//   0=ch178(CCH) 1=ch172 2=ch174 3=ch176 4=ch180 5=ch182 6=ch184, loopback=7.
+// ---------------------------------------------------------------------------
+static const uint32_t kNumWifiChannels = 7u;
+extern uint32_t beaconChannelMode;
+
+inline uint32_t
+BeaconDeviceIndexFor(uint32_t sequenceNumber)
+{
+    if (beaconChannelMode == 1u)
+        return 0u;                                   // ch178 CCH
+    return sequenceNumber % kNumWifiChannels;        // spread
+}
+
+// Returns true when the socket was successfully pinned to one channel. On any
+// failure it returns false and leaves the socket unbound, i.e. it degrades to
+// the legacy 7-copy behaviour rather than silently dropping the beacon.
+inline bool
+BindSenderToChannel(Ptr<Socket> socket, uint32_t sequenceNumber)
+{
+    if (beaconChannelMode == 0u || !socket)
+        return false;
+    Ptr<Node> node = socket->GetNode();
+    if (!node)
+        return false;
+    const uint32_t devIndex = BeaconDeviceIndexFor(sequenceNumber);
+    if (devIndex >= node->GetNDevices())
+        return false;
+    Ptr<NetDevice> dev = node->GetDevice(devIndex);
+    if (!dev)
+        return false;
+    // Guard against picking the loopback (added by InternetStackHelper after the
+    // 7 wifi devices) if the device ordering ever changes.
+    Ptr<Ipv4> ip = node->GetObject<Ipv4>();
+    if (ip)
+    {
+        int32_t ifIndex = ip->GetInterfaceForDevice(dev);
+        if (ifIndex < 0 || ip->GetNAddresses(static_cast<uint32_t>(ifIndex)) == 0)
+            return false;
+        if (ip->GetAddress(static_cast<uint32_t>(ifIndex), 0).GetLocal() ==
+            Ipv4Address("127.0.0.1"))
+            return false;
+    }
+    socket->BindToNetDevice(dev);
+    return true;
+}
+
 // Defined in Sybil-Developing-Improved.cc.  True when this vehicle holds a revocation
 // bulletin covering claimedId and will therefore drop the packet on arrival.  Exposed as
 // a predicate rather than the blacklist container so this header stays independent of the
@@ -1986,6 +2063,18 @@ inline void
 SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
                  uint16_t destinationPort, Ptr<TxInfo> tx)
 {
+    // Source-side revocation suppression: once a claimed identity's
+    // revocation manifest has completed, it never transmits again, from
+    // any node, on any channel -- see IsClaimedIdGloballyRevoked in
+    // sybil_metrics.h for why this is the backstop to the vehicle-tier
+    // bulletin blacklist rather than a replacement for it.
+    if (tx->messageType == static_cast<uint32_t>(V2V_BEACON) &&
+        tx->realNodeId != tx->claimedNodeId &&
+        IsClaimedIdGloballyRevoked(tx->claimedNodeId))
+    {
+        return;
+    }
+
     // Charge the security bytes as real airtime.  Under SUITE_NONE this adds 0
     // and the packet is exactly the plain-network baseline size; the classical
     // arm adds 128 B to a beacon and the PQC arm 3073 B.  Without this the key
@@ -2073,6 +2162,14 @@ SendTaggedPacket(Ptr<Socket> socket, Ipv4Address destinationIp,
                       << "  sign  0.000\n";
         }
     }
+    // Pin V2V beacons to ONE channel instead of letting the limited-broadcast
+    // path fan them out across all 7 devices. Applied here rather than at each
+    // call site so the legit-vehicle beacon and all four attacker beacon paths
+    // (sybil_attacks.h) get identical treatment — fixing only the legit path
+    // would hand attackers 7x the airtime and corrupt M3/M4/M11.
+    if (tx->messageType == static_cast<uint32_t>(V2V_BEACON))
+        BindSenderToChannel(socket, tx->sequenceNumber);
+
     socket->SendTo(packet, 0, InetSocketAddress(destinationIp, destinationPort));
 
     // M11 chi_sybil: offered channel load. A frame whose claimed identity is not

@@ -23,6 +23,7 @@ Run in ml/.venv with TF_USE_LEGACY_KERAS=1 TOKENIZERS_PARALLELISM=false MPLBACKE
 """
 
 import argparse
+import csv
 import importlib.util
 import json
 import math
@@ -96,7 +97,7 @@ class Daemon:
                  batch=64, max_new=128, agent_device=0, max_identities=None,
                  window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=2000,
                  ablate_analyzer=None, ablate_stream=None, ablate_llm=None,
-                 mlfl_tau=None):
+                 mlfl_tau=None, consensus_config=None, txgb_min_beacons=None):
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
@@ -126,6 +127,15 @@ class Daemon:
         self.trust = trust.TrustPredictor.load()
         self.txgb = txgb.TemporalXGBPredictor.load()  # RSU-tier p̄_temp (Eq 3.19)
         self._txgb_mod = txgb                          # module (for ingest_history)
+        # D-stack contingency: the per-window two-beacon floor is what prevents p̄_temp
+        # aggregating for short-lived v3 (non-simultaneous rotation) identities. Rebinding
+        # the module global works because build_feature_table resolves it at call time.
+        self.txgb_min_beacons = txgb.MIN_BEACONS_WINDOW
+        if txgb_min_beacons is not None:
+            if txgb_min_beacons < 1:
+                raise ValueError("--txgb-min-beacons must be >= 1")
+            txgb.MIN_BEACONS_WINDOW = int(txgb_min_beacons)
+            self.txgb_min_beacons = int(txgb_min_beacons)
         self.rxgb = rxgb.RSSIXGBPredictor.load()       # RSU-tier p̄_rssi (Eq 3.19)
         # temporal-XGB incremental cumulative state: lets us feed a BOUNDED comm slice each
         # window yet keep claimed_id_age_s / beacons_so_far globally exact (see predict.py).
@@ -146,6 +156,10 @@ class Daemon:
         self.ablate_analyzer = ablate_analyzer
         self.ablate_stream = ablate_stream
         self.ablate_llm = ablate_llm
+        # D5/D6: which LoRA adapter set the Eq 3.21 agents load. None = the frozen
+        # Stage-2 CENTRALLY trained adapters (D5); a config path swaps in the Stage-3
+        # LLM-FL federated adapters (D6) without touching anything upstream.
+        self.consensus_config = consensus_config
         self.mlfl_only = (ablate_llm == "mlfl_only")
         if mlfl_tau is not None:
             self.mlfl_tau, self.mlfl_tau_src = float(mlfl_tau), "--mlfl-tau"
@@ -181,11 +195,12 @@ class Daemon:
                   f"(C1 ABLATION mlfl_only: LLM tier DISABLED, no agents loaded; "
                   f"ŷ_ens thresholded at τ={self.mlfl_tau} (from {self.mlfl_tau_src}); "
                   f"ablate_analyzer={self.ablate_analyzer or 'none'}, "
-                  f"ablate_stream={self.ablate_stream or 'tuned-lambda'})",
+                  f"ablate_stream={self.ablate_stream or 'tuned-lambda'}, "
+                  f"txgb_min_beacons={self.txgb_min_beacons})",
                   flush=True)
         else:
             print("[daemon] loading frozen consensus config + 3 LoRA agents (GPU) ...", flush=True)
-            self.cfg = CI.load_config()
+            self.cfg = CI.load_config(self.consensus_config)
             self.tok, self.model = CI.load_agents(self.cfg["base"], self.cfg["adapters"],
                                                   device=agent_device)
             self.sysmsg = {a: A.AGENTS[a]["system"] for a in A.AGENT_ORDER}
@@ -193,7 +208,10 @@ class Daemon:
                   f"(θ={self.cfg['theta']}, ω={self.cfg['omega']}; "
                   f"ensemble_gate={self.ensemble_gate}, max_llm_candidates={self.max_llm_candidates}; "
                   f"ablate_analyzer={self.ablate_analyzer or 'none'}, "
-                  f"ablate_stream={self.ablate_stream or 'tuned-lambda'})",
+                  f"ablate_stream={self.ablate_stream or 'tuned-lambda'}, "
+                  f"txgb_min_beacons={self.txgb_min_beacons}; "
+                  f"consensus_config={self.consensus_config or 'FROZEN_DEFAULTS (central)'}; "
+                  f"adapters={ {a: os.path.join(*p.split(os.sep)[-2:]) for a, p in self.cfg['adapters'].items()} })",
                   flush=True)
 
     # -- the full chain for one scoring window -------------------------------
@@ -392,6 +410,43 @@ class Daemon:
                 confidence="high", y_hat_ens=yhe, reason=reason))
         return out
 
+    # -- reasoning sidecar ----------------------------------------------------
+    def _log_reasoning(self, t, verdicts):
+        """Persist each verdict's generated reasoning to <run_dir>/full_mode_reasoning.csv.
+
+        RC (Eq 3.74) scores the MODEL'S OWN reasoning against the signature vocabulary, so
+        it needs the generated string. The C++ verdict sink parses only the decision fields
+        out of the socket JSON and drops `reason`, and its CSV schema has other consumers —
+        hence a sidecar rather than a schema change. Written by the daemon, keyed the same
+        way (claimed_id, window_start) so it joins straight onto full_mode_verdicts.csv.
+
+        Skipped entirely for mlfl_only: there is no LLM, so there is no reasoning to score
+        and an empty-reason file would make RC look like 0 rather than n/a.
+        """
+        if self.mlfl_only or not verdicts:
+            return
+        path = os.path.join(self.run_dir, "full_mode_reasoning.csv")
+        new = not os.path.exists(path)
+        try:
+            with open(path, "a", newline="") as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(["score_time", "claimed_id", "window_start", "d",
+                                "attack_type_id", "attack_type", "confidence",
+                                "y_hat_ens", "reason"])
+                for v in verdicts:
+                    try:
+                        d = PROTO.parse_verdict(v)
+                    except (ValueError, TypeError):
+                        continue
+                    w.writerow([f"{t:.3f}", d["claimed_id"], d["window_start"], d["d"],
+                                d["attack_type_id"], d["attack_type"], d["confidence"],
+                                "" if d["y_hat_ens"] is None else d["y_hat_ens"],
+                                d["reason"]])
+        except OSError as e:
+            # Never let a sidecar write failure take down a scoring window.
+            print(f"[daemon] WARNING: reasoning sidecar write failed: {e}", flush=True)
+
     # -- socket server (protocol.py) -----------------------------------------
     def serve(self, sock_path):
         if os.path.exists(sock_path):
@@ -424,6 +479,7 @@ class Daemon:
                         f.write(v + "\n")
                     f.write(PROTO.TOK_END + "\n")
                     f.flush()
+                    self._log_reasoning(t, verdicts)
                     print(f"[daemon] SCORE {t}: {len(verdicts)} verdicts "
                           f"({time.time() - t0:.1f}s)", flush=True)
         finally:
@@ -454,9 +510,10 @@ def main():
                          "effectively uncapped at this scale — a low cap throttles recall "
                          "(cap=48 gave in-sim recall 0.19 vs 0.96 uncapped)")
     ap.add_argument("--ablate-analyzer", default=None,
-                    choices=["trust", "rssi", "temp"],
-                    help="ablation B1: zero that vehicle-tier φ-block in the Eq 3.18 head "
-                         "and renormalise the survivors (omit = full head)")
+                    help="zero one or more vehicle-tier φ-blocks in the Eq 3.18 head and "
+                         "renormalise the survivors. A single name (B1 leave-one-out: "
+                         "trust|rssi|temp) or a comma-separated subset (D-stack ladder: "
+                         "'rssi,trust' = temporal-GRU-only). Omit = full head")
     ap.add_argument("--ablate-stream", default=None,
                     choices=list(EL.STREAM_LAMBDAS),
                     help="ablation B2: pin the Eq 3.20 λ to one evidence stream "
@@ -469,6 +526,17 @@ def main():
                          f"(default: read from ablation/C1/results/mlfl_tau.json, else "
                          f"{MLFL_TAU_FALLBACK}; calibrated on the val split by "
                          f"ablation/C1/c1_llm_vs_mlfl.py)")
+    ap.add_argument("--consensus-config", default=None,
+                    help="path to a consensus config JSON overriding the frozen Stage-2 "
+                         "deployment defaults — chiefly `adapters` (a1/a2/a3 LoRA paths) "
+                         "and ω/θ. Used by the D-stack ladder to swap the CENTRALLY "
+                         "trained adapters (D5, the default) for the Stage-3 LLM-FL "
+                         "federated ones (D6). Omit = FROZEN_DEFAULTS")
+    ap.add_argument("--txgb-min-beacons", type=int, default=None,
+                    help="override the RSU temporal-XGB per-window minimum deduped-beacon "
+                         "count (default 2). Lowering to 1 restores p̄_temp coverage for "
+                         "short-lived v3 rotation identities that never emit 2 beacons in "
+                         "one window")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
 
@@ -477,7 +545,9 @@ def main():
                max_identities=args.max_identities, window_margin=args.window_margin,
                ensemble_gate=args.ensemble_gate, max_llm_candidates=args.max_llm_candidates,
                ablate_analyzer=args.ablate_analyzer, ablate_stream=args.ablate_stream,
-               ablate_llm=args.ablate_llm, mlfl_tau=args.mlfl_tau)
+               ablate_llm=args.ablate_llm, mlfl_tau=args.mlfl_tau,
+               consensus_config=args.consensus_config,
+               txgb_min_beacons=args.txgb_min_beacons)
     if args.once is not None:
         vs = d.score(args.once, only_new=False, max_identities=args.max_identities)
         print(f"\n=== {len(vs)} verdicts @ t={args.once} ===")

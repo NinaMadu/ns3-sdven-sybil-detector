@@ -86,6 +86,48 @@ static std::string g_metricsOutDir = "sybil-attack/outputs";
 static uint64_t g_totalTransmitted = 0;
 static uint64_t g_totalDelivered   = 0;
 
+// Eq:pdr pre-/post-mitigation window split. -1.0 = no revocation has completed
+// yet (whole run so far counts as the active-attack window). Set once, from
+// the .cc, the first time RevokeEntityCurrentCrypto actually completes an
+// isolation record -- that is "RevokeEntity completes" in the paper's sense.
+static double   g_firstRevocationCompleteSec = -1.0;
+static uint64_t g_preMitTransmitted  = 0;   // active-attack window
+static uint64_t g_preMitDelivered    = 0;
+static uint64_t g_postMitTransmitted = 0;   // post-mitigation window
+static uint64_t g_postMitDelivered   = 0;
+
+// Source-side revocation suppression (Q32 fix, round 2). The vehicle-tier
+// bulletin blacklist (g_vehicleRevokedIdBlacklist) requires a receiving
+// vehicle to physically be in range of a revoking RSU at some point during
+// the run -- confirmed empirically to leave ~65% of vehicles permanently
+// unreached in short runs, a genuine spatial coverage limit no retry
+// frequency can fix. This set is the backstop: once a claimed identity's
+// revocation manifest completes (t-of-n signed, network-wide truth), the
+// identity itself stops being transmitted at all, everywhere, instantly --
+// no propagation delay, no coverage dependency. This directly satisfies
+// "revocation must suppress further beacons from the revoked pseudonym"
+// regardless of which vehicles ever heard the bulletin.
+static std::set<uint32_t> g_globallyRevokedClaimedIds;
+
+inline void
+MarkClaimedIdGloballyRevoked(uint32_t claimedId)
+{
+    g_globallyRevokedClaimedIds.insert(claimedId);
+}
+
+inline bool
+IsClaimedIdGloballyRevoked(uint32_t claimedId)
+{
+    return g_globallyRevokedClaimedIds.count(claimedId) > 0;
+}
+
+inline void
+MarkFirstRevocationComplete(double nowSec)
+{
+    if (g_firstRevocationCompleteSec < 0.0)
+        g_firstRevocationCompleteSec = nowSec;
+}
+
 // M2 – Latency
 static double   g_totalDelay  = 0.0;
 static uint64_t g_delayCount  = 0;
@@ -115,12 +157,17 @@ inline double   GetM7CorrectRevocationDetTimeSumSec(){ return g_m7CorrectRevocat
 static uint64_t g_falseTrafficPackets = 0;
 static uint64_t g_legitimatePackets   = 0;
 
-// M11 – Sybil Channel Load (chi_sybil)   [Experiment 1, metric 5]
+// M11 – Sybil Channel BANDWIDTH Share   [Experiment 1, metric 5]
 // Fraction of offered channel BYTES attributable to fake-identity traffic.
-// Deliberately distinct from M4: M4 is a packet-COUNT ratio, whereas chi_sybil
-// is bandwidth, so it responds to iota (identities per attacker) even when the
-// per-packet size is unchanged.  Accumulated at TRANSMIT, because channel load
-// is airtime the attacker consumes whether or not anyone receives the frame.
+// THIS IS NOT THE PAPER'S chi_sybil (Eq 3.68 / eq:channel_load). That quantity
+// is N_beacon_sybil / N_beacon, a packet-COUNT ratio, and is M4_congestion_ratio
+// below. This M11 metric is a deliberately distinct, BYTE-weighted quantity
+// (so it responds to iota, identities-per-attacker, even when per-packet size
+// is unchanged) — a real, separate Experiment-1 metric, but a different one.
+// Naming it "chi_sybil" in the exported CSV caused it to be mistaken for the
+// paper's metric; renamed to M11_sybil_bandwidth_share to remove the ambiguity.
+// Accumulated at TRANSMIT, because channel load is airtime the attacker
+// consumes whether or not anyone receives the frame.
 static uint64_t g_sybilChannelBytes  = 0;
 static uint64_t g_totalChannelBytes  = 0;
 static uint64_t g_windowSybilChannelBytes = 0;
@@ -200,6 +247,13 @@ enum DetectionMode
     MODE_ADAPTIVE      = 7  ///< A1 dual-mode selector (Eq 3.11): runtime L<->F switch.
 };
 
+// Which detector the LIGHTWEIGHT tier's M5/M6 confusion matrix scores.
+//   0 = legacy SybilDetector::ComputeConfidence (registry-miss + arrival-rate heuristic)
+//   1 = the report's LW-SSD (Eq 3.13): OR-gate over the OBSERVABLE suspicion bank
+// DEFINED in Sybil-Developing-Improved.cc. Affects MODE_LIGHTWEIGHT only.
+extern uint32_t lwScoringMode;
+extern double   lwFlagTtlSec;   ///< LW-SSD flag sliding window (s); 0 = latch forever
+
 static inline bool
 IsImplementedDetectionMode(uint32_t mode)
 {
@@ -248,6 +302,19 @@ struct NodeBehaviorRecord
 // M5/M6  Confusion matrix
 // Cast to double BEFORE multiplying to prevent uint64_t overflow on TP*TN.
 // =============================================================================
+
+// Effective-mode hook (adaptive-mode fix, supervisor Q23/Q24 follow-up).
+//
+// The metrics gates used to test m_proposedMethod, which is the RUN-LEVEL mode
+// fixed once in Initialize() and never updated. Under MODE_ADAPTIVE that is
+// permanently 7, so the MODE_LIGHTWEIGHT gate could never pass and every LW-SSD
+// decision taken during a disengaged cycle was silently discarded from M5/M6 —
+// adaptive's matrix was FM-SDP-only even while the Eq 3.11 selector sat in
+// Lightweight. The .cc registers &EffectiveMode here so the gates follow the
+// selector's CURRENT choice instead. nullptr => fall back to the run-level mode,
+// which is exactly the old behaviour for modes 4/5/6 (EffectiveMode() is the
+// identity for those), so non-adaptive runs are bit-identical.
+static uint32_t (*g_effectiveModeHook)() = nullptr;
 
 struct ConfusionMatrix
 {
@@ -435,6 +502,22 @@ struct FLConvergenceTracker
                : totalMpcOverheadMs / (double)roundsCompleted;
     }
 };
+
+// =============================================================================
+// M10  cost_component tags.
+//
+// WHY THIS EXISTS (supervisor Q23/Q24 follow-up).  M_F is NOT a pure FM-SDP run:
+// the LW-SSD rule-based suspicion computation executes every cycle in M_F too
+// (RecordComputedDetectionEvidence admits M_F via FullCryptoMechanismActive()),
+// so the empirical per-detection cost Ĉ_R of M_F is LW-SSD + FM-SDP, larger than
+// the paper's FM-SDP-only model.  Reporting M10 therefore requires knowing which
+// component produced each row; a blind mean over the CSV is meaningless because
+// the placeholder rows are structural zeros and the two real components differ by
+// ~5 orders of magnitude (µs rule evaluation vs multi-second LLM windows).
+static const char* const kCostDetectorGeneric = "detector_generic";  // M_L/FL/RSSI per-packet detector
+static const char* const kCostPlaceholderZero = "placeholder_zero";  // no detector ran: structural 0.0, EXCLUDE from Ĉ_R
+static const char* const kCostLwssdRuleConsensus = "lwssd_rule_consensus"; // Eq 3.13 flags + Eq 3.22 consensus
+static const char* const kCostFmsdpLlmWindow  = "fmsdp_llm_window";   // one FM-SDP scoring window (SCORE round-trip)
 
 // =============================================================================
 // M10  FLOPs complexity model  (Eqs 3.39 – 3.41)
@@ -629,6 +712,14 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         csvM10  = dir + "/metrics_M10_complexity.csv";
     }
 
+    // The mode the detection layer is ACTUALLY in this cycle. Identity for modes
+    // 4/5/6; under MODE_ADAPTIVE it tracks the Eq 3.11 selector. All M5/M6 gates
+    // use this, so exactly one detection path can score in any given cycle.
+    uint32_t EffectiveProposedMethod() const
+    {
+        return g_effectiveModeHook ? g_effectiveModeHook() : m_proposedMethod;
+    }
+
     void Initialize(uint32_t nVehicles,
                     uint32_t nRsus,
                     uint32_t proposedMethod,
@@ -725,48 +816,81 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         std::string tier     = RoleToTier(receiverRole);
         std::string modeStr  = ModeLabel(m_proposedMethod);
 
+        // Everything below keys off the EFFECTIVE mode, so an adaptive run's disengaged
+        // cycles are measured exactly as a real M_L run would be (and its engaged cycles
+        // pay nothing here, exactly as a real M_F run). Identity for modes 4/5/6.
+        const uint32_t effMode = EffectiveProposedMethod();
+        const std::string effModeStr = ModeLabel(effMode);
+
         // M10: wall-clock measured around detector call.  Placeholder modes and
         // no-detection mode intentionally keep confidence and cost at zero.
         double confidence  = 0.0;
         double wallClockMs = 0.0;
-        if (IsImplementedDetectionMode(m_proposedMethod))
+        if (IsImplementedDetectionMode(effMode))
         {
             auto t0 = std::chrono::high_resolution_clock::now();
-            confidence = m_detector->ComputeConfidence(rec, m_proposedMethod);
+            confidence = m_detector->ComputeConfidence(rec, effMode);
             auto t1 = std::chrono::high_resolution_clock::now();
             wallClockMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
 
-        bool isFlagged = IsImplementedDetectionMode(m_proposedMethod) &&
+        bool isFlagged = IsImplementedDetectionMode(effMode) &&
                          (confidence >= m_detector->GetThreshold());
-        if (IsImplementedDetectionMode(m_proposedMethod) &&
+
+        // --lwScoringMode=1 (default): score the report's actual LW-SSD — the OR-gate
+        // over the observable suspicion bank fed by RecordLwSsdFlag — instead of
+        // ComputeConfidence's registry+arrival heuristic.  Lightweight tier only;
+        // MODE_FULL is already excluded from this matrix below, and the feed itself
+        // is gated on LightweightDecisionModeActive(), so M_F is bit-identical.
+        // =0 restores the pre-2026-08-03 scorer for reproducing older M_L numbers.
+        if (lwScoringMode == 1u && effMode == MODE_LIGHTWEIGHT)
+        {
+            std::map<uint32_t, double>::const_iterator lwIt =
+                m_lwSsdFlaggedAt.find(claimedNodeId);
+            isFlagged = (lwIt != m_lwSsdFlaggedAt.end()) &&
+                        (lwFlagTtlSec <= 0.0 ||
+                         (timestampSec - lwIt->second) <= lwFlagTtlSec);
+        }
+
+        if (IsImplementedDetectionMode(effMode) &&
             m_explicitLightweightFlags.find(claimedNodeId) !=
             m_explicitLightweightFlags.end())
         {
             isFlagged = true;
         }
 
-        uint64_t flops = m_detector->EstimateFLOPs(tier, m_proposedMethod,
+        uint64_t flops = m_detector->EstimateFLOPs(tier, effMode,
                                                     m_complexityModel);
-        WriteM10Row(timestampSec, receiverId, tier, modeStr, wallClockMs, flops);
+        // Tag structural zeros: in a placeholder mode (incl. MODE_FULL) no detector
+        // is called here, so wall_clock_ms is 0.0 by construction. These rows dominate
+        // the CSV by count (~1.9M in a 30 s M_F run) and MUST be filtered out of any
+        // Ĉ_R average — the tag makes that filter explicit instead of folklore.
+        WriteM10Row(timestampSec, receiverId, tier, effModeStr, wallClockMs, flops,
+                    IsImplementedDetectionMode(effMode)
+                        ? kCostDetectorGeneric
+                        : kCostPlaceholderZero);
 
         // M5/M6 confusion matrix — skipped for FL mode (RecordFLPacketDecision) AND for
         // MODE_FULL (RecordFullModeDecision). Those modes count their detector's own
         // decisions directly; letting the per-packet path also write here would double-count
         // and drown the detector's per-identity verdicts in per-packet FN/TN.
-        if (m_proposedMethod != MODE_BASELINE_FL && m_proposedMethod != MODE_FULL
-            && m_proposedMethod != MODE_ADAPTIVE)
+        // MODE_ADAPTIVE is no longer excluded wholesale: it resolves to LIGHTWEIGHT or FULL
+        // per cycle, and the FULL case is filtered by the same MODE_FULL test below.
+        if (effMode != MODE_BASELINE_FL && effMode != MODE_FULL)
         {
-            if      ( isActuallySybil &&  isFlagged) { m_windowMatrix.TP++; m_totalMatrix.TP++; }
+            if      ( isActuallySybil &&  isFlagged) { m_windowMatrix.TP++; m_totalMatrix.TP++;
+                                                       m_lwssdMatrix.TP++; }
             else if (!isActuallySybil &&  isFlagged) { m_windowMatrix.FP++; m_totalMatrix.FP++;
+                                                       m_lwssdMatrix.FP++;
                 std::cout << "[M6] FP at t=" << timestampSec
                           << " claimedId="   << claimedNodeId << std::endl; }
-            else if ( isActuallySybil && !isFlagged) { m_windowMatrix.FN++; m_totalMatrix.FN++; }
-            else                                     { m_windowMatrix.TN++; m_totalMatrix.TN++; }
+            else if ( isActuallySybil && !isFlagged) { m_windowMatrix.FN++; m_totalMatrix.FN++;
+                                                       m_lwssdMatrix.FN++; }
+            else                                     { m_windowMatrix.TN++; m_totalMatrix.TN++;
+                                                       m_lwssdMatrix.TN++; }
         }
 
-        if (isFlagged && m_proposedMethod != MODE_BASELINE_FL && m_proposedMethod != MODE_FULL
-            && m_proposedMethod != MODE_ADAPTIVE)
+        if (isFlagged && effMode != MODE_BASELINE_FL && effMode != MODE_FULL)
         {
             // M7: record detection start only on first flag for this identity;
             // subsequent packets from the same Sybil claimedId are already tracked.
@@ -812,7 +936,9 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                            bool               countConfusionNow,
                                            bool               flagFuturePackets)
     {
-        if (m_proposedMethod != MODE_LIGHTWEIGHT)
+        // Effective, not run-level: under MODE_ADAPTIVE this now passes while the Eq 3.11
+        // selector sits in Lightweight, instead of discarding every LW-SSD decision.
+        if (EffectiveProposedMethod() != MODE_LIGHTWEIGHT)
             return;
 
         if (flagFuturePackets)
@@ -832,11 +958,13 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         {
             m_windowMatrix.TP++;
             m_totalMatrix.TP++;
+            m_lwssdMatrix.TP++;
         }
         else
         {
             m_windowMatrix.FP++;
             m_totalMatrix.FP++;
+            m_lwssdMatrix.FP++;
             std::cout << "[M6] FP explicit lightweight decision at t="
                       << timestampSec
                       << " claimedId=" << claimedNodeId
@@ -900,6 +1028,24 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                   << " reason=identity_not_attributed_by_lightweight_budget"
                   << " t=" << timestampSec
                   << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // RecordLwSsdFlag — LW-SSD (Eq 3.13) D_LW output, for SCORING only.
+    //
+    // Called from RecordComputedDetectionEvidence with the OBSERVABLE subset of the
+    // 12-bit suspicion bank, and ONLY under MODE_LIGHTWEIGHT, so MODE_FULL is
+    // untouched.  Sticky by design, matching m_explicitLightweightFlags: once the
+    // rule tier has flagged an identity it stays suspect for the rest of the run.
+    //
+    // WHY THIS EXISTS.  The report specifies D_LW as an OR-gate over the suspicion
+    // bank, but the scored detector was SybilDetector::ComputeConfidence — a
+    // registry-miss + arrival-rate heuristic that never reads the bank at all.  So
+    // the published M_L MCC measured a detector the paper does not describe.
+    // -------------------------------------------------------------------------
+    void RecordLwSsdFlag(uint32_t claimedId)
+    {
+        m_lwSsdFlaggedAt[claimedId] = Simulator::Now().GetSeconds();
     }
 
     // -------------------------------------------------------------------------
@@ -989,18 +1135,24 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                                 double             timestampSec,
                                 double             revLatencySec = 0.001)
     {
-        if (m_proposedMethod != MODE_FULL && m_proposedMethod != MODE_ADAPTIVE) return;
+        // Effective, not run-level: under MODE_ADAPTIVE this passes only while the Eq 3.11
+        // selector is ENGAGED, so LW-SSD and FM-SDP can never both score the same cycle.
+        if (EffectiveProposedMethod() != MODE_FULL) return;
 
         // M5/M6: per-decision confusion matrix
-        if      ( isActuallySybil &&  predictedSybil) { m_windowMatrix.TP++; m_totalMatrix.TP++; }
+        if      ( isActuallySybil &&  predictedSybil) { m_windowMatrix.TP++; m_totalMatrix.TP++;
+                                                        m_fmsdpMatrix.TP++; }
         else if (!isActuallySybil &&  predictedSybil)
         {
             m_windowMatrix.FP++; m_totalMatrix.FP++;
+            m_fmsdpMatrix.FP++;
             std::cout << "[M6] FULL_FP at t=" << timestampSec
                       << " claimedId=" << claimedId << " (legit id flagged sybil)" << std::endl;
         }
-        else if ( isActuallySybil && !predictedSybil) { m_windowMatrix.FN++; m_totalMatrix.FN++; }
-        else                                          { m_windowMatrix.TN++; m_totalMatrix.TN++; }
+        else if ( isActuallySybil && !predictedSybil) { m_windowMatrix.FN++; m_totalMatrix.FN++;
+                                                        m_fmsdpMatrix.FN++; }
+        else                                          { m_windowMatrix.TN++; m_totalMatrix.TN++;
+                                                        m_fmsdpMatrix.TN++; }
 
         // M7: first-detection latency per flagged identity
         if (predictedSybil &&
@@ -1022,6 +1174,39 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
             m_windowOverhead.AddEvent(40u, m_thresholdN, m_thresholdT, tier);
             m_totalOverhead.AddEvent(40u, m_thresholdN, m_thresholdT, tier);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // RecordFullModeDetectionCost — M10 wall-clock for the LW-SSD half of M_F's
+    // cost: the rule-based suspicion computation + weighted cross-RSU consensus,
+    // which execute every cycle in M_F as well as in M_L.  FLOPs uses the SAME
+    // Eq 3.39 rule-based model as M_L, because it is literally the same code —
+    // that is the point of the measurement, so it must not be reported as 0.
+    // -------------------------------------------------------------------------
+    void RecordFullModeDetectionCost(double timestampSec, uint32_t nodeId,
+                                     const std::string& tier, double wallClockMs)
+    {
+        WriteM10Row(timestampSec, nodeId, tier, ModeLabel(MODE_FULL), wallClockMs,
+                    m_complexityModel.MF_FLOPs(tier), kCostLwssdRuleConsensus);
+    }
+
+    // -------------------------------------------------------------------------
+    // RecordFullModeLlmCost — M10 wall-clock for the FM-SDP half of M_F's cost:
+    // one full scoring window (SCORE request → all verdicts → END), i.e. the six
+    // sub-detectors + Eq 3.20 ensemble + the LLM head, measured in the sim's own
+    // clock as the blocking round-trip the simulation actually pays.
+    //
+    // identityCount is the number of verdicts that window: Ĉ_R per identity is
+    // wallClockMs / identityCount, whereas the LW-SSD rows are already per event.
+    // Reported as its own component so the two are never silently pooled.
+    // FLOPs is 0 because Eqs 3.39-3.41 model no transformer path — that is a
+    // genuine gap in the analytic model, not a measurement failure.
+    // -------------------------------------------------------------------------
+    void RecordFullModeLlmCost(double timestampSec, double wallClockMs,
+                               uint32_t identityCount)
+    {
+        WriteM10Row(timestampSec, identityCount, "SDN", ModeLabel(MODE_FULL),
+                    wallClockMs, 0, kCostFmsdpLlmWindow);
     }
 
     // -------------------------------------------------------------------------
@@ -1123,7 +1308,26 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
                 << m_totalMatrix.ComputePrecision() << ","
                 << m_totalMatrix.ComputeRecall()    << ","
                 << (m_totalMatrix.TP + m_totalMatrix.FN) << ","
-                << (m_totalMatrix.FP + m_totalMatrix.TN) << "\n";
+                << (m_totalMatrix.FP + m_totalMatrix.TN) << ",pooled\n";
+        }
+
+        // Source-split cumulative rows. In an adaptive run BOTH are non-empty and the
+        // pooled row above must NOT be quoted on its own: LW-SSD rows are per-packet and
+        // FM-SDP rows are per-identity-verdict, so the pooled MCC is denominator-dominated
+        // by whichever path the selector spent longer in. Report these two instead.
+        WriteM5M6SourceRow(simEndTimeSec, m_lwssdMatrix, "lwssd");
+        WriteM5M6SourceRow(simEndTimeSec, m_fmsdpMatrix, "fmsdp");
+        if (m_lwssdMatrix.TP + m_lwssdMatrix.FP + m_lwssdMatrix.FN + m_lwssdMatrix.TN > 0 &&
+            m_fmsdpMatrix.TP + m_fmsdpMatrix.FP + m_fmsdpMatrix.FN + m_fmsdpMatrix.TN > 0)
+        {
+            std::cout << "[M5/M6] BOTH detection paths scored this run (adaptive): "
+                      << "report the two CUMULATIVE_BY_SOURCE rows, NOT the pooled row — "
+                      << "lwssd N=" << (m_lwssdMatrix.TP + m_lwssdMatrix.FP +
+                                        m_lwssdMatrix.FN + m_lwssdMatrix.TN)
+                      << " MCC=" << m_lwssdMatrix.ComputeMCC()
+                      << " | fmsdp N=" << (m_fmsdpMatrix.TP + m_fmsdpMatrix.FP +
+                                           m_fmsdpMatrix.FN + m_fmsdpMatrix.TN)
+                      << " MCC=" << m_fmsdpMatrix.ComputeMCC() << std::endl;
         }
 
         // Cumulative M8
@@ -1214,9 +1418,25 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
     LatencyTracker                         m_latencyTracker;
     std::map<uint32_t, NodeBehaviorRecord> m_nodeRecords;
     std::set<uint32_t>                     m_explicitLightweightFlags;
+    /// Identities flagged by the real LW-SSD bank (observable bits only).
+    /// Populated only under MODE_LIGHTWEIGHT — see RecordLwSsdFlag.
+    /// claimedId -> sim time of its most recent LW-SSD flag.  Was a std::set, i.e. a
+    /// permanent latch: an identity flagged once stayed flagged for the whole run.
+    /// Measured at 180s/200veh: the ORACLE arm's FPR reached 0.53 and its MCC fell
+    /// 0.995 -> 0.621 purely because every legit vehicle eventually tripped something
+    /// once.  With lwFlagTtlSec > 0 the verdict decays instead of latching.
+    std::map<uint32_t, double>             m_lwSsdFlaggedAt;
 
     ConfusionMatrix      m_windowMatrix;
     ConfusionMatrix      m_totalMatrix;
+
+    // Source-split cumulative matrices. LW-SSD scores per PACKET, FM-SDP scores per
+    // identity-verdict-per-window: on the 300 s pair those denominators differ ~510x
+    // (9,714,626 vs 19,053), so a pooled MCC is numerically dominated by the LW rows
+    // and says nothing about the LLM. Adaptive mode is the only run type where both
+    // can be non-empty; keeping them apart is what makes its M5/M6 interpretable.
+    ConfusionMatrix      m_lwssdMatrix;
+    ConfusionMatrix      m_fmsdpMatrix;
     OverheadAccumulator  m_windowOverhead;
     OverheadAccumulator  m_totalOverhead;
     FLConvergenceTracker m_flTracker;
@@ -1248,7 +1468,7 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         { std::ofstream o(csvM5M6.c_str(), std::ios::out);
           o << "window_end_sec,window_label,TP,FP,FN,TN,"
                "MCC,FPR,Precision,Recall,"
-               "total_sybil_ground_truth,total_legit_ground_truth\n"; }
+               "total_sybil_ground_truth,total_legit_ground_truth,source\n"; }
 
         { std::ofstream o(csvM7.c_str(), std::ios::out);
           o << "revocation_time_sec,claimed_node_id,actually_sybil,"
@@ -1267,7 +1487,8 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
 
         { std::ofstream o(csvM10.c_str(), std::ios::out);
           o << "timestamp_sec,node_id,tier,detection_mode,"
-               "wall_clock_ms_measured,estimated_flops_eq3_39_to_3_41\n"; }
+               "wall_clock_ms_measured,estimated_flops_eq3_39_to_3_41,"
+               "cost_component\n"; }
     }
 
     void WriteM5M6Row(double windowEnd, const ConfusionMatrix& m)
@@ -1278,7 +1499,23 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
           << m.TP << "," << m.FP << "," << m.FN << "," << m.TN << ","
           << m.ComputeMCC()       << "," << m.ComputeFPR()       << ","
           << m.ComputePrecision() << "," << m.ComputeRecall()    << ","
-          << (m.TP + m.FN) << "," << (m.FP + m.TN) << "\n";
+          << (m.TP + m.FN) << "," << (m.FP + m.TN) << ",pooled\n";
+    }
+
+    // Source-split cumulative row. `label` distinguishes it from the pooled row so an
+    // existing reader that filters on window_label=="CUMULATIVE" is unaffected.
+    void WriteM5M6SourceRow(double simEndSec, const ConfusionMatrix& m,
+                            const std::string& source)
+    {
+        if (m.TP + m.FP + m.FN + m.TN == 0)
+            return;                     // path never ran this mode: emit nothing, not zeros
+        std::ofstream o(csvM5M6.c_str(), std::ios::app);
+        o << std::fixed << std::setprecision(6);
+        o << simEndSec << ",CUMULATIVE_BY_SOURCE,"
+          << m.TP << "," << m.FP << "," << m.FN << "," << m.TN << ","
+          << m.ComputeMCC()       << "," << m.ComputeFPR()       << ","
+          << m.ComputePrecision() << "," << m.ComputeRecall()    << ","
+          << (m.TP + m.FN) << "," << (m.FP + m.TN) << "," << source << "\n";
     }
 
     void WriteM7Row(double detTimeSec, uint32_t claimedId,
@@ -1328,13 +1565,17 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
           << note << "\n";
     }
 
+    // cost_component distinguishes the two detection costs that BOTH execute in
+    // M_F (supervisor Q23/Q24 follow-up): rows are not interchangeable and must
+    // never be averaged together blind. See kCost* constants above.
     void WriteM10Row(double ts, uint32_t nodeId, const std::string& tier,
-                     const std::string& mode, double wcMs, uint64_t flops)
+                     const std::string& mode, double wcMs, uint64_t flops,
+                     const std::string& costComponent = kCostDetectorGeneric)
     {
         std::ofstream o(csvM10.c_str(), std::ios::app);
         o << std::fixed << std::setprecision(6);
         o << ts << "," << nodeId << "," << tier << ","
-          << mode << "," << wcMs << "," << flops << "\n";
+          << mode << "," << wcMs << "," << flops << "," << costComponent << "\n";
     }
 };
 
@@ -1461,6 +1702,11 @@ MetricsOnTransmit(uint32_t expectedDeliveries = 1)
 {
     g_totalTransmitted += expectedDeliveries;
     g_windowTransmitted += expectedDeliveries;
+
+    const bool postMit = (g_firstRevocationCompleteSec >= 0.0 &&
+                          Simulator::Now().GetSeconds() >= g_firstRevocationCompleteSec);
+    if (postMit) g_postMitTransmitted += expectedDeliveries;
+    else         g_preMitTransmitted  += expectedDeliveries;
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,6 +1779,11 @@ MetricsOnReceive(bool isSybil, double delay, bool countForPDR = true)
     {
         g_totalDelivered++;
         g_windowDelivered++;
+
+        const bool postMit = (g_firstRevocationCompleteSec >= 0.0 &&
+                              Simulator::Now().GetSeconds() >= g_firstRevocationCompleteSec);
+        if (postMit) g_postMitDelivered++;
+        else         g_preMitDelivered++;
     }
 
     // M2 — latency across all tagged receives (RSU overhears included)
@@ -1847,6 +2098,27 @@ WriteFinalSummary()
         << ",Total packets successfully received\n"
         << "M1_PDR,"                   << finalPDR
         << ",Packet Delivery Ratio (delivered/transmitted)\n"
+        << "M1_mitigation_window_boundary_sec," << g_firstRevocationCompleteSec
+        << ",Sim time RevokeEntity first completed; splits M1_PDR_active_attack / "
+           "M1_PDR_post_mitigation below. -1 = no revocation completed in this run\n"
+        << "M1_PDR_active_attack,"      << (g_preMitTransmitted > 0
+                                                ? static_cast<double>(g_preMitDelivered) /
+                                                      static_cast<double>(g_preMitTransmitted)
+                                                : 0.0)
+        << ",eq:pdr over [0, mitigation_window_boundary): PDR before any revocation completed\n"
+        << "M1_PDR_post_mitigation,"    << (g_postMitTransmitted > 0
+                                                ? static_cast<double>(g_postMitDelivered) /
+                                                      static_cast<double>(g_postMitTransmitted)
+                                                : 0.0)
+        << ",eq:pdr over [mitigation_window_boundary, sim_time]: PDR after RevokeEntity completed\n"
+        << "M1_active_attack_transmitted," << g_preMitTransmitted
+        << ",N_tx in the active-attack window\n"
+        << "M1_active_attack_delivered,"   << g_preMitDelivered
+        << ",N_rx (paper eq:pdr numerator) in the active-attack window\n"
+        << "M1_post_mitigation_transmitted," << g_postMitTransmitted
+        << ",N_tx in the post-mitigation window\n"
+        << "M1_post_mitigation_delivered,"   << g_postMitDelivered
+        << ",N_rx (paper eq:pdr numerator) in the post-mitigation window\n"
         << "M2_avg_latency_ms,"        << finalAvgLatencyMs
         << ",Average latency over all received tagged packets in milliseconds\n"
         << "M2_intended_avg_latency_ms," << finalIntendedAvgLatencyMs
@@ -1874,13 +2146,19 @@ WriteFinalSummary()
         << "M4_legitimate_packets,"    << (g_beaconAllTx - g_beaconSybilTx)
         << ",Legitimate V2V beacon transmissions\n"
         << "M4_congestion_ratio,"      << finalCongRatio
-        << ",chi_sybil (Eq 3.68): Sybil share of BEACON transmissions only (N_beacon denominator)\n"
+        << ",chi_sybil -- THE PAPER'S canonical Eq 3.68 / eq:channel_load metric: "
+           "N_beacon_sybil / N_beacon, a packet-count ratio. Use THIS field wherever "
+           "chi_sybil is reported. (M11_sybil_bandwidth_share below is a different, "
+           "byte-weighted quantity -- not this metric.)\n"
         << "M11_sybil_channel_bytes,"  << g_sybilChannelBytes
         << ",Offered channel bytes carrying a fake claimed identity\n"
         << "M11_total_channel_bytes,"  << g_totalChannelBytes
         << ",Total offered channel bytes across all transmissions\n"
-        << "M11_chi_sybil,"            << finalChiSybil
-        << ",Sybil Channel Load: fraction of offered channel bytes consumed by fake-identity announcements\n"
+        << "M11_sybil_bandwidth_share," << finalChiSybil
+        << ",Sybil Channel BANDWIDTH Share (bytes) -- a distinct, byte-weighted Experiment-1 "
+           "metric. This is NOT the paper's chi_sybil / Eq 3.68 metric; see M4_congestion_ratio "
+           "for that. Renamed from 'M11_chi_sybil' -- that name caused it to be confused with "
+           "the paper's canonical chi_sybil, which is a different (packet-count) quantity.\n"
         << "sybil_attack_enabled,"     << (sybil_attack_enabled ? 1 : 0)
         << ",Whether Sybil attack was active\n"
         << "sybil_attack_percentage,"  << sybil_attack_percentage
@@ -1895,8 +2173,9 @@ WriteFinalSummary()
         << ",Reliable local V2V beacon evaluation radius in metres\n"
         << "rsuCoverageRange,"         << rsuCoverageRange
         << ",RSU coverage radius in metres\n"
-        << "N_rx,"                     << g_allReceived
-        << ",Raw physical-layer reception count (includes multi-channel duplication; distinct from M1_total_delivered)\n"
+        << "N_rx_raw,"                 << g_allReceived
+        << ",Raw physical-layer reception count (each broadcast counted once per receiving "
+           "neighbour; NOT the paper's PDR numerator -- that is M1_total_delivered)\n"
         << "M7_detection_event_count," << GetM7CorrectRevocationCount()
         << ",Number of confirmed-Sybil identities that were flagged and revoked\n"
         << "M7_mean_L_revoke_ms,"      << (GetM7CorrectRevocationCount() > 0
@@ -1916,12 +2195,12 @@ WriteFinalSummary()
     std::cout << "M3 PAR (Eq 3.67)     : " << finalAttrRatio
               << " (" << g_parSybilRouteTx << "/" << g_parAllTx
               << " transmissions routed via a Sybil identity)\n";
-    std::cout << "M11 chi_sybil        : " << finalChiSybil
+    std::cout << "M11 bandwidth share  : " << finalChiSybil
               << " (" << g_sybilChannelBytes << " / " << g_totalChannelBytes
-              << " offered bytes)\n";
+              << " offered bytes -- NOT chi_sybil, see M4 below)\n";
     std::cout << "M4 chi_sybil (3.68)  : " << finalCongRatio
               << " (" << g_beaconSybilTx << " Sybil / " << totalPkts
-              << " beacon transmissions)\n";
+              << " beacon transmissions) -- THE paper's canonical chi_sybil\n";
     std::cout << "Summary CSV          : " << summaryPath << std::endl;
 
     std::ofstream tierOut(metricsTierSummaryCsv.c_str(), std::ios::out);
