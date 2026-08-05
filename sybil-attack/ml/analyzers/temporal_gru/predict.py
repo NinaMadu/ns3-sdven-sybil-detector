@@ -231,26 +231,6 @@ class TemporalPredictor:
     # emit the degeneracy warning once per process, like the drift one
     _degenerate_warned = False
 
-    def _degeneracy(self, phi, prob):
-        """(is_degenerate, [reasons]) for one scored batch.
-
-        Split out from the warning so the verdict can travel with the DATA, not just
-        the log: score_logs stamps it onto every row as `temporal_degenerate` and the
-        live cᵢ builder uses it to withhold the class tokens. Evaluated per batch
-        because degeneracy is a property of this run's feature distribution, not of
-        the weights.
-        """
-        sat = float((np.abs(phi) >= PHI_SAT_LEVEL).mean())
-        p0 = float(prob[:, 0].mean())
-        reasons = []
-        if sat > PHI_SAT_FRAC_WARN:
-            reasons.append(f"{100 * sat:.0f}% of phi pinned at |{PHI_SAT_LEVEL}| "
-                           f"(state saturated)")
-        if p0 < P0_COLLAPSE_WARN:
-            reasons.append(f"mean p_temp_0={p0:.4f} vs training {P0_TRAIN_REFERENCE} "
-                           f"(cannot output 'legitimate')")
-        return bool(reasons), reasons
-
     def _warn_on_degenerate_output(self, phi, prob):
         """Warn when the OUTPUT is degenerate, whatever the inputs looked like.
 
@@ -262,11 +242,18 @@ class TemporalPredictor:
         reads features.temporal.pred as its variant evidence, so a degenerate class
         head is reported as a confident wrong attack type rather than as no evidence.
         """
-        degenerate, problems = self._degeneracy(phi, prob)
-        self._last_degenerate = degenerate
         if TemporalPredictor._degenerate_warned:
             return
-        if degenerate:
+        sat = float((np.abs(phi) >= PHI_SAT_LEVEL).mean())
+        p0 = float(prob[:, 0].mean())
+        problems = []
+        if sat > PHI_SAT_FRAC_WARN:
+            problems.append(f"{100 * sat:.0f}% of phi pinned at |{PHI_SAT_LEVEL}| "
+                            f"(state saturated)")
+        if p0 < P0_COLLAPSE_WARN:
+            problems.append(f"mean p_temp_0={p0:.4f} vs training {P0_TRAIN_REFERENCE} "
+                            f"(cannot output 'legitimate')")
+        if problems:
             TemporalPredictor._degenerate_warned = True
             print(f"[temporal_gru] WARNING: output is DEGENERATE — "
                   f"{'; '.join(problems)}. p_temp/pred are not trustworthy this run; "
@@ -305,13 +292,7 @@ class TemporalPredictor:
         key = ["run_id", "claimed_node_id", "window_start_seconds"]
         val_cols = [f"phi_temp_{i}" for i in range(phi.shape[1])] + \
                    [f"p_temp_{k}" for k in range(prob.shape[1])]
-        pooled = out.groupby(key, as_index=False)[val_cols].mean()
-        # Batch-level verdict carried on every row, so downstream consumers can decide
-        # whether to trust p_temp WITHOUT re-deriving it. p_temp/phi_temp themselves are
-        # left intact: this is a label on the data, never a modification of it, and the
-        # Eq 3.18/3.20 fusion path keeps using phi_temp exactly as before.
-        pooled["temporal_degenerate"] = int(getattr(self, "_last_degenerate", False))
-        return pooled
+        return out.groupby(key, as_index=False)[val_cols].mean()
 
 
 if __name__ == "__main__":
