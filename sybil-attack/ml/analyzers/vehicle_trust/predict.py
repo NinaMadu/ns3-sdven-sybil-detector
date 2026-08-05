@@ -174,7 +174,26 @@ class TrustPredictor:
         return cls(sd, stats, fcols, hp)
 
     def score_windows(self, w):
-        """Enriched windows -> pooled spine-schema rows with phi_trust + scores."""
+        """Enriched windows -> pooled spine-schema rows with phi_trust + scores.
+
+        SCALE CONTRACT — emit from `ws`, never `w`.
+        Training's export_fusion_parquet ran on an already-standardised frame, so the
+        cᵢ the LLM learned from carries z-SCORES for T_composite/T_RSSI/T_behav/T_hist
+        and every EVIDENCE_COL. Emitting the raw `w` values here fed the LLM the same
+        token names on a different scale: measured 2026-08-05, live ctrl_trust sat in
+        [0.25, 1.0] against a training range of [-28.05, 0.036] — no overlap at all —
+        and identity_lifetime inverted its meaning (live 3.0 = 3 s = short and
+        suspicious; 3.0 in training-space is past the 2.38 max = extremely long-lived).
+
+        All nine columns are in self.fcols, so apply_stats already standardises them
+        for the MLP; reusing that frame is what makes live match training exactly.
+        Verified: scaled live T_RSSI/rssi_mismatch_frac/ctrl_trust reproduce the
+        training parquet's min/max to 3 dp.
+
+        phi_trust_score is unaffected either way — it is the MLP sigmoid, always
+        computed from `ws`, which is why the binary path stayed healthy while variant
+        attribution did not. See ablation/SOTA/8_5_v2_check/LIVE_CI_MISMATCH.md.
+        """
         ws = T.apply_stats(w, self.fcols, self.stats)
         X = torch.tensor(ws[self.fcols].to_numpy(dtype="float32"))
         with torch.no_grad():
@@ -182,22 +201,24 @@ class TrustPredictor:
             prob = torch.sigmoid(logits).numpy()
             phi = phi.numpy()
 
+        # identifiers stay on `w` (apply_stats never touches them); every MODEL-FACING
+        # value comes from `ws`.
         out = pd.DataFrame({
             "run_id": w["run_id"].to_numpy(),
             "claimed_node_id": w["observed_claimed_id"].astype(int).to_numpy(),
             "window_start_seconds": T.IDM.snap_grid(w["window_start"].to_numpy()),
             "phi_trust_score": prob,
-            "T_composite": w["T_composite"].to_numpy(),
-            "T_RSSI": w["T_RSSI"].to_numpy(),
-            "T_behav": w["T_behav"].to_numpy(),
-            "T_hist": w["T_hist"].to_numpy(),
+            "T_composite": ws["T_composite"].to_numpy(),
+            "T_RSSI": ws["T_RSSI"].to_numpy(),
+            "T_behav": ws["T_behav"].to_numpy(),
+            "T_hist": ws["T_hist"].to_numpy(),
         })
         phi_cols = [f"phi_trust_{j}" for j in range(phi.shape[1])]
         for j, col in enumerate(phi_cols):
             out[col] = phi[:, j]
         for c in EVIDENCE_COLS:
-            if c in w:
-                out[c] = w[c].to_numpy()
+            if c in ws:
+                out[c] = ws[c].to_numpy()
 
         # pool duplicate (run_id, claimed, snapped-window) rows -> one per grid cell,
         # matching export_fusion_parquet (mean of phi/scores), minus split/labels.
