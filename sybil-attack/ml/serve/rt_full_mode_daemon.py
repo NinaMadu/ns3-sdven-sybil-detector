@@ -98,7 +98,11 @@ class Daemon:
                  window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=2000,
                  ablate_analyzer=None, ablate_stream=None, ablate_llm=None,
                  mlfl_tau=None, consensus_config=None, txgb_min_beacons=None,
-                 agent_stage=None):
+                 agent_stage=None, temporal_gate=True):
+        # Withhold the GRU's class tokens from the LLM prompt when the analyzer flags
+        # itself degenerate. On by default; --no-temporal-gate restores the old
+        # behaviour for A/B. Prompt-only — phi_temp still feeds Eq 3.18/3.20.
+        self.temporal_gate = temporal_gate
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
@@ -351,7 +355,7 @@ class Daemon:
         if len(cand) == 0:
             return verdicts
 
-        msgs = BC.build_messages(cand)
+        msgs = BC.build_messages(cand, gate_degenerate_temporal=self.temporal_gate)
         contexts = [json.dumps(m["context"]) for m in msgs]
 
         # Eq 3.21 — three agents on the SAME contexts, distinct role prompt
@@ -555,6 +559,11 @@ def main():
                          "count (default 2). Lowering to 1 restores p̄_temp coverage for "
                          "short-lived v3 rotation identities that never emit 2 beacons in "
                          "one window")
+    ap.add_argument("--no-temporal-gate", dest="temporal_gate", action="store_false",
+                    default=True,
+                    help="keep feeding the LLM the GRU's class tokens even when the "
+                         "analyzer reports itself degenerate (pre-2026-08-05 behaviour; "
+                         "for A/B only)")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
     # Fail before the (expensive) predictor load rather than after: both switches name
@@ -573,6 +582,7 @@ def main():
                ablate_analyzer=args.ablate_analyzer, ablate_stream=args.ablate_stream,
                ablate_llm=args.ablate_llm, mlfl_tau=args.mlfl_tau,
                consensus_config=args.consensus_config,
+               temporal_gate=args.temporal_gate,
                txgb_min_beacons=args.txgb_min_beacons,
                agent_stage=args.agent_stage)
     if args.once is not None:

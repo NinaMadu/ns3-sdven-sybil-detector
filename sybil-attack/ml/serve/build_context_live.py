@@ -59,13 +59,40 @@ def assemble_ci(temporal, rssi=None, trust=None, ensemble=None, mobility=None,
     return ev.reset_index(drop=True)
 
 
-def build_messages(ci_df):
+def build_messages(ci_df, gate_degenerate_temporal=True):
     """cᵢ DataFrame -> list of {key..., context} using the shared build_context.
 
     context is the Eq 3.31 token dict the 3 agents consume (identical across agents;
-    each agent only prepends its own role system prompt)."""
+    each agent only prepends its own role system prompt).
+
+    gate_degenerate_temporal — when the GRU flagged itself degenerate for this batch
+    (`temporal_degenerate`), blank p_temp_* so build_context omits the whole
+    `features.temporal` group. _num() maps NaN to None and _present() drops such
+    columns, so the tokens simply do not appear.
+
+    The point is that MISSING evidence and WRONG evidence are not the same thing to a
+    language model. Measured 2026-08-05: with the GRU unable to emit "legitimate" for
+    any of 1636 windows, its modal class was `outsider`, and the LLM copied that onto
+    340 of 347 true insider-simultaneous identities — 7-class MCC 0.4579 while the
+    binary MCC was 0.93. Withholding a class label the analyzer cannot support lets
+    the model fall back on the trust and ensemble evidence, which are healthy.
+
+    Only the LLM PROMPT is affected. phi_temp still anchors cᵢ and still feeds the
+    Eq 3.18/3.20 fusion head, so ŷ_ens and the binary decision path are untouched.
+    Pass False to A/B the gate.
+    """
     sys.path.insert(0, os.path.join(_HERE, "..", "llm", "common"))
     import build_llm_dataset as B          # noqa: E402  (build_context, null-safe)
+
+    gated = 0
+    if gate_degenerate_temporal and "temporal_degenerate" in ci_df.columns:
+        mask = ci_df["temporal_degenerate"].fillna(0).astype(int) == 1
+        if mask.any():
+            ci_df = ci_df.copy()
+            pcols = [c for c in ci_df.columns if c.startswith("p_temp_")]
+            ci_df.loc[mask, pcols] = float("nan")
+            gated = int(mask.sum())
+
     out = []
     for _, row in ci_df.iterrows():
         out.append({
@@ -74,6 +101,10 @@ def build_messages(ci_df):
             "window_start_seconds": float(row["window_start_seconds"]),
             "context": B.build_context(row),
         })
+    if gated:
+        print(f"[build_context_live] temporal class tokens WITHHELD from {gated}/"
+              f"{len(ci_df)} cᵢ rows (GRU self-reported degenerate); the LLM sees no "
+              f"temporal evidence rather than wrong evidence", flush=True)
     return out
 
 
