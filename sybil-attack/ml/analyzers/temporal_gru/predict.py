@@ -46,9 +46,24 @@ SEQ_FEATURE_COLS = ["delta_t", "temp_id_change_flag", "bsm_x", "bsm_y", "bsm_spe
                     "bsm_msg_count_delta"]
 WINDOW_W, WINDOW_STEP = 10, 1
 # Mean |z| above which a live feature is reported as outside its training scale.
-# 5 sigma is far past anything legitimate mobility/timing noise produces, so this
-# fires on configuration drift (a changed packet size, a new map extent) only.
-DRIFT_ABS_Z_WARN = 5.0
+# Lowered 5.0 -> 3.0 on 2026-08-05: at 5.0 this guard stayed SILENT through a run
+# whose worst feature sat at mean |z| = 4.48 (bsm_msg_count_delta) while the GRU's
+# state was 31 % saturated and p_temp_0 had collapsed 800x — precisely the failure
+# it was written to catch. This is a MEAN |z|, not a single sample: 3.0 means the
+# average observation is three sigma out, which no legitimate mobility or timing
+# noise produces.
+DRIFT_ABS_Z_WARN = 3.0
+
+# Output-side degeneracy thresholds. Input drift is only a proxy; these fire on the
+# symptom itself, so a distribution shift that keeps every feature under the |z| bar
+# but still saturates the recurrent state cannot pass silently.
+#   PHI_SAT_FRAC_WARN  fraction of |phi| >= PHI_SAT_LEVEL (GRU state is tanh-bounded,
+#                      so |phi| pinned at 1 means the cell has stopped discriminating)
+#   P0_COLLAPSE_WARN   mean p_temp_0. The training cᵢ sits at 0.637 and calls the
+#                      modal window legitimate 66 % of the time; a live mean near zero
+#                      means the analyzer has stopped being able to say "legitimate".
+PHI_SAT_LEVEL, PHI_SAT_FRAC_WARN = 0.99, 0.25
+P0_COLLAPSE_WARN, P0_TRAIN_REFERENCE = 0.05, 0.637
 GRU_HIDDEN, N_CLASSES, DROPOUT, BIDIRECTIONAL = 16, 7, 0.3, True
 BEACON_KEY = ["run_id", "real_node_id", "claimed_node_id", "bsm_temporary_id", "receive_time"]
 
@@ -213,6 +228,38 @@ class TemporalPredictor:
                   f"saturated and its output degenerate — check phi variance before "
                   f"trusting p_temp.", flush=True)
 
+    # emit the degeneracy warning once per process, like the drift one
+    _degenerate_warned = False
+
+    def _warn_on_degenerate_output(self, phi, prob):
+        """Warn when the OUTPUT is degenerate, whatever the inputs looked like.
+
+        _warn_on_drift watches the inputs, which is a proxy and an imperfect one:
+        on 2026-08-05 every feature sat below the |z| bar in force at the time, yet
+        31 % of phi was pinned at |1| and p_temp_0 averaged 0.0008 against a training
+        mean of 0.637 — the analyzer had stopped being able to output "legitimate"
+        at all, and nothing said so. Downstream this is not a small error: the LLM
+        reads features.temporal.pred as its variant evidence, so a degenerate class
+        head is reported as a confident wrong attack type rather than as no evidence.
+        """
+        if TemporalPredictor._degenerate_warned:
+            return
+        sat = float((np.abs(phi) >= PHI_SAT_LEVEL).mean())
+        p0 = float(prob[:, 0].mean())
+        problems = []
+        if sat > PHI_SAT_FRAC_WARN:
+            problems.append(f"{100 * sat:.0f}% of phi pinned at |{PHI_SAT_LEVEL}| "
+                            f"(state saturated)")
+        if p0 < P0_COLLAPSE_WARN:
+            problems.append(f"mean p_temp_0={p0:.4f} vs training {P0_TRAIN_REFERENCE} "
+                            f"(cannot output 'legitimate')")
+        if problems:
+            TemporalPredictor._degenerate_warned = True
+            print(f"[temporal_gru] WARNING: output is DEGENERATE — "
+                  f"{'; '.join(problems)}. p_temp/pred are not trustworthy this run; "
+                  f"treat the temporal class label as absent rather than as evidence.",
+                  flush=True)
+
     @torch.no_grad()
     def _extract_phi(self, X, L, batch=65536):
         phis, logits = [], []
@@ -226,6 +273,7 @@ class TemporalPredictor:
         phi = np.concatenate(phis)
         e = np.exp(logit - logit.max(1, keepdims=True))
         prob = e / e.sum(1, keepdims=True)
+        self._warn_on_degenerate_output(phi, prob)
         return phi, prob                     # (N,32), (N,7)
 
     def score_logs(self, run_dir, t=None, run_id="live", nrows=None, rows=None):
