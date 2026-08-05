@@ -56,22 +56,98 @@ FROZEN_DEFAULTS = {
 # present. Nothing is required at runtime — the defaults above already work.
 DEFAULT_CONFIG = os.path.join(_HERE, "consensus_config.json")
 
+# ── NAMED AGENT STAGES (the "LLM agent shifter") ──────────────────────────────
+# A stage selects ONLY which LoRA adapter triple is overlaid on the shared frozen
+# base. Everything else — base model, the three ROLE PROMPTS (Stage-3 training
+# imports agents.AGENTS from here, so they are byte-identical), ω, θ, confidence
+# weights and tie-break — is inherited from FROZEN_DEFAULTS. That is deliberate:
+# switching stages isolates the adapters and nothing else, so a Stage-2 vs
+# Stage-3 comparison is attributable to the federation alone.
+#
+# Both adapter sets are r=8 / α=16 LoRA over the same 7 target modules on the
+# same Qwen2.5-1.5B-Instruct base, so they are drop-in interchangeable.
+# Paths are relative to THIS file's directory (see load_config).
+AGENT_STAGES = {
+    # Stage-2: CENTRALLY trained adapters (the frozen deployment default, D5).
+    "stage2": {"a1": "adapters/qwen1_5b_a1",
+               "a2": "adapters/qwen1_5b_a2",
+               "a3": "adapters/qwen1_5b_a3"},
+    # Stage-3: FEDERATED adapters, Eq 3.32 aggregation over 4 zones, Hmax
+    # partition (10/30/50/70 label skew) — the promoted deployment set (D6).
+    "stage3": {"a1": "../stage3_agents/final_models/Hmax_llm_fl_seed42/a1",
+               "a2": "../stage3_agents/final_models/Hmax_llm_fl_seed42/a2",
+               "a3": "../stage3_agents/final_models/Hmax_llm_fl_seed42/a3"},
+    # Stage-3 contingency: same federation under the H0 (IID) zone partition.
+    "stage3_h0": {"a1": "../stage3_agents/final_models/H0_llm_fl_seed42/a1",
+                  "a2": "../stage3_agents/final_models/H0_llm_fl_seed42/a2",
+                  "a3": "../stage3_agents/final_models/H0_llm_fl_seed42/a3"},
+}
 
-def load_config(path=None):
-    """Frozen consensus config: built-in FROZEN_DEFAULTS + optional JSON override.
+# Friendly spellings accepted from the CLI / the C++ --llmAgentStage flag.
+STAGE_ALIASES = {
+    "2": "stage2", "stage2": "stage2", "central": "stage2",
+    "3": "stage3", "stage3": "stage3", "hmax": "stage3",
+    "stage3_hmax": "stage3", "3hmax": "stage3", "fl": "stage3",
+    "3h0": "stage3_h0", "h0": "stage3_h0", "stage3_h0": "stage3_h0",
+}
+
+DEFAULT_STAGE = "stage2"   # unchanged behaviour when nothing is selected
+
+
+def normalize_stage(name):
+    """Map a user-supplied stage spelling onto an AGENT_STAGES key.
+
+    Accepts '2'/'3' as well as the canonical 'stage2'/'stage3'/'stage3_h0'.
+    Raises ValueError (listing the valid choices) on anything else, so a typo can
+    never silently fall back to the Stage-2 default and make a Stage-3 run a
+    duplicate of a Stage-2 one.
+    """
+    key = STAGE_ALIASES.get(str(name).strip().lower())
+    if key is None:
+        raise ValueError(
+            f"unknown LLM agent stage {name!r}; choose one of "
+            f"{sorted(AGENT_STAGES)} (aliases: {sorted(STAGE_ALIASES)})")
+    return key
+
+
+def load_config(path=None, stage=None):
+    """Frozen consensus config: FROZEN_DEFAULTS + optional JSON override / stage.
 
     Starts from the version-controlled defaults and, if `path` is given or
     consensus_config.json sits next to this file, shallow-merges that JSON on top
     (keys starting with '_' are ignored). Adapter paths are resolved to absolutes.
+
+    `stage` selects a NAMED adapter set from AGENT_STAGES ('stage2' | 'stage3' |
+    'stage3_h0', or the short '2'/'3'). It is applied LAST, so an explicit stage
+    always beats the machine-local consensus_config.json — otherwise a stale
+    gitignored file on one machine could silently revert a Stage-3 selection back
+    to Stage-2 and the run would be mislabelled. Passing both `path` and `stage`
+    is rejected as ambiguous rather than resolved by a precedence rule.
+
     Returns dict: base, adapters{a->abs}, omega[list in AGENT_ORDER], theta,
-    conf_w{high/medium/low}, tie_break_idx.
+    conf_w{high/medium/low}, tie_break_idx, stage (human-readable provenance).
     """
+    if path and stage:
+        raise ValueError(
+            "pass EITHER a consensus-config path OR an agent stage, not both "
+            f"(got path={path!r}, stage={stage!r}). The stage registry already "
+            "names the Stage-2/Stage-3 adapter sets; a path is for a bespoke config.")
     cfg = copy.deepcopy(FROZEN_DEFAULTS)
     override = path or (DEFAULT_CONFIG if os.path.exists(DEFAULT_CONFIG) else None)
     if override:
         with open(override) as f:
             cfg.update({k: v for k, v in json.load(f).items()
                         if not str(k).startswith("_")})
+    if stage is not None:
+        key = normalize_stage(stage)
+        cfg["adapters"] = dict(AGENT_STAGES[key])
+        provenance = key
+    elif path:
+        provenance = f"config:{os.path.basename(path)}"
+    elif override:
+        provenance = f"{DEFAULT_STAGE}+local:{os.path.basename(override)}"
+    else:
+        provenance = f"{DEFAULT_STAGE} (FROZEN_DEFAULTS)"
     adapters = {}
     for a in A.AGENT_ORDER:
         p = cfg["adapters"][a]
@@ -86,6 +162,7 @@ def load_config(path=None):
         "theta": float(cfg["theta_consensus"]),
         "conf_w": conf_w,
         "tie_break_idx": A.AGENT_ORDER.index(tie),
+        "stage": provenance,
     }
 
 
@@ -95,6 +172,18 @@ def load_agents(base, adapters, dtype=torch.bfloat16, device=0):
     `adapters` is a dict {a1,a2,a3 -> path}. Returns (tok, model) with model.eval().
     Select an agent before generating with model.set_adapter("a1"|"a2"|"a3").
     """
+    # Pre-flight: a wrong adapter path otherwise surfaces as an opaque HF "repo id"
+    # error deep inside PeftModel, or — worse for the shifter — a partially loaded
+    # agent set. Check all three up front and name the offender. Deliberately here
+    # and not in load_config, so config-only callers (the eq audit reading ω/θ) keep
+    # working on a clone where the gitignored weights are absent.
+    for a in A.AGENT_ORDER:
+        p = adapters[a]
+        if not os.path.isfile(os.path.join(p, "adapter_config.json")):
+            raise FileNotFoundError(
+                f"LoRA adapter for agent {a} not found: {p}/adapter_config.json is "
+                f"missing. Adapter weights are machine-local (gitignored) — check the "
+                f"selected agent stage / consensus config points at a materialised set.")
     tok = AutoTokenizer.from_pretrained(adapters["a1"])
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token

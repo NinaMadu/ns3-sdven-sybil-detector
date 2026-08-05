@@ -45,6 +45,10 @@ SEQ_FEATURE_COLS = ["delta_t", "temp_id_change_flag", "bsm_x", "bsm_y", "bsm_spe
                     "bsm_heading", "packet_size", "delay", "observer_count",
                     "bsm_msg_count_delta"]
 WINDOW_W, WINDOW_STEP = 10, 1
+# Mean |z| above which a live feature is reported as outside its training scale.
+# 5 sigma is far past anything legitimate mobility/timing noise produces, so this
+# fires on configuration drift (a changed packet size, a new map extent) only.
+DRIFT_ABS_Z_WARN = 5.0
 GRU_HIDDEN, N_CLASSES, DROPOUT, BIDIRECTIONAL = 16, 7, 0.3, True
 BEACON_KEY = ["run_id", "real_node_id", "claimed_node_id", "bsm_temporary_id", "receive_time"]
 
@@ -147,10 +151,67 @@ class TemporalPredictor:
             scaler = pickle.load(f)
         return cls(model, scaler, device)
 
+    def _degenerate_feature_idx(self):
+        """Indices of features that were CONSTANT while the scaler was fitted.
+
+        StandardScaler records var_ == 0 for such a feature and falls back to
+        scale_ == 1.0, so any later drift is fed to the model as a RAW difference
+        rather than a standard score. `packet_size` is the live example: it was a
+        flat 120 B throughout training, then commit c970786 (2026-08-02) made
+        beacons carry real signature bytes on the wire (248 B classical, 3193 B
+        PQC). That is z = 3073 for a feature the model was never able to learn
+        from, and it saturated 30 of the 32 tanh GRU dims — the analyzer returned
+        one constant class for every identity.
+        """
+        var = getattr(self.scaler, "var_", None)
+        if var is None:
+            return np.array([], dtype=int)
+        return np.flatnonzero(np.asarray(var) == 0.0)
+
     def _scale(self, X):
-        """Apply the persisted StandardScaler per timestep (all windows full W)."""
+        """Apply the persisted StandardScaler per timestep (all windows full W).
+
+        Zero-variance-in-training features are pinned to the scaler's own mean
+        (z = 0) before transforming. This is information-PRESERVING, not a
+        correction: a feature that never varied while the model trained cannot
+        have contributed anything to its weights, so neutralising it removes
+        drift noise without discarding learned signal. Everything else is
+        transformed exactly as before, so healthy runs are bit-identical.
+        """
         n, w, f = X.shape
-        return self.scaler.transform(X.reshape(n * w, f)).reshape(n, w, f).astype(np.float32)
+        flat = X.reshape(n * w, f)
+        deg = self._degenerate_feature_idx()
+        if len(deg):
+            flat = flat.copy()
+            for i in deg:
+                flat[:, i] = self.scaler.mean_[i]
+        Z = self.scaler.transform(flat)
+        self._warn_on_drift(Z)
+        return Z.reshape(n, w, f).astype(np.float32)
+
+    # emit the drift warning once per process, not once per scoring window
+    _drift_warned = False
+
+    def _warn_on_drift(self, Z, thresh=DRIFT_ABS_Z_WARN):
+        """Loud warning when a live feature sits far outside its training scale.
+
+        The failure this guards against is silent: the GRU keeps returning
+        confident-looking probabilities while its hidden state is saturated. Had
+        this existed on 2026-08-02 the packet_size regression would have been
+        caught on the first run instead of via a full A/B campaign.
+        """
+        if TemporalPredictor._drift_warned:
+            return
+        mean_abs_z = np.abs(Z).mean(axis=0)
+        bad = [(SEQ_FEATURE_COLS[i], float(mean_abs_z[i]))
+               for i in np.flatnonzero(mean_abs_z > thresh)]
+        if bad:
+            TemporalPredictor._drift_warned = True
+            detail = ", ".join(f"{c} |z|={z:.1f}" for c, z in bad)
+            print(f"[temporal_gru] WARNING: live features far outside the training "
+                  f"scale (mean |z| > {thresh}): {detail}. The GRU's tanh state may be "
+                  f"saturated and its output degenerate — check phi variance before "
+                  f"trusting p_temp.", flush=True)
 
     @torch.no_grad()
     def _extract_phi(self, X, L, batch=65536):

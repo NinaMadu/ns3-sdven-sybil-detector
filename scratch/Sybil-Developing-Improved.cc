@@ -79,6 +79,11 @@ double beaconJitterMax = 0.02;        ///< Maximum random V2V beacon timing jitt
 double rsuReportInterval = 1.5;       ///< RSU→Controller report period.
 bool routing_test = true;             ///< true → small 3-vehicle/2-RSU/1-SDN test network.
 bool g_secEnabled         = true;     ///< Master security toggle — false = plain network (no crypto/registration).
+bool g_chargeCryptoAirtime = true;    ///< Charge crypto bytes as airtime (--cryptoWireOverhead). TRUE = the
+                                      ///< corrected c970786 behaviour (supervisor Q33). FALSE restores pre-
+                                      ///< 2026-08-02 packet sizing so beacons are a flat 120 B again — needed
+                                      ///< only because packet_size is also a temporal-GRU feature whose scaler
+                                      ///< was fitted at a constant 120 B. See SecurityWireOverheadBytes().
 bool sybil_attack_enabled = false;    ///< Master on/off for Sybil behavior.
 uint32_t sybil_attack_percentage = 25;///< % of eligible nodes that are attackers.
 uint32_t sybil_attacker_level = 2;    ///< Attacker sophistication: 1=basic, 2=standard, 3=stealth, 4=advanced.
@@ -348,6 +353,15 @@ std::string llmConsensusConfig = "";         ///< D-stack D5/D6: consensus confi
                                              ///< frozen Stage-2 CENTRALLY trained adapters (D5); a
                                              ///< path swaps in the Stage-3 LLM-FL federated ones (D6).
                                              ///< Nothing upstream of the decision layer changes.
+std::string llmAgentStage = "";              ///< LLM AGENT SHIFTER: the NAMED adapter-set selector.
+                                             ///< "" or "2"/"stage2" = Stage-2 CENTRALLY trained agents
+                                             ///< (default); "3"/"stage3" = Stage-3 LLM-FL FEDERATED
+                                             ///< agents (Hmax partition); "stage3_h0" = the H0/IID
+                                             ///< federated contingency set. Only the LoRA adapters
+                                             ///< change — the three role prompts, the base model, ω
+                                             ///< and θ are identical, so a Stage-2 vs Stage-3 delta is
+                                             ///< attributable to the federation alone. Mutually
+                                             ///< exclusive with llmConsensusConfig (same selector).
 double   mlflTau = -1.0;                     ///< D-stack: explicit ŷ_ens decision threshold for the
                                              ///< mlfl_only conditions (D2/D3/D4). Each rung has its
                                              ///< own ŷ_ens distribution, so reusing C1's single tau
@@ -15305,6 +15319,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getUint  ("controllerRegistrationThreshold", controllerRegistrationThreshold);
     getDouble("simTime",                         simTime);
     getBool  ("routing_test",                    routing_test);
+    getBool  ("cryptoWireOverhead",              g_chargeCryptoAirtime);
     getDouble("beaconInterval",                  beaconInterval);
     getDouble("beaconJitterMax",                 beaconJitterMax);
     getDouble("rsuReportInterval",               rsuReportInterval);
@@ -15361,6 +15376,7 @@ ApplyConfigFile(const std::map<std::string, std::string>& cfg)
     getStr("ablateStream",                       ablateStream);
     getStr("ablateLlm",                          ablateLlm);
     getStr("llmConsensusConfig",                 llmConsensusConfig);
+    getStr("llmAgentStage",                      llmAgentStage);
     getDouble("mlflTau",                         mlflTau);
     getUint("txgbMinBeacons",                    txgbMinBeacons);
     getDouble("detectLatency",                   detectLatencySec);
@@ -15417,6 +15433,7 @@ main(int argc, char* argv[])
     std::string g_zoneProfilesPath;
     CommandLine cmd;
     cmd.AddValue("SecEnabled",                 "Enable crypto, registration & token auth (false = plain network)", g_secEnabled);
+    cmd.AddValue("cryptoWireOverhead",         "Charge crypto signature/key bytes as real airtime (default true = beacons 248B classical / 3193B PQC, supervisor Q33). false = pre-2026-08-02 sizing, beacons flat 120B with crypto in zero-cost PacketTags. Set false ONLY for detector experiments needing the temporal GRU's training-time packet_size; such a run is NOT a valid PQC cost measurement", g_chargeCryptoAirtime);
     cmd.AddValue("config",                     "Path to .cfg scenario file (key=value)",  configFile);
     cmd.AddValue("N_Vehicles",                 "Number of vehicle nodes",                N_Vehicles);
     cmd.AddValue("N_RSUs",                     "Number of RSU edge nodes",               N_RSUs);
@@ -15502,6 +15519,7 @@ main(int argc, char* argv[])
     cmd.AddValue("ablateStream", "Ablation B2: pin the Eq 3.20 RSU ensemble to one evidence stream — fl_only|temp_only|rssi_only (empty = jointly-tuned lambda)", ablateStream);
     cmd.AddValue("ablateLlm", "Ablation C1: drop the LLM tier and threshold Eq 3.20 y_hat_ens directly — mlfl_only (empty = full LLM multi-agent tier)", ablateLlm);
     cmd.AddValue("llmConsensusConfig", "D-stack D5/D6: path to a consensus config JSON selecting the Eq 3.21 LoRA adapter set (empty = frozen Stage-2 CENTRALLY trained adapters = D5; a Stage-3 LLM-FL config = D6)", llmConsensusConfig);
+    cmd.AddValue("llmAgentStage", "LLM AGENT SHIFTER: select the Eq 3.21 agents by NAME — '2'/'stage2' = Stage-2 CENTRALLY trained (default), '3'/'stage3' = Stage-3 LLM-FL FEDERATED (Hmax), 'stage3_h0' = the H0/IID federated set. Only the LoRA adapters change (role prompts, base model, omega, theta identical). Mutually exclusive with --llmConsensusConfig", llmAgentStage);
     cmd.AddValue("mlflTau", "D-stack: explicit y_hat_ens decision threshold for the ablateLlm=mlfl_only conditions; each rung needs its own calibrated tau (negative = let the daemon calibrate)", mlflTau);
     cmd.AddValue("txgbMinBeacons", "D-stack: RSU temporal-XGB per-window minimum deduped-beacon count (0 = the trained default of 2; 1 restores p_bar_temp coverage for short-lived v3 rotation identities)", txgbMinBeacons);
     // ── Group E: security-infrastructure ablations (§5.2.5) ────────────────
@@ -15651,6 +15669,21 @@ main(int argc, char* argv[])
                   << "B chan_ack="   << SecurityWireOverheadBytes(CHAN_ACK) << "B"
                   << std::endl;
 
+        // A run with airtime charging OFF looks like a normal PQC run in every other
+        // log line, so say so loudly here and in metrics_S_security_profile.csv —
+        // otherwise its PDR/latency numbers get quoted as if crypto had been paid for.
+        if (!g_chargeCryptoAirtime)
+        {
+            std::cout << "[SecuritySuite] *** --cryptoWireOverhead=false: crypto bytes are "
+                         "NOT charged as airtime (pre-2026-08-02 sizing; beacons carry only "
+                         "their payload, keys/signatures ride in zero-cost PacketTags).\n"
+                         "[SecuritySuite] *** This run reproduces the temporal GRU's "
+                         "training-time packet_size. PDR / latency / channel-load and any "
+                         "PQC-vs-classical comparison from it are NOT valid security-cost "
+                         "measurements and must not be reported as a PQC arm.\n"
+                      << std::flush;
+        }
+
         if (full_crypto_profile == 2 && !CryptoPqcAvailable())
         {
             std::cerr << "[SecuritySuite] FATAL-ish: --full_crypto_profile=2 requested but "
@@ -15665,7 +15698,8 @@ main(int argc, char* argv[])
         sf << "security_suite,sec_enabled,solution_mode,full_crypto_profile,liboqs_linked,"
               "beacon_sig_bytes,beacon_pub_bytes,auth_sig_bytes,auth_pub_bytes,"
               "kem_pub_bytes,kem_ct_bytes,"
-              "wire_overhead_v2v_beacon,wire_overhead_chan_hello,wire_overhead_chan_ack\n"
+              "wire_overhead_v2v_beacon,wire_overhead_chan_hello,wire_overhead_chan_ack,"
+              "crypto_airtime_charged\n"
            << SecuritySuiteName() << ","
            << (g_secEnabled ? 1 : 0) << "," << solution_mode << ","
            << full_crypto_profile << "," << (CryptoPqcAvailable() ? 1 : 0) << ","
@@ -15674,7 +15708,8 @@ main(int argc, char* argv[])
            << SuiteKemPubBytes()    << "," << SuiteKemCtBytes()     << ","
            << SecurityWireOverheadBytes(V2V_BEACON) << ","
            << SecurityWireOverheadBytes(CHAN_HELLO) << ","
-           << SecurityWireOverheadBytes(CHAN_ACK) << "\n";
+           << SecurityWireOverheadBytes(CHAN_ACK) << ","
+           << (g_chargeCryptoAirtime ? 1 : 0) << "\n";
     }
     if (!ablateMitigation.empty() || rsuRevocationThreshold > 0 ||
         rsuEndorserPoolSize > 0 || rsuEndorserPolicy != "dynamic" ||
@@ -16563,6 +16598,17 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
 
     Simulator::Stop(Seconds(simTime));
+    // LLM agent shifter: selecting a stage only means something where the Eq 3.21 agents
+    // actually run. Outside MODE_FULL/adaptive the flag is a silent no-op, which is how a
+    // run gets mislabelled "Stage-3" in a results table — so refuse it here rather than
+    // let it pass unnoticed.
+    if (!llmAgentStage.empty() && !FullSolutionModeActive() && !AdaptiveSolutionModeActive())
+    {
+        NS_FATAL_ERROR("--llmAgentStage='" << llmAgentStage << "' requires the LLM tier: "
+                       "use --solution_mode=5 (MODE_FULL) or the adaptive mode. In the "
+                       "current mode no Eq 3.21 agents are loaded, so the stage would be "
+                       "silently ignored");
+    }
     // Full-mode (MODE_FULL): launch the persistent LLM detector daemon and schedule
     // periodic SCORE windows. Blocks briefly while the daemon loads its models. The
     // sink feeds each window's verdicts into the RSU evidence tables + Eq 3.22 consensus.
@@ -16654,15 +16700,59 @@ main(int argc, char* argv[])
                                    << "' does not exist or is unreadable");
                 }
             }
+            // LLM AGENT SHIFTER. Validate the stage name HERE (not only in the daemon):
+            // the daemon is launched detached in the background, so a bad value there
+            // would surface as a hung socket connect rather than a clear error. Reject an
+            // unknown spelling outright — falling back to Stage-2 on a typo is precisely
+            // how a "Stage-3" row ends up holding Stage-2 numbers.
+            if (!llmAgentStage.empty())
+            {
+                if (llmAgentStage != "2" && llmAgentStage != "stage2"
+                    && llmAgentStage != "3" && llmAgentStage != "stage3"
+                    && llmAgentStage != "stage3_h0")
+                {
+                    NS_FATAL_ERROR("--llmAgentStage='" << llmAgentStage << "' is not a known "
+                                   "agent stage; use 2|stage2 (Stage-2 central), "
+                                   "3|stage3 (Stage-3 LLM-FL federated, Hmax), or "
+                                   "stage3_h0 (Stage-3 federated, H0/IID)");
+                }
+                // Both flags name the adapter set. Honouring one and dropping the other
+                // silently would make the run's provenance unknowable after the fact.
+                if (!llmConsensusConfig.empty())
+                {
+                    NS_FATAL_ERROR("--llmAgentStage and --llmConsensusConfig both select the "
+                                   "Eq 3.21 LoRA adapter set; pass only one (got stage='"
+                                   << llmAgentStage << "', config='" << llmConsensusConfig << "')");
+                }
+                // The stage picks the adapters; mlfl_only removes the agents entirely.
+                if (ablateLlm == "mlfl_only")
+                {
+                    NS_FATAL_ERROR("--llmAgentStage='" << llmAgentStage << "' is meaningless "
+                                   "with --ablateLlm=mlfl_only, which drops the LLM tier "
+                                   "(no Eq 3.21 agents are loaded at all)");
+                }
+            }
+            // Always announce which agent stage is live — not only under an ablation — so
+            // every MODE_FULL run.log records the provenance of the adapters it used.
+            std::cout << "[LLMRealtime] LLM agent stage: "
+                      << (!llmAgentStage.empty()
+                              ? llmAgentStage + " (named selector)"
+                              : (!llmConsensusConfig.empty()
+                                     ? "config:" + llmConsensusConfig
+                                     : std::string("stage2 (Stage-2 central, default)")))
+                      << "\n" << std::flush;
             if (!ablateAnalyzer.empty() || !ablateStream.empty() || !ablateLlm.empty()
-                || !llmConsensusConfig.empty() || txgbMinBeacons > 0 || mlflTau >= 0.0)
+                || !llmConsensusConfig.empty() || !llmAgentStage.empty()
+                || txgbMinBeacons > 0 || mlflTau >= 0.0)
             {
                 std::cout << "[LLMRealtime] ABLATION active:"
                           << " analyzer_dropped=" << (ablateAnalyzer.empty() ? "none" : ablateAnalyzer)
                           << " ensemble_stream=" << (ablateStream.empty() ? "tuned-lambda" : ablateStream)
                           << " llm_tier=" << (ablateLlm.empty() ? "full-3-agent-consensus" : ablateLlm)
-                          << " llm_adapters=" << (llmConsensusConfig.empty()
-                                                  ? "central-stage2-frozen" : llmConsensusConfig)
+                          << " llm_adapters=" << (!llmAgentStage.empty()
+                                                  ? llmAgentStage
+                                                  : (llmConsensusConfig.empty()
+                                                     ? "central-stage2-frozen" : llmConsensusConfig))
                           << " txgb_min_beacons=" << (txgbMinBeacons > 0 ? std::to_string(txgbMinBeacons)
                                                                          : std::string("default(2)"))
                           << " mlfl_tau=" << (mlflTau >= 0.0 ? std::to_string(mlflTau)
@@ -16673,6 +16763,7 @@ main(int argc, char* argv[])
             LLMRealtimeDetector::SetAblateStream(ablateStream);
             LLMRealtimeDetector::SetAblateLlm(ablateLlm);
             LLMRealtimeDetector::SetLlmConsensusConfig(llmConsensusConfig);
+            LLMRealtimeDetector::SetLlmAgentStage(llmAgentStage);
             LLMRealtimeDetector::SetTxgbMinBeacons(static_cast<int>(txgbMinBeacons));
             if (mlflTau >= 0.0)
                 LLMRealtimeDetector::SetMlflTau(std::to_string(mlflTau));

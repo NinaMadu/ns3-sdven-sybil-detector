@@ -81,6 +81,13 @@ static std::string g_llmConsensusConfig = ""; // D5/D6: consensus config JSON se
                                            //     adapter set. Empty = the frozen Stage-2 CENTRALLY
                                            //     trained adapters (D5); a path swaps in the
                                            //     Stage-3 LLM-FL federated adapters (D6)
+static std::string g_llmAgentStage  = "";  // LLM AGENT SHIFTER: the NAMED form of the same
+                                           //     selector — "2" = Stage-2 central (default),
+                                           //     "3" = Stage-3 LLM-FL federated (Hmax),
+                                           //     "stage3_h0" = the H0/IID federated set. Only
+                                           //     the LoRA adapters change; role prompts, base
+                                           //     model, omega and theta are identical across
+                                           //     stages. Mutually exclusive with the config path.
 static int         g_txgbMinBeacons  = 0;  // D-stack: override the RSU temporal-XGB per-window
                                            //     minimum beacon count (0 = leave the default 2)
 static std::string g_ablateStream   = "";  // B2: "fl_only"|"temp_only"|"rssi_only" — pin the
@@ -137,6 +144,7 @@ static void (*g_costSink)(double, double, uint32_t) = nullptr;
 [[maybe_unused]] static void SetAblateLlm(const std::string& s)      { g_ablateLlm = s; }
 [[maybe_unused]] static void SetMlflTau(const std::string& s)        { g_mlflTau = s; }
 [[maybe_unused]] static void SetLlmConsensusConfig(const std::string& p) { g_llmConsensusConfig = p; }
+[[maybe_unused]] static void SetLlmAgentStage(const std::string& s)      { g_llmAgentStage = s; }
 [[maybe_unused]] static void SetTxgbMinBeacons(int n)                { g_txgbMinBeacons = n; }
 [[maybe_unused]] static void SetVerdictSink(void (*cb)(const std::vector<Verdict>&)) { g_verdictSink = cb; }
 [[maybe_unused]] static void SetShouldScoreGate(bool (*fn)()) { g_shouldScoreFn = fn; }
@@ -167,6 +175,10 @@ static void LaunchDaemon()
         cmd << " --mlfl-tau " << g_mlflTau;
     if (!g_llmConsensusConfig.empty())
         cmd << " --consensus-config " << g_llmConsensusConfig;
+    // LLM agent shifter. The .cc rejects setting this together with the config path,
+    // so at most one of the two adapter selectors ever reaches the daemon's argv.
+    if (!g_llmAgentStage.empty())
+        cmd << " --agent-stage " << g_llmAgentStage;
     if (g_txgbMinBeacons > 0)
         cmd << " --txgb-min-beacons " << g_txgbMinBeacons;
     cmd << " > " << g_daemonLog << " 2>&1 &'";

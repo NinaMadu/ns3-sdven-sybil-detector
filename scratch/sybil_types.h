@@ -1809,10 +1809,30 @@ inline uint32_t SuiteKemCtBytes()
 // Under SUITE_NONE every branch returns 0 and packet sizes collapse to the
 // plain-network baseline, which is exactly what the third arm should measure.
 // ---------------------------------------------------------------------------
+// Master switch for CHARGING the crypto bytes as airtime (--cryptoWireOverhead).
+// DEFAULT true = the corrected behaviour from commit c970786 (supervisor Q33).
+// false restores the pre-2026-08-02 sizing: beacons and handshakes are created at
+// their application payload size and the crypto material rides in PacketTags at zero
+// airtime.
+//
+// WHY THIS EXISTS. packet_size doubles as an ML feature. The temporal GRU's scaler was
+// fitted while beacons were a flat 120 B (StandardScaler stored var_==0, scale_==1), so
+// once beacons became 248 B / 3193 B that feature arrived at z=128 / z=3073 and
+// saturated 30 of the 32 tanh GRU dims — the analyzer then returned one constant class
+// for every identity. This flag reproduces the training-time wire conditions without
+// editing code.
+//
+// ⚠ Turning it OFF makes the run UNSOUND as a security-COST measurement: PDR, latency,
+// channel contention and any PQC-vs-classical comparison stop seeing the crypto. Use it
+// only for detector-focused experiments and never report such a run as a PQC arm.
+// Cryptographic BYTE accounting (M8) is unaffected — it reads SuiteAuthSigBytes()
+// directly and still reports true crypto volume regardless of this flag.
+extern bool g_chargeCryptoAirtime;
+
 inline uint32_t
 SecurityWireOverheadBytes(uint32_t messageType)
 {
-    if (GetSecuritySuite() == SUITE_NONE)
+    if (GetSecuritySuite() == SUITE_NONE || !g_chargeCryptoAirtime)
         return 0;
 
     const uint32_t pqcKeyTransport =

@@ -97,7 +97,8 @@ class Daemon:
                  batch=64, max_new=128, agent_device=0, max_identities=None,
                  window_margin=30.0, ensemble_gate=0.5, max_llm_candidates=2000,
                  ablate_analyzer=None, ablate_stream=None, ablate_llm=None,
-                 mlfl_tau=None, consensus_config=None, txgb_min_beacons=None):
+                 mlfl_tau=None, consensus_config=None, txgb_min_beacons=None,
+                 agent_stage=None):
         self.run_dir = run_dir
         self.run_id = os.path.basename(os.path.normpath(run_dir))
         self.cap = cap
@@ -159,7 +160,12 @@ class Daemon:
         # D5/D6: which LoRA adapter set the Eq 3.21 agents load. None = the frozen
         # Stage-2 CENTRALLY trained adapters (D5); a config path swaps in the Stage-3
         # LLM-FL federated adapters (D6) without touching anything upstream.
+        # `agent_stage` is the NAMED form of the same switch ('2'/'3'/'stage3_h0'),
+        # resolved against consensus_infer.AGENT_STAGES. The two are mutually
+        # exclusive; load_config raises if both arrive. Only the adapters change —
+        # role prompts, base, ω and θ are identical across stages.
         self.consensus_config = consensus_config
+        self.agent_stage = agent_stage
         self.mlfl_only = (ablate_llm == "mlfl_only")
         if mlfl_tau is not None:
             self.mlfl_tau, self.mlfl_tau_src = float(mlfl_tau), "--mlfl-tau"
@@ -200,7 +206,7 @@ class Daemon:
                   flush=True)
         else:
             print("[daemon] loading frozen consensus config + 3 LoRA agents (GPU) ...", flush=True)
-            self.cfg = CI.load_config(self.consensus_config)
+            self.cfg = CI.load_config(self.consensus_config, stage=self.agent_stage)
             self.tok, self.model = CI.load_agents(self.cfg["base"], self.cfg["adapters"],
                                                   device=agent_device)
             self.sysmsg = {a: A.AGENTS[a]["system"] for a in A.AGENT_ORDER}
@@ -210,6 +216,7 @@ class Daemon:
                   f"ablate_analyzer={self.ablate_analyzer or 'none'}, "
                   f"ablate_stream={self.ablate_stream or 'tuned-lambda'}, "
                   f"txgb_min_beacons={self.txgb_min_beacons}; "
+                  f"agent_stage={self.cfg['stage']}; "
                   f"consensus_config={self.consensus_config or 'FROZEN_DEFAULTS (central)'}; "
                   f"adapters={ {a: os.path.join(*p.split(os.sep)[-2:]) for a, p in self.cfg['adapters'].items()} })",
                   flush=True)
@@ -526,12 +533,23 @@ def main():
                          f"(default: read from ablation/C1/results/mlfl_tau.json, else "
                          f"{MLFL_TAU_FALLBACK}; calibrated on the val split by "
                          f"ablation/C1/c1_llm_vs_mlfl.py)")
+    ap.add_argument("--agent-stage", default=None,
+                    choices=sorted(set(CI.STAGE_ALIASES)),
+                    help="LLM AGENT SHIFTER: select the Eq 3.21 agents' LoRA adapter set "
+                         "by NAME. '2'/'stage2' = Stage-2 CENTRALLY trained (default, D5); "
+                         "'3'/'stage3' = Stage-3 LLM-FL FEDERATED, Hmax partition (D6); "
+                         "'stage3_h0' = the H0/IID federated contingency set. Only the "
+                         "adapters change — base model, the three role prompts, ω, θ and "
+                         "the confidence weights are identical across stages. Mutually "
+                         "exclusive with --consensus-config. Omit = Stage-2")
     ap.add_argument("--consensus-config", default=None,
                     help="path to a consensus config JSON overriding the frozen Stage-2 "
                          "deployment defaults — chiefly `adapters` (a1/a2/a3 LoRA paths) "
                          "and ω/θ. Used by the D-stack ladder to swap the CENTRALLY "
                          "trained adapters (D5, the default) for the Stage-3 LLM-FL "
-                         "federated ones (D6). Omit = FROZEN_DEFAULTS")
+                         "federated ones (D6). Prefer --agent-stage for the plain "
+                         "Stage-2/Stage-3 switch; this stays for bespoke configs that "
+                         "also move ω/θ. Omit = FROZEN_DEFAULTS")
     ap.add_argument("--txgb-min-beacons", type=int, default=None,
                     help="override the RSU temporal-XGB per-window minimum deduped-beacon "
                          "count (default 2). Lowering to 1 restores p̄_temp coverage for "
@@ -539,6 +557,14 @@ def main():
                          "one window")
     ap.add_argument("--serve", action="store_true")
     args = ap.parse_args()
+    # Fail before the (expensive) predictor load rather than after: both switches name
+    # the adapter set, so accepting both would silently honour one and drop the other.
+    if args.agent_stage and args.consensus_config:
+        ap.error("--agent-stage and --consensus-config both select the LoRA adapter set; "
+                 "pass only one")
+    if args.agent_stage and args.ablate_llm == "mlfl_only":
+        ap.error("--agent-stage is meaningless with --ablate-llm mlfl_only (that condition "
+                 "loads no LLM agents at all)")
 
     d = Daemon(args.run_dir, cap=args.cap, carry_forward=args.carry_forward,
                tol=args.tol, batch=args.batch, max_new=args.max_new,
@@ -547,7 +573,8 @@ def main():
                ablate_analyzer=args.ablate_analyzer, ablate_stream=args.ablate_stream,
                ablate_llm=args.ablate_llm, mlfl_tau=args.mlfl_tau,
                consensus_config=args.consensus_config,
-               txgb_min_beacons=args.txgb_min_beacons)
+               txgb_min_beacons=args.txgb_min_beacons,
+               agent_stage=args.agent_stage)
     if args.once is not None:
         vs = d.score(args.once, only_new=False, max_identities=args.max_identities)
         print(f"\n=== {len(vs)} verdicts @ t={args.once} ===")
