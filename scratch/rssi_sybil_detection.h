@@ -115,7 +115,22 @@ static double kMmseCoarseStep = 5.0;
 /// MMSE grid search step — fine pass (metres).
 static double kMmseFineStep = 0.5;
 
-/// Output CSV path.
+/// Minimum distinct claimedIds in a Mean-Shift cluster before it is called
+/// Sybil. The paper (§III-C) flags a cluster holding MORE THAN ONE identity,
+/// i.e. 2 — which is the default, so behaviour is unchanged. Exposed so the
+/// FP/TP trade-off can be swept: raising it demands a larger co-located
+/// identity group before anything is flagged.
+static uint32_t kMinClusterIds = 2;
+
+/// Consecutive RunDetection() windows an identity must be flagged in before
+/// the verdict is committed. 1 = commit immediately (the original behaviour,
+/// and the default). Higher values suppress single-window flapping, which is
+/// what the previously-unwired --rssiStreak knob was meant to control.
+static uint32_t kStreakRequired = 1;
+
+/// Output CSV path. SetCsvPath() redirects this into the run's --outputDir.
+/// The hardcoded default is a GLOBAL path shared by every run, so without
+/// SetCsvPath() concurrent or successive runs overwrite each other.
 static std::string kCsvPath = "sybil-attack/outputs/rssi_paper_detection_log.csv";
 
 // =============================================================================
@@ -156,6 +171,10 @@ static uint32_t g_TP = 0, g_FP = 0, g_TN = 0, g_FN = 0;
 /// Map: claimedId → {actSybil, detSybil} of the LAST committed verdict.
 struct Verdict { bool actSybil; bool detSybil; };
 static std::map<uint32_t, Verdict> g_committed;
+
+/// Consecutive-window flag counter per claimedId, for kStreakRequired.
+/// Reset to 0 whenever a window does NOT flag the identity.
+static std::map<uint32_t, uint32_t> g_streak;
 
 // =============================================================================
 // STEP 1 — RSSI to distance  (Cost231 inverse, paper eq. 1 → eq. 8)
@@ -359,6 +378,37 @@ static void WriteCsvRow(const ResultRow& r)
 // =============================================================================
 
 /// Call once in main() AFTER rsuMobility.Install().
+/// Redirect the detection CSV into a per-run directory. Call BEFORE Init(),
+/// which truncates the file. Without this every run overwrites the global
+/// default path.
+static void SetCsvPath(const std::string& path) { kCsvPath = path; }
+
+/// Override the tunable detector parameters from the command line.
+/// Call BEFORE Init() so the values are visible in the Init banner.
+///
+/// Every argument defaults to the value the detector already had compiled in,
+/// so a caller that passes the current constants gets bit-identical behaviour.
+/// A non-positive / zero argument leaves that parameter untouched.
+///
+/// ONLY reachable from the solution_mode==MODE_BASELINE_RSSI path. MODE_FULL
+/// never includes this detector in its scoring, so this cannot perturb M_F.
+static void Configure(double   meanShiftR,
+                      double   coLocDistThresh,
+                      double   windowSec,
+                      uint32_t minSamplesForMle,
+                      uint32_t minRsuForMmse,
+                      uint32_t minClusterIds,
+                      uint32_t streakRequired)
+{
+    if (meanShiftR       > 0.0) kMeanShiftR       = meanShiftR;
+    if (coLocDistThresh  > 0.0) kCoLocDistThresh  = coLocDistThresh;
+    if (windowSec        > 0.0) kWindowSec        = windowSec;
+    if (minSamplesForMle > 0u)  kMinSamplesForMle = minSamplesForMle;
+    if (minRsuForMmse    > 0u)  kMinRsuForMmse    = minRsuForMmse;
+    if (minClusterIds    > 0u)  kMinClusterIds    = minClusterIds;
+    if (streakRequired   > 0u)  kStreakRequired   = streakRequired;
+}
+
 static void Init(uint32_t nRsu, const std::vector<RssiPos2D>& rsuPositions)
 {
     g_nRsu   = nRsu;
@@ -366,13 +416,17 @@ static void Init(uint32_t nRsu, const std::vector<RssiPos2D>& rsuPositions)
     g_obs.assign(nRsu, {});
     g_TP = g_FP = g_TN = g_FN = 0;
     g_committed.clear();
+    g_streak.clear();
     InitCsv();
     std::cout << "[RssiSybilDetector] Init (IMPROVED):"
               << " RSUs="    << nRsu
               << "  R="      << kMeanShiftR    << "m (was 2.0)"
               << "  window=" << kWindowSec     << "s (was 0.1)"
               << "  coloc="  << kCoLocDistThresh << "m (was 3.0)"
-              << "  minSamp=" << kMinSamplesForMle << "\n";
+              << "  minSamp=" << kMinSamplesForMle
+              << "  minRsuMmse=" << kMinRsuForMmse
+              << "  minClusterIds=" << kMinClusterIds
+              << "  streak=" << kStreakRequired << "\n";
     for (uint32_t u = 0; u < nRsu; ++u)
         std::cout << "  RSU" << u
                   << " pos=(" << rsuPositions[u].x
@@ -515,8 +569,11 @@ static void RunDetection(double roadXMin =   0.0,
         int ii = ciMap[ci];
         // FIX 5 — use distinct claimedId count, not raw cluster size
         uint32_t clusterCid = cIdMap[ci];
+        // kMinClusterIds defaults to 2, i.e. the paper's "more than one
+        // identity at the same position"; raising it requires a larger
+        // co-located identity group before the cluster is flagged.
         bool isSybilCluster = (cDistinctIds.size() > clusterCid &&
-                               cDistinctIds[clusterCid].size() > 1);
+                               cDistinctIds[clusterCid].size() >= kMinClusterIds);
         detSybil[ii]  = isSybilCluster;
         detMethod[ii] = posMethod[ii];
     }
@@ -555,6 +612,22 @@ static void RunDetection(double roadXMin =   0.0,
         bool actSybil = (infos[i].realId != infos[i].claimedId);
         bool det      = detSybil[i];
         uint32_t cid  = infos[i].claimedId;
+
+        // Streak confirmation: an identity must be flagged in kStreakRequired
+        // CONSECUTIVE windows before the positive verdict is committed. With
+        // the default of 1 this is a no-op and every raw flag commits, exactly
+        // as before. The CSV row written below records the CONFIRMED verdict,
+        // so detected_sybil in the log always agrees with the TP/FP counters.
+        if (det)
+        {
+            uint32_t& s = g_streak[cid];
+            if (s < kStreakRequired) ++s;
+            if (s < kStreakRequired) det = false;   // not yet confirmed
+        }
+        else
+        {
+            g_streak[cid] = 0;
+        }
 
         uint32_t clustCid = 0, clustSz = 1;
         for (size_t ci = 0; ci < ciMap.size(); ++ci)
@@ -724,10 +797,15 @@ static void PrintMetrics()
     // =========================================================
 
     std::cout << "\n========================================================\n";
-    std::cout << "          SECURITY EVALUATION METRICS\n";
+    std::cout << "     RSSI BASELINE (Liu et al. ICC 2023) METRICS\n";
     std::cout << "========================================================\n\n";
 
-    std::cout << "Mode        : MF_rule_based\n";
+    // NOTE: this block is RssiSybilDetector's OWN scoring, independent of the
+    // simulator's M5/M6 matrix. It used to print the banner "SECURITY
+    // EVALUATION METRICS" with "Mode: MF_rule_based", which is MODE_FULL's
+    // label — it is not MODE_FULL and never was, and that mislabel caused the
+    // block to be read as a duplicate of the simulator's own summary.
+    std::cout << "Mode        : baseline2_rssi (solution_mode=2)\n";
 
     std::cout << std::fixed << std::setprecision(4);
 

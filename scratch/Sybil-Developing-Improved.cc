@@ -97,12 +97,30 @@ uint32_t sybil_attack_type = 0;       ///< Attack variant (see sybil_attacks.h).
 // so no pre-existing scenario, ablation or dataset run is affected.
 uint32_t g_sybilIdentitiesPerAttacker = 0; ///< iota override; 0 = derive from sybil_attacker_level.
 uint32_t g_maliciousControllerCount   = 0; ///< explicit f; 0 = derive from sybil_attack_percentage.
-// RSSI co-location detection tuning + logging flags (bound by CmdLine below).
-double   rssiClusterRadius  = 25.0;   ///< Co-location cluster radius (m).
-double   rssiDist1Thresh    = 15.0;   ///< 1-RSU fallback distance threshold (m).
-double   rssiWindowSec      = 2.0;    ///< Rolling observation window (s).
-uint32_t rssiMinSamples     = 8;      ///< Min samples per RSU before including in detection.
-uint32_t rssiStreakRequired = 2;      ///< Consecutive windows to confirm Sybil.
+// RSSI baseline (solution_mode=2) detector tuning, bound by CmdLine below and
+// pushed into RssiSybilDetector::Configure() from InitializeRssiSolution().
+//
+// These five were declared here from the start but NEVER READ by anything —
+// their old defaults (25 / 15 / 2.0 / 8 / 2) did not even match the detector's
+// compiled-in constants, so setting them on the command line silently did
+// nothing. They are now wired, and their defaults are set to the values
+// rssi_sybil_detection.h already used, so a run that does not pass them
+// behaves exactly as before.
+//
+// MODE_FULL is unaffected: RssiSybilDetector is only ever driven from the
+// RssiSolutionModeActive() branches.
+// FLEMDS baseline (solution_mode=1) decision threshold, applied to
+// FLSybilDetector::RunInference()'s sigmoid output. 0.5 = the previously
+// hardcoded value; inert in every other solution_mode.
+double   flThreshold        = 0.5;    ///< FLEMDS sigmoid decision threshold tau
+
+double   rssiClusterRadius  = 2.5;    ///< Mean-Shift radius R (m)      -> kMeanShiftR
+double   rssiDist1Thresh    = 1.5;    ///< 1-RSU co-location thresh (m) -> kCoLocDistThresh
+double   rssiWindowSec      = 0.3;    ///< Rolling observation window(s)-> kWindowSec
+uint32_t rssiMinSamples     = 3;      ///< Min RSSI samples for MLE     -> kMinSamplesForMle
+uint32_t rssiStreakRequired = 1;      ///< Consecutive windows to confirm (1 = immediate)
+uint32_t rssiMinRsuForMmse  = 3;      ///< RSUs needed for MMSE fix     -> kMinRsuForMmse
+uint32_t rssiMinClusterIds  = 2;      ///< Distinct ids to flag cluster -> kMinClusterIds
 bool     sweepMode          = false;  ///< Suppress per-packet logging for fast threshold sweeps.
 bool     quietMode          = false;  ///< Suppress console output (CSV writes unaffected).
 /// Beacon channel policy — see BindSenderToChannel() in sybil_types.h.
@@ -8558,6 +8576,24 @@ InitializeRssiSolution()
     if (!RssiSolutionModeActive())
         return;
 
+    // Push the --rssi* command-line knobs into the detector. Defaults equal the
+    // detector's own compiled-in constants, so an invocation that passes none
+    // of them is bit-identical to the pre-wiring behaviour.
+    RssiSybilDetector::Configure(rssiClusterRadius,
+                                 rssiDist1Thresh,
+                                 rssiWindowSec,
+                                 rssiMinSamples,
+                                 rssiMinRsuForMmse,
+                                 rssiMinClusterIds,
+                                 rssiStreakRequired);
+
+    // Keep the detection log inside the run's own directory. kCsvPath is
+    // otherwise a single GLOBAL file that every run overwrites, which silently
+    // destroys the previous run's evidence during a sweep. Must precede Init(),
+    // which truncates the file.
+    if (!outputDir.empty())
+        RssiSybilDetector::SetCsvPath(outputDir + "/rssi_paper_detection_log.csv");
+
     std::vector<RssiSybilDetector::RssiPos2D> rsuPos;
     for (uint32_t u = 0; u < N_RSUs; ++u)
     {
@@ -13164,8 +13200,13 @@ DeliverVerifiedBeacon(uint32_t receiverId, const BufferedBeacon& b)
             feat[9] = clamp01(positionRadius / 5000.0);
         }
 
+        // tau was hardcoded at 0.5, which flags 94.8% of all beacons and costs
+        // ~0.12 MCC against the tau that maximises it on this feature set
+        // (measured offline: MCC 0.221 at tau=0.5 vs 0.344 at tau=0.543, on
+        // mobility_mode=2 / type 2 / 40%). Default stays 0.5 so existing runs
+        // are unchanged; --flThreshold makes the operating point sweepable.
         double pred           = FLSybilDetector::RunInference(feat);
-        bool   predictedSybil = (pred >= 0.5);
+        bool   predictedSybil = (pred >= flThreshold);
 
         g_secMetrics->RecordFLPacketDecision(
             claimedId, isActuallySybil, predictedSybil, "vehicle", now);
@@ -15236,7 +15277,26 @@ static void
 SendControllerRsuCommand(uint32_t rsuIndex)
 {
     if (RssiSolutionModeActive() && rsuIndex == 0)
-        RssiSybilDetector::RunDetection(0.0, 200.0, 20.0, 110.0, 65.0);
+    {
+        // MMSE search area. This used to be the literal box (0, 200, 20, 110),
+        // which only matched the old default 200 m corridor: on the 2 km SUMO
+        // trace every vehicle fell outside it, so no position could be placed.
+        // Derive it from the actual RSU extent instead, padded by one grid
+        // step, so the search area follows whatever topology is in use.
+        double xMin = g_rsuNodes.GetN() ? 1e18 : 0.0, xMax = 0.0;
+        double yMin = g_rsuNodes.GetN() ? 1e18 : 0.0, yMax = 0.0;
+        for (uint32_t u = 0; u < g_rsuNodes.GetN(); ++u)
+        {
+            Vector p = g_rsuNodes.Get(u)->GetObject<MobilityModel>()->GetPosition();
+            xMin = std::min(xMin, p.x); xMax = std::max(xMax, p.x);
+            yMin = std::min(yMin, p.y); yMax = std::max(yMax, p.y);
+        }
+        const double pad = 50.0;   // one comms-range-ish margin beyond the RSUs
+        xMin -= pad; xMax += pad;
+        yMin -= pad; yMax += pad;
+        RssiSybilDetector::RunDetection(xMin, xMax, yMin, yMax,
+                                        0.5 * (yMin + yMax));
+    }
 
     // Type 6: malicious controller injects Sybil records into its global table.
     // Fired once per interval (only for rsuIndex==0 to avoid duplicate injections
@@ -15900,12 +15960,17 @@ main(int argc, char* argv[])
     cmd.AddValue("mobilityMode5TraceFile",     "SUMO/ns-2 mobility trace for mobility_mode=5",mobilityMode5TraceFile);
     cmd.AddValue("mobilityMode5RsuPositionFile","Optional RSU CSV for mobility_mode=5",mobilityMode5RsuPositionFile);
 
-    // RSSI detector tuning
-    cmd.AddValue("rssiClusterRadius",  "Co-location cluster radius (m) [default 25]",      rssiClusterRadius);
-    cmd.AddValue("rssiDist1Thresh",    "1-RSU fallback distance threshold (m) [default 15]",rssiDist1Thresh);
-    cmd.AddValue("rssiWindowSec",      "Rolling observation window (s) [default 2.0]",      rssiWindowSec);
-    cmd.AddValue("rssiMinSamples",     "Min samples per RSU before including in detection [default 8]", rssiMinSamples);
-    cmd.AddValue("rssiStreak",         "Consecutive windows to confirm Sybil [default 2]",  rssiStreakRequired);
+    cmd.AddValue("flThreshold",        "FLEMDS baseline (solution_mode=1): sigmoid decision threshold tau; >= tau is flagged Sybil [default 0.5]", flThreshold);
+    // RSSI baseline (solution_mode=2) detector tuning. All seven are pushed
+    // into RssiSybilDetector::Configure() by InitializeRssiSolution(); they are
+    // inert in every other solution_mode.
+    cmd.AddValue("rssiClusterRadius",  "RSSI baseline: Mean-Shift cluster radius R (m) [default 2.5]", rssiClusterRadius);
+    cmd.AddValue("rssiDist1Thresh",    "RSSI baseline: 1-RSU co-location distance threshold (m) [default 1.5]", rssiDist1Thresh);
+    cmd.AddValue("rssiWindowSec",      "RSSI baseline: rolling RSSI observation window (s) [default 0.3]", rssiWindowSec);
+    cmd.AddValue("rssiMinSamples",     "RSSI baseline: min RSSI samples before MLE distance is trusted [default 3]", rssiMinSamples);
+    cmd.AddValue("rssiStreak",         "RSSI baseline: consecutive windows an identity must be flagged in before the verdict commits; 1 = immediate [default 1]", rssiStreakRequired);
+    cmd.AddValue("rssiMinRsuForMmse",  "RSSI baseline: RSUs that must observe an identity before MMSE positioning is attempted [default 3]", rssiMinRsuForMmse);
+    cmd.AddValue("rssiMinClusterIds",  "RSSI baseline: distinct claimed ids in a cluster before it is flagged Sybil; 2 = the paper's rule [default 2]", rssiMinClusterIds);
     cmd.AddValue("sweepMode",           "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
     cmd.AddValue("quietMode",           "Suppress all console output; CSV writes are unaffected", quietMode);
     cmd.AddValue("beaconChannelMode",   "Beacon channel policy: 0=legacy (one beacon egresses all 7 DSRC channels, 7.33x measured duplication), 1=CCH only (ch178, DSRC/WAVE standard), 2=spread one beacon per channel round-robin [default 2]", beaconChannelMode);
