@@ -18,6 +18,9 @@
 //   CryptoEcdsaVerify(pub64, hash32, sig64)      → bool
 //   CryptoEcdhKeygen()                           → {priv32, pub64} pair
 //   CryptoEcdhCompute(myPriv32, theirPub64)      → 32-byte shared secret
+//   CryptoRsa2048Keygen()                        → {privDER, pubDER} pair
+//   CryptoRsa2048Encapsulate(theirPubDER)        → {ct256, ss32} pair
+//   CryptoRsa2048Decapsulate(ct, myPrivDER)      → 32-byte shared secret
 //   CryptoAesGcmEncrypt(key32, iv12, pt, aad)   → ciphertext||tag(16), empty on fail
 //   CryptoAesGcmDecrypt(key32, iv12, ct_tag, aad)→ plaintext, empty on fail/auth error
 //
@@ -30,7 +33,9 @@
 #include <openssl/evp.h>
 #include <openssl/obj_mac.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
 #include <openssl/sha.h>
+#include <openssl/x509.h>
 
 #ifdef HAVE_LIBOQS
 #include <oqs/oqs.h>
@@ -381,6 +386,149 @@ CryptoEcdhCompute(const std::vector<uint8_t> &my_priv,
     EC_POINT_free(their_pt);
     EC_KEY_free(key);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// RSA-2048 key encapsulation  (thesis Table 5.3 / §5.2.5, ablation E1 arm (ii)).
+//
+// The E1 specification names RSA-2048 as the *classical* comparison against
+// ML-KEM-1024 for V2I session re-keying. ECDH-P-256 is the codebase's other
+// classical KEM and stays the default (--classicalKemScheme=ecdh) so no
+// pre-existing run changes; --classicalKemScheme=rsa2048 selects this path and
+// makes the E1 classical arm literally what the report specifies.
+//
+// RSA-KEM in its RSA-OAEP form: the encapsulating party draws a fresh 32-byte
+// secret, OAEP-encrypts it under the recipient's public key, and ships the
+// 256-byte ciphertext; the recipient decrypts to recover the same secret. The
+// interface deliberately mirrors ML-KEM's shape (keygen -> {priv, pub};
+// encapsulate -> {ct, ss}; decapsulate(ct, priv) -> ss) so the V2I-AUTH call
+// sites differ only in which primitive they name.
+//
+// Sizes, for the E1 overhead columns: public key ~294 B DER, private key
+// ~1,190 B DER, ciphertext 256 B — against ML-KEM-1024's 1,568 B pk / 1,568 B ct.
+// ---------------------------------------------------------------------------
+
+inline std::pair<std::vector<uint8_t>, std::vector<uint8_t>>
+CryptoRsa2048Keygen()
+{
+    std::vector<uint8_t> priv_out, pub_out;
+
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    if (!ctx)
+        return {priv_out, pub_out};
+
+    EVP_PKEY *pkey = nullptr;
+    if (EVP_PKEY_keygen_init(ctx) != 1 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) != 1 ||
+        EVP_PKEY_keygen(ctx, &pkey) != 1)
+    {
+        EVP_PKEY_CTX_free(ctx);
+        return {priv_out, pub_out};
+    }
+    EVP_PKEY_CTX_free(ctx);
+
+    // SubjectPublicKeyInfo DER for the public half, PKCS#1 DER for the private.
+    unsigned char *pub_der = nullptr;
+    int pub_len = i2d_PUBKEY(pkey, &pub_der);
+    if (pub_len > 0 && pub_der)
+    {
+        pub_out.assign(pub_der, pub_der + pub_len);
+        OPENSSL_free(pub_der);
+    }
+    unsigned char *priv_der = nullptr;
+    int priv_len = i2d_PrivateKey(pkey, &priv_der);
+    if (priv_len > 0 && priv_der)
+    {
+        priv_out.assign(priv_der, priv_der + priv_len);
+        OPENSSL_free(priv_der);
+    }
+
+    EVP_PKEY_free(pkey);
+    if (pub_out.empty() || priv_out.empty())
+        return {std::vector<uint8_t>(), std::vector<uint8_t>()};
+    return {priv_out, pub_out};
+}
+
+// Encapsulate a fresh 32-byte secret under an RSA-2048 SubjectPublicKeyInfo.
+//   returns {ciphertext(256 B), shared_secret(32 B)}; both empty on failure.
+inline std::pair<std::vector<uint8_t>, std::vector<uint8_t>>
+CryptoRsa2048Encapsulate(const std::vector<uint8_t> &their_pub_der)
+{
+    std::vector<uint8_t> ct, ss;
+    if (their_pub_der.empty())
+        return {ct, ss};
+
+    const unsigned char *p = their_pub_der.data();
+    EVP_PKEY *pkey = d2i_PUBKEY(nullptr, &p, static_cast<long>(their_pub_der.size()));
+    if (!pkey)
+        return {ct, ss};
+
+    std::vector<uint8_t> secret = CryptoRandBytes(32);
+
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    size_t out_len = 0;
+    if (!ctx || EVP_PKEY_encrypt_init(ctx) != 1 ||
+        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) != 1 ||
+        EVP_PKEY_encrypt(ctx, nullptr, &out_len, secret.data(), secret.size()) != 1)
+    {
+        if (ctx) EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return {std::vector<uint8_t>(), std::vector<uint8_t>()};
+    }
+    ct.resize(out_len);
+    if (EVP_PKEY_encrypt(ctx, ct.data(), &out_len, secret.data(), secret.size()) != 1)
+    {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return {std::vector<uint8_t>(), std::vector<uint8_t>()};
+    }
+    ct.resize(out_len);
+    ss = secret;
+
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return {ct, ss};
+}
+
+// Recover the encapsulated secret. Returns empty on any failure — which is
+// exactly the case an E4 replay attacker hits: it replayed the victim's token
+// but does not hold the victim's private key, so it cannot decapsulate.
+inline std::vector<uint8_t>
+CryptoRsa2048Decapsulate(const std::vector<uint8_t> &ciphertext,
+                         const std::vector<uint8_t> &my_priv_der)
+{
+    std::vector<uint8_t> ss;
+    if (ciphertext.empty() || my_priv_der.empty())
+        return ss;
+
+    const unsigned char *p = my_priv_der.data();
+    EVP_PKEY *pkey = d2i_PrivateKey(EVP_PKEY_RSA, nullptr, &p,
+                                    static_cast<long>(my_priv_der.size()));
+    if (!pkey)
+        return ss;
+
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    size_t out_len = 0;
+    if (!ctx || EVP_PKEY_decrypt_init(ctx) != 1 ||
+        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) != 1 ||
+        EVP_PKEY_decrypt(ctx, nullptr, &out_len, ciphertext.data(), ciphertext.size()) != 1)
+    {
+        if (ctx) EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return ss;
+    }
+    ss.resize(out_len);
+    if (EVP_PKEY_decrypt(ctx, ss.data(), &out_len, ciphertext.data(), ciphertext.size()) != 1)
+    {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return std::vector<uint8_t>();
+    }
+    ss.resize(out_len);
+
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return ss;
 }
 
 // ---------------------------------------------------------------------------

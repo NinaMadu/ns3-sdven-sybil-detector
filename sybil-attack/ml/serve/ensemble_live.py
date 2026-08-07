@@ -21,7 +21,15 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 FUSION_OUT = os.path.join(_HERE, "..", "fusion", "outputs")
-DEFAULT_WEIGHTS = os.path.join(FUSION_OUT, "fusion_head_weights.json")
+# Eq 3.18 head weights. SYBIL_FUSION_HEAD_WEIGHTS overrides the path so a refit head
+# can be A/B'd without overwriting the deployed export. UNSET => byte-identical to the
+# pre-2026-08-05 behaviour; that is the undo.
+#
+# This head is SHARED BY EVERY RUNG (D2/D3/D4/full mode) — ablate_block() only zeroes
+# φ-blocks of these same weights. Swapping it therefore changes all of them at once,
+# not just the temporal-only D2 condition it was refit to repair.
+DEFAULT_WEIGHTS = (os.environ.get("SYBIL_FUSION_HEAD_WEIGHTS")
+                   or os.path.join(FUSION_OUT, "fusion_head_weights.json"))
 DEFAULT_LAMBDAS = os.path.join(FUSION_OUT, "ensemble_lambdas.json")
 
 TERMS = ["y_hat_i_fused", "p_bar_temp", "p_bar_rssi"]   # ŷ_i, p̄_temp, p̄_rssi

@@ -45,6 +45,22 @@ def load_split(agent, split):
     return [json.loads(l) for l in open(path)]
 
 
+def split_keys(rows):
+    """(run_id, claimed_node_id, window_start_seconds) per row, IN FILE ORDER.
+
+    The user message carries the window's identity. Persisting it alongside the
+    predictions is what lets RC (Eq 3.74) join generated reasoning back onto
+    c_i without relying on a row-order assumption.
+    """
+    out = []
+    for r in rows:
+        u = json.loads(r["messages"][1]["content"])
+        out.append({"run_id": u.get("run"),
+                    "claimed_node_id": int(u.get("claimed_id")),
+                    "window_start_seconds": float(u.get("window_start_s"))})
+    return out
+
+
 def score_binary(y_true_sybil, d):
     from sklearn.metrics import matthews_corrcoef
     mcc = matthews_corrcoef(y_true_sybil, d)
@@ -90,12 +106,16 @@ def main():
 
     results = {}   # agent -> dict(split -> parsed preds), plus latency
     gold = {}
+    test_keys = None
     for split, lim in (("val", args.val_limit), ("test", args.test_limit)):
         gold[split] = None
         for agent in A.AGENT_ORDER:
             rows = take(load_split(agent, split), lim)
             if gold[split] is None:
                 gold[split] = [json.loads(r["messages"][-1]["content"]) for r in rows]
+                if split == "test":
+                    # identical context across agents, so capture once
+                    test_keys = split_keys(rows)
             model.set_adapter(agent)
             print(f"  [{agent}] generating {split} ({len(rows)}) ...")
             preds, dt, ntok = I.agent_generate(
@@ -179,6 +199,15 @@ def main():
         "true_attack_type": yt_mc, "true_is_sybil": yt,
         "d_a1": D["test"][:, 0], "d_a2": D["test"][:, 1], "d_a3": D["test"][:, 2],
         "D_global": Dg, "variant_vote": yv})
+    # Join keys + each agent's own reasoning string. RC (Eq 3.74) scores the
+    # MODEL'S generated text against the signatures that genuinely fired, so
+    # dropping these two things is what made RC unrecoverable from earlier runs.
+    if test_keys is not None:
+        for k in ("run_id", "claimed_node_id", "window_start_seconds"):
+            rec[k] = [d[k] for d in test_keys]
+    for agent in A.AGENT_ORDER:
+        rec[f"reasoning_{agent}"] = [(p or {}).get("reasoning", "")
+                                     for p in results[agent]["test"]]
     rec.to_parquet(args.preds, index=False)
 
     print("\n=== Stage-2 Consensus (Eq 3.22) ===")

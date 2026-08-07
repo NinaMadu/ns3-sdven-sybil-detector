@@ -38,7 +38,16 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parents[1] / "fusion"))   # ml/fusion for snap_grid
 import identity_manifest as IDM          # noqa: E402  (snap_grid only)
 
-MODEL_DIR = _HERE / "outputs" / "temporal_vehicle_tier"
+# Model directory. SYBIL_GRU_MODEL_DIR overrides it so a refit export can be A/B'd
+# against the deployed one WITHOUT copying files over the deployed directory.
+# UNSET => byte-identical to the pre-2026-08-05 behaviour; that is the undo.
+#
+# ml/refit/README.md and mock_ablation/run_refit_ab.sh have exported this variable
+# since 2026-08-05, but NOTHING read it — both A/B arms silently loaded the deployed
+# model, which is why that A/B measured run-to-run noise (0.864 vs 0.992) and not a
+# refit effect. Reading it here is what makes those scripts do what they claim.
+MODEL_DIR = Path(os.environ.get("SYBIL_GRU_MODEL_DIR")
+                 or _HERE / "outputs" / "temporal_vehicle_tier")
 
 # feature/window contract (mirrors config.json; asserted against it at load)
 SEQ_FEATURE_COLS = ["delta_t", "temp_id_change_flag", "bsm_x", "bsm_y", "bsm_speed",

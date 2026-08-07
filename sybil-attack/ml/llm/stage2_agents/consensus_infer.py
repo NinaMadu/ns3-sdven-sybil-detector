@@ -74,9 +74,13 @@ AGENT_STAGES = {
                "a3": "adapters/qwen1_5b_a3"},
     # Stage-3: FEDERATED adapters, Eq 3.32 aggregation over 4 zones, Hmax
     # partition (10/30/50/70 label skew) — the promoted deployment set (D6).
-    "stage3": {"a1": "../stage3_agents/final_models/Hmax_llm_fl_seed42/a1",
-               "a2": "../stage3_agents/final_models/Hmax_llm_fl_seed42/a2",
-               "a3": "../stage3_agents/final_models/Hmax_llm_fl_seed42/a3"},
+    # 2026-08-07: repointed to stage3_agents_new, the CONVERGED round-46 global
+    # (κ_conv=46, MCC_macro 0.8472). The previous stage3_agents/ set was promoted
+    # from round 5 before convergence (MCC_macro 0.8025) and is kept on disk only
+    # as the provenance of already-published pre-2026-08-07 Stage-3 numbers.
+    "stage3": {"a1": "../stage3_agents_new/final_models/Hmax_llm_fl_seed42/a1",
+               "a2": "../stage3_agents_new/final_models/Hmax_llm_fl_seed42/a2",
+               "a3": "../stage3_agents_new/final_models/Hmax_llm_fl_seed42/a3"},
     # Stage-3 contingency: same federation under the H0 (IID) zone partition.
     "stage3_h0": {"a1": "../stage3_agents/final_models/H0_llm_fl_seed42/a1",
                   "a2": "../stage3_agents/final_models/H0_llm_fl_seed42/a2",

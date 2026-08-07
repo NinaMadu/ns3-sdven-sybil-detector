@@ -41,6 +41,8 @@ sys.path.insert(0, os.path.join(_HERE, "..", "llm", "common"))   # constants
 sys.path.insert(0, os.path.join(_HERE, "..", "llm", "stage2_agents"))  # consensus_infer, agents
 
 import build_context_live as BC          # noqa: E402
+import d4_rsu_union as D4U               # noqa: E402  (D4 ablation only; no-op unless
+                                         #             SYBIL_D4_RSU_UNION is set)
 import ensemble_live as EL               # noqa: E402  (Eq 3.18 head + Eq 3.20 ŷ_ens)
 import log_cache as LC                    # noqa: E402  (incremental tail reader)
 import mobility_live as ML               # noqa: E402  (Eq 3.31 {v_rel,rho_c,dt_sync})
@@ -55,6 +57,37 @@ import constants as C                    # noqa: E402
 # exactly at `lo` still sees an rssi row just below it, so the cached slice reproduces the
 # full-history read exactly. -inf - pad is still -inf, so the uncapped path is unaffected.
 RSSI_ASOF_TOL = 1.0
+
+
+def _artifact_id(path):
+    """'<basename>@<sha256[:12]>' for a model artifact, for the provenance banner.
+
+    A path alone is not enough: the deployed GRU export and its pre-refit backup are
+    byte-identical, and a directory can be swapped underneath a fixed path. The hash is
+    what makes two runs' logs comparable after the fact.
+    """
+    import hashlib
+    p = str(path)
+    try:
+        with open(p, "rb") as f:
+            return f"{os.path.basename(p)}@{hashlib.sha256(f.read()).hexdigest()[:12]}"
+    except OSError as e:
+        return f"{os.path.basename(p)}@UNREADABLE({e.__class__.__name__})"
+
+
+def _adapter_provenance(adapter_dir):
+    """'<abs dir>@<sha256[:12] of adapter_model.safetensors>' for the READY banner.
+
+    The banner used to print only the last TWO path components, which is ambiguous
+    exactly where it matters: two different promotions of the same FL experiment
+    (e.g. an un-converged round-5 snapshot and the converged round-46 one) share the
+    leaf 'Hmax_llm_fl_seed42/a1' and differ only in an ancestor directory. A run log
+    then could not answer "which weights actually ran". Full path + weight hash makes
+    the answer readable off the log alone, and the hash still distinguishes two runs
+    if a directory is swapped underneath a fixed path.
+    """
+    d = os.path.abspath(str(adapter_dir))
+    return f"{d}@{_artifact_id(os.path.join(d, 'adapter_model.safetensors')).split('@')[-1]}"
 
 # C1 ablation (LLM tier vs ML-FL only): decision threshold on ŷ_ens for the
 # mlfl_only condition. The report specifies "a scalar calibrated on the validation
@@ -144,6 +177,13 @@ class Daemon:
         self._txgb_cum = {}            # cid -> deduped-beacon count with time < _txgb_upto
         self._txgb_upto = float("-inf")  # cumulative state has folded in all beacons < this
         self.head = EL.FusionHeadLive.load()          # Eq 3.18 head (weights, no refit)
+        # PROVENANCE — print the artifacts ACTUALLY loaded, with a sha, not the ones the
+        # caller believes it selected. On 2026-08-05 an A/B exported SYBIL_GRU_MODEL_DIR /
+        # SYBIL_FUSION_HEAD_WEIGHTS that nothing read: both arms ran the deployed model and
+        # the 0.13 MCC "gain" between them was run-to-run noise. Nothing in either run's log
+        # could have revealed that. These two lines are the check that would have.
+        print(f"[daemon] ARTIFACTS gru={_artifact_id(gru.MODEL_DIR / 'temporal_federated_gru_hier.pt')} "
+              f"fusion_head={_artifact_id(EL.DEFAULT_WEIGHTS)}", flush=True)
         # ŷ_ens (Eq 3.20) now blends all 3 terms: ŷ_i + p̄_temp + p̄_rssi (λ 0.3/0.5/0.2).
         # ── ablations (default None = the proposed pipeline, byte-identical to before) ──
         # B1: drop one vehicle-tier analyzer from the Eq 3.18 head (renormalised survivors).
@@ -174,6 +214,11 @@ class Daemon:
         if ablate_analyzer:
             self.head.ablate_block(ablate_analyzer)
         self.lam = EL.STREAM_LAMBDAS[ablate_stream] if ablate_stream else None
+        # D4 ablation only: re-select the Eq 3.20 λ. Never overrides an explicit B2
+        # --ablate-stream pin, and is None (deployed λ) unless SYBIL_D4_LAMBDAS is set.
+        self.d4_union = D4U.enabled()
+        if self.lam is None and self.d4_union:
+            self.lam = D4U.lambdas_override()
 
         # incremental log caches: parse each physical log ONCE, then per-SCORE ingest
         # only the appended tail (kills the ~60 s/SCORE full re-read). comm feeds GRU +
@@ -202,7 +247,8 @@ class Daemon:
                   f"ŷ_ens thresholded at τ={self.mlfl_tau} (from {self.mlfl_tau_src}); "
                   f"ablate_analyzer={self.ablate_analyzer or 'none'}, "
                   f"ablate_stream={self.ablate_stream or 'tuned-lambda'}, "
-                  f"txgb_min_beacons={self.txgb_min_beacons})",
+                  f"txgb_min_beacons={self.txgb_min_beacons}; "
+                  f"d4_rsu_union={'ON lam=' + str(self.lam) if self.d4_union else 'off'})",
                   flush=True)
         else:
             print("[daemon] loading frozen consensus config + 3 LoRA agents (GPU) ...", flush=True)
@@ -218,7 +264,7 @@ class Daemon:
                   f"txgb_min_beacons={self.txgb_min_beacons}; "
                   f"agent_stage={self.cfg['stage']}; "
                   f"consensus_config={self.consensus_config or 'FROZEN_DEFAULTS (central)'}; "
-                  f"adapters={ {a: os.path.join(*p.split(os.sep)[-2:]) for a, p in self.cfg['adapters'].items()} })",
+                  f"adapters={ {a: _adapter_provenance(p) for a, p in self.cfg['adapters'].items()} })",
                   flush=True)
 
     # -- the full chain for one scoring window -------------------------------
@@ -283,6 +329,10 @@ class Daemon:
         # Eq 3.18 ŷ_i (from live φ) + Eq 3.20 ŷ_ens = renorm(λ1·ŷ_i + λ2·p̄_temp + λ3·p̄_rssi)
         # over the terms present for each window (all 3 now wired).
         ci = EL.enrich(ci, head=self.head, lam=self.lam)
+        # D4 ablation only (SYBIL_D4_RSU_UNION): add back the RSU-tier rows the
+        # GRU-anchored join drops. Purely additive — every row above is untouched — and
+        # a no-op when the flag is unset, which is everywhere except run_d4.sh.
+        ci = D4U.union(ci, pbar, lam=self.lam)
         if only_new:
             ci = ci[ci["window_start_seconds"] > self.last_t]
         self.last_t = max(self.last_t, t)

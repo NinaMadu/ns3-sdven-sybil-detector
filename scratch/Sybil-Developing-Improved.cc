@@ -278,6 +278,7 @@ bool v5EnforcementEnabled = false;
 //   E1  Post-Quantum vs Classical vs No Mitigation
 //         proposed : --full_crypto_profile=2                    (defaults)
 //         classical: --full_crypto_profile=1 --rsuRevocationThreshold=1
+//                    --classicalKemScheme=rsa2048
 //         none     : --ablateMitigation=none
 //   E2  Threshold Dilithium vs Single-Signer Revocation
 //         proposed : --rsuRevocationThreshold=3 --rsuEndorserPoolSize=5
@@ -285,6 +286,10 @@ bool v5EnforcementEnabled = false;
 //   E3  Dynamic Trust-Driven vs Static RSU Endorser Set
 //         proposed : --rsuEndorserPolicy=dynamic                (default)
 //         static   : --rsuEndorserPolicy=static
+//   E4  Explicit V2I-AUTH vs Implicit Authentication
+//         proposed : --v2iAuthMode=explicit                     (default)
+//         implicit : --v2iAuthMode=implicit
+//         both arms add --replayAttackEnabled=true (the adversary E4 measures)
 // ---------------------------------------------------------------------------
 std::string ablateMitigation = "";           ///< E1(iii). "" = full mitigation pipeline;
                                              ///< "none" = detection still fires and is scored,
@@ -316,6 +321,29 @@ bool maliciousRsuForgeRevocation = false;    ///< E2 adversary: a compromised RS
                                              ///< Without this the two E2 conditions are
                                              ///< observationally identical.
 double maliciousRsuForgeInterval = 5.0;      ///< Seconds between forgery attempts per malicious RSU.
+
+std::string classicalKemScheme = "ecdh";     ///< E1(ii) fidelity. Which classical KEM the
+                                             ///< full_crypto_profile=1 arm uses for V2I session
+                                             ///< re-keying. "ecdh" = ECDH-P-256 (the historical
+                                             ///< default; every pre-existing classical run used it);
+                                             ///< "rsa2048" = RSA-2048 OAEP KEM, which is what the
+                                             ///< E1 specification actually names. Default is left at
+                                             ///< ecdh so no existing run changes meaning.
+std::string v2iAuthMode = "explicit";        ///< E4. "explicit" = the three-phase V2I-AUTH with
+                                             ///< nonce binding (N_v, N_r), RSU signature sigma_r
+                                             ///< verified by the vehicle in phase 2, and the key-
+                                             ///< possession proof Auth_v verified by the RSU in
+                                             ///< phase 3. "implicit" = phases 2 and 3 are skipped
+                                             ///< and the nonces are dropped from the session-key
+                                             ///< derivation: the vehicle presents a token, the RSU
+                                             ///< checks it against the IPFS registration, and the
+                                             ///< session is treated as authenticated from there.
+bool replayAttackEnabled = false;            ///< E4 adversary: an attacker replays a session token
+                                             ///< captured from a legitimate vehicle's earlier
+                                             ///< handshake. Without it both E4 arms are
+                                             ///< observationally identical, exactly as E2 is
+                                             ///< without --maliciousRsuForgeRevocation.
+double replayAttackInterval = 5.0;           ///< Seconds between replay attempts per attacker.
 
 double weightedDetectionConsensusThreshold = 1.0; ///< theta_consensus for weighted RSU detection votes.
 uint32_t llmRevokeMinWindows = 2;            ///< Phase-4 FP safety: a REAL id (< N_Vehicles) needs
@@ -432,6 +460,14 @@ std::string e1SuppressedRevocationCsv =
 // receiving RSU's t-of-n policy accepted it.
 std::string e2ForgedRevocationCsv =
     "sybil-attack/outputs/metrics_E2_forged_revocations.csv";
+// E4: every replayed session token an attacker presented, which phase of
+// V2I-AUTH rejected it (or that none did), and whether the replay therefore
+// yielded a working session. This is the ledger the E4 arms separate on: under
+// explicit V2I-AUTH the replay dies at phase 2/3 because the attacker cannot
+// decapsulate ct_sess and so cannot produce Auth_v; under implicit auth there
+// is no phase 2/3 to die at.
+std::string e4ReplayAttackCsv =
+    "sybil-attack/outputs/metrics_E4_replay_attacks.csv";
 // E1: MEASURED cost of one mitigation event — real wall-clock microseconds
 // spent signing + publishing, and the real byte size of the records produced.
 //
@@ -1341,6 +1377,23 @@ StaticEndorserPolicy()
     return rsuEndorserPolicy == "static";
 }
 
+// E4(ii). Phases 2 and 3 of V2I-AUTH are skipped and the nonce binding is
+// dropped from the session-key derivation. Phase 1 (token presentation +
+// IPFS-registration check) still runs, and Ksess is still established with the
+// same KEM — the ablation removes the VERIFICATION, not the key exchange.
+static bool
+ImplicitV2IAuth()
+{
+    return v2iAuthMode == "implicit";
+}
+
+// E1(ii). Which classical KEM the full_crypto_profile=1 arm uses.
+static bool
+ClassicalKemIsRsa()
+{
+    return classicalKemScheme == "rsa2048";
+}
+
 static RsuTrustRole
 RoleForRsuTrustScore(double omega)
 {
@@ -2189,12 +2242,29 @@ InitializeFullModeShamirAndLkh()
         {
             g_vehicleV2IPqcKemKeys[vehicleId] = CryptoMlKem1024Keygen();
         }
+        else if (ClassicalKemIsRsa())
+        {
+            // E1(ii) as specified: RSA-2048 in place of ML-KEM-1024. Keygen is
+            // the expensive half of RSA (~50-100 ms per key), so this costs a
+            // one-off ~10-20 s at 200 vehicles. It happens once at setup and is
+            // deliberately NOT inside the measured L_revoke window.
+            auto keys = CryptoRsa2048Keygen();
+            g_vehicleV2IClassicalKemPriv[vehicleId] = keys.first;
+            g_vehicleV2IClassicalKemPub[vehicleId] = keys.second;
+        }
         else
         {
             auto keys = CryptoEcdhKeygen();
             g_vehicleV2IClassicalKemPriv[vehicleId] = keys.first;
             g_vehicleV2IClassicalKemPub[vehicleId] = keys.second;
         }
+    }
+    if (!FullPqcProfileActive() && N_Vehicles > 0)
+    {
+        std::cout << "[V2I-AUTH] classical KEM = "
+                  << (ClassicalKemIsRsa() ? "RSA-2048-OAEP" : "ECDH-P-256")
+                  << "  pk_bytes=" << g_vehicleV2IClassicalKemPub[0].size()
+                  << std::endl;
     }
 
     uint32_t participantCount = std::max(1u, N_Controllers + N_RSUs);
@@ -10471,8 +10541,15 @@ DeriveV2ISessionKey(const std::vector<uint8_t>& kemSharedSecret,
     material.insert(material.end(), label.begin(), label.end());
     material.push_back((vehicleId >> 24) & 0xFF); material.push_back((vehicleId >> 16) & 0xFF);
     material.push_back((vehicleId >>  8) & 0xFF); material.push_back( vehicleId        & 0xFF);
-    material.insert(material.end(), nonceV.begin(), nonceV.end());
-    material.insert(material.end(), nonceR.begin(), nonceR.end());
+    // E4(i): under implicit authentication the nonce binding is disabled — the
+    // session key ciphertext does not embed N_v or N_r, so nothing ties this
+    // key to the freshness of *this* handshake. That is the property a replayed
+    // token exploits, so it must actually be absent, not merely unverified.
+    if (!ImplicitV2IAuth())
+    {
+        material.insert(material.end(), nonceV.begin(), nonceV.end());
+        material.insert(material.end(), nonceR.begin(), nonceR.end());
+    }
     material.insert(material.end(), timestampText.begin(), timestampText.end());
     return CryptoSha256(material);
 }
@@ -10597,9 +10674,18 @@ SendV2IAuthChallenge(uint32_t rsuIndex, uint32_t vehicleIndex, const std::vector
                       << vehicleIndex << std::endl;
             return;
         }
-        auto eph = CryptoEcdhKeygen();
-        ctSess = eph.second;
-        kemSharedSecret = CryptoEcdhCompute(eph.first, g_vehicleV2IClassicalKemPub[vehicleIndex]);
+        if (ClassicalKemIsRsa())
+        {
+            auto enc = CryptoRsa2048Encapsulate(g_vehicleV2IClassicalKemPub[vehicleIndex]);
+            ctSess = enc.first;
+            kemSharedSecret = enc.second;
+        }
+        else
+        {
+            auto eph = CryptoEcdhKeygen();
+            ctSess = eph.second;
+            kemSharedSecret = CryptoEcdhCompute(eph.first, g_vehicleV2IClassicalKemPub[vehicleIndex]);
+        }
     }
     if (ctSess.empty() || kemSharedSecret.empty())
         return;
@@ -10612,13 +10698,23 @@ SendV2IAuthChallenge(uint32_t rsuIndex, uint32_t vehicleIndex, const std::vector
     std::vector<uint8_t> detectionKey = DeriveV2IDetectionKey(sessionKey, vehicleIndex, tsText);
 
     V2IAuthSessionState state;
-    state.authenticated = false;
+    // E4(i): with phase 3 skipped there is no Auth_v to wait for, so the RSU
+    // has to commit the session here — that IS the ablation. Whoever completed
+    // phase 1 gets a working session, and the only thing standing between an
+    // attacker and the network is whether it could present a registered token.
+    state.authenticated = ImplicitV2IAuth();
     state.nonceV = nonceV;
     state.nonceR = nonceR;
     state.sessionKey = sessionKey;
     state.detectionKey = detectionKey;
     state.timestamp = ts;
     g_rsuV2IAuthSessions[rsuIndex][vehicleIndex] = state;
+    if (ImplicitV2IAuth())
+    {
+        LkhJoinVehicleAtRsu(vehicleIndex, rsuIndex);
+        std::cout << "[V2I-AUTH] implicit: phases 2-3 skipped, session committed"
+                  << " rsu=" << rsuIndex << " vehicle=" << vehicleIndex << std::endl;
+    }
 
     std::string context = BuildV2IAuthChallengeContext(rsuIndex, nonceV, ctSess, tsText);
     std::string sig = SignWithCurrentRsuKeyHex(rsuIndex, context);
@@ -10651,11 +10747,254 @@ SendV2IAuthProof(uint32_t vehicleIndex,
     state.detectionKey = detectionKey;
     state.timestamp = std::atof(timestampText.c_str());
     g_vehicleV2IAuthSessions[vehicleIndex][rsuIndex] = state;
+    // E4(i): phase 3 does not run under implicit authentication. The vehicle
+    // keeps the session it just derived, but never proves possession of K_det,
+    // and the RSU never asks — it already committed the session in phase 2.
+    if (ImplicitV2IAuth())
+    {
+        std::cout << "[V2I-AUTH] implicit: phase3 proof suppressed vehicle="
+                  << vehicleIndex << " rsu=" << rsuIndex << std::endl;
+        return;
+    }
     std::string payload = "V2I_AUTH_PROOF|" + std::to_string(vehicleIndex) + "|" +
                           std::to_string(rsuIndex) + "|" + BytesToHex(proof);
     if (SendEncryptedVehicleToRsuControl(vehicleIndex, rsuIndex, static_cast<uint32_t>(V2I_AUTH_PROOF), payload))
         std::cout << "[V2I-AUTH] phase3 proof vehicle=" << vehicleIndex
                   << " rsu=" << rsuIndex << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// E4 adversary — session-token REPLAY (thesis §5.2.5, E4).
+//
+// Threat model, stated precisely because the whole ablation rests on it: the
+// attacker has observed a legitimate vehicle's earlier V2I-AUTH handshake and
+// captured the session token tau_v it presented in phase 1. Tokens are
+// controller-issued and IPFS-anchored, so the captured one is *genuine* and
+// passes phase 1 at any RSU. What the attacker does NOT have is the victim's
+// KEM private key, and that is the only thing separating a replay from a
+// takeover.
+//
+//   explicit V2I-AUTH : the RSU encapsulates ct_sess to the VICTIM's public
+//                       key. The attacker cannot decapsulate it, so it derives
+//                       the wrong K_sess, the wrong K_det, and therefore the
+//                       wrong Auth_v = H(K_det || N_r). Phase 3 rejects it.
+//   implicit auth     : there is no phase 3 to reject it at. Whoever presents a
+//                       registered token gets a committed session.
+//
+// This is measured, not assumed: the decapsulation below is actually executed
+// with the attacker's own private key and the resulting proof is actually
+// compared against the RSU's expected value. If the crypto ever did let a
+// replay through, this ledger would say so.
+//
+// On success the attacker is given a genuinely working session at that RSU —
+// both endpoints keyed to the replayed K_sess — so the replay has the real
+// downstream consequence it should: the attacker's V2RSU uplink is accepted
+// where it would otherwise have been dropped for having no authenticated
+// session.
+//
+// Off by default (--replayAttackEnabled), so no existing run changes.
+// ---------------------------------------------------------------------------
+static uint32_t g_replayAttackRound    = 0;
+static uint32_t g_replayAttackAccepted = 0;
+static uint32_t g_replayAttackRejected = 0;
+
+static void
+ReplayAttackRound()
+{
+    double now = Simulator::Now().GetSeconds();
+
+    if (replayAttackEnabled && FullCryptoMechanismActive() &&
+        sybil_attack_enabled && now >= g_attackOnsetTime)
+    {
+        static bool headerWritten = false;
+        std::ofstream out(e4ReplayAttackCsv.c_str(),
+                          headerWritten ? std::ios::app : std::ios::out);
+        if (!headerWritten)
+        {
+            out << "time,attacker_vehicle_id,victim_vehicle_id,rsu_id,auth_mode,"
+                   "phase1_token_ok,phase2_sigma_r_present,phase2_kem_decap_ok,"
+                   "phase3_auth_v_ok,accepted,attack_type\n";
+            headerWritten = true;
+        }
+
+        for (uint32_t a = 0; a < N_Vehicles; ++a)
+        {
+            if (!IsSybilVehicle(a))
+                continue;
+
+            // Pick a victim the attacker could plausibly have eavesdropped on:
+            // a legitimate vehicle that has actually completed a handshake at
+            // some RSU. Deterministic rotation keeps the run reproducible.
+            uint32_t victim = N_Vehicles;
+            uint32_t rsu    = N_RSUs;
+            for (uint32_t r = 0; r < N_RSUs && victim >= N_Vehicles; ++r)
+            {
+                uint32_t rr = (a * 5u + g_replayAttackRound * 11u + r) % std::max(1u, N_RSUs);
+                if (rr >= g_rsuV2IAuthSessions.size())
+                    continue;
+                for (const auto& kv : g_rsuV2IAuthSessions[rr])
+                {
+                    if (kv.first < N_Vehicles && !IsSybilVehicle(kv.first) &&
+                        kv.second.authenticated)
+                    {
+                        victim = kv.first;
+                        rsu    = rr;
+                        break;
+                    }
+                }
+            }
+            if (victim >= N_Vehicles || rsu >= N_RSUs)
+                continue;   // nothing captured yet this round
+
+            // ── Phase 1: present the captured token ────────────────────────
+            // The token is genuine, so this is expected to PASS in both arms.
+            // That is the point: phase 1 alone cannot stop a replay.
+            std::string expectedTokenHash;
+            if (rsu < g_rsuTokenHashCache.size())
+            {
+                auto hit = g_rsuTokenHashCache[rsu].find(victim);
+                if (hit != g_rsuTokenHashCache[rsu].end())
+                    expectedTokenHash = hit->second;
+            }
+            std::string replayedTokenHash;
+            if (victim < g_vehicleTokens.size() && !g_vehicleTokens[victim].empty())
+                replayedTokenHash = BytesToHex(CryptoSha256(g_vehicleTokens[victim]));
+            const bool blacklisted =
+                rsu < g_rsuRevokedVehicleBlacklist.size() &&
+                g_rsuRevokedVehicleBlacklist[rsu].count(victim) > 0;
+            const bool phase1Ok = !expectedTokenHash.empty() &&
+                                  replayedTokenHash == expectedTokenHash && !blacklisted;
+
+            bool decapOk = false, phase3Ok = false, accepted = false;
+            std::vector<uint8_t> replaySessionKey;
+
+            if (phase1Ok)
+            {
+                // ── Phase 2: the RSU encapsulates to the VICTIM's public key ──
+                std::vector<uint8_t> ctSess, rsuSharedSecret;
+                if (FullPqcProfileActive())
+                {
+                    if (victim < g_vehicleV2IPqcKemKeys.size() &&
+                        !g_vehicleV2IPqcKemKeys[victim].publicKey.empty())
+                    {
+                        CryptoPqcKemEncapsulation enc =
+                            CryptoMlKem1024Encapsulate(g_vehicleV2IPqcKemKeys[victim].publicKey);
+                        ctSess          = enc.ciphertext;
+                        rsuSharedSecret = enc.sharedSecret;
+                    }
+                }
+                else if (victim < g_vehicleV2IClassicalKemPub.size() &&
+                         !g_vehicleV2IClassicalKemPub[victim].empty())
+                {
+                    if (ClassicalKemIsRsa())
+                    {
+                        auto enc = CryptoRsa2048Encapsulate(g_vehicleV2IClassicalKemPub[victim]);
+                        ctSess          = enc.first;
+                        rsuSharedSecret = enc.second;
+                    }
+                    else
+                    {
+                        auto eph = CryptoEcdhKeygen();
+                        ctSess          = eph.second;
+                        rsuSharedSecret = CryptoEcdhCompute(eph.first,
+                                                            g_vehicleV2IClassicalKemPub[victim]);
+                    }
+                }
+
+                if (!ctSess.empty() && !rsuSharedSecret.empty())
+                {
+                    // The attacker attempts decapsulation with ITS OWN key.
+                    // Really executed — this is the cryptographic barrier E4
+                    // exists to measure, so it is not shortcut.
+                    std::vector<uint8_t> attackerSecret;
+                    if (FullPqcProfileActive())
+                    {
+                        if (a < g_vehicleV2IPqcKemKeys.size() &&
+                            !g_vehicleV2IPqcKemKeys[a].secretKey.empty())
+                        {
+                            attackerSecret = CryptoMlKem1024Decapsulate(
+                                ctSess, g_vehicleV2IPqcKemKeys[a].secretKey);
+                        }
+                    }
+                    else if (a < g_vehicleV2IClassicalKemPriv.size() &&
+                             !g_vehicleV2IClassicalKemPriv[a].empty())
+                    {
+                        attackerSecret =
+                            ClassicalKemIsRsa()
+                                ? CryptoRsa2048Decapsulate(ctSess, g_vehicleV2IClassicalKemPriv[a])
+                                : CryptoEcdhCompute(g_vehicleV2IClassicalKemPriv[a], ctSess);
+                    }
+                    decapOk = !attackerSecret.empty() && attackerSecret == rsuSharedSecret;
+
+                    // ── Phase 3: Auth_v = H(K_det || N_r), checked by the RSU ──
+                    std::vector<uint8_t> nonceV = CryptoRandBytes(32);
+                    std::vector<uint8_t> nonceR = CryptoRandBytes(32);
+                    std::string tsText = std::to_string(now);
+
+                    std::vector<uint8_t> rsuKey = DeriveV2ISessionKey(
+                        rsuSharedSecret, victim, rsu, nonceV, nonceR, tsText);
+                    std::vector<uint8_t> expectedProof = BuildV2IAuthProofBytes(
+                        DeriveV2IDetectionKey(rsuKey, victim, tsText), nonceR);
+
+                    std::vector<uint8_t> attackerKey = DeriveV2ISessionKey(
+                        attackerSecret, victim, rsu, nonceV, nonceR, tsText);
+                    std::vector<uint8_t> attackerProof = BuildV2IAuthProofBytes(
+                        DeriveV2IDetectionKey(attackerKey, victim, tsText), nonceR);
+
+                    phase3Ok = (attackerProof == expectedProof);
+                    replaySessionKey = ImplicitV2IAuth() ? rsuKey : attackerKey;
+                }
+            }
+
+            // Explicit: every phase must pass. Implicit: phases 2 and 3 are not
+            // run at all, so phase 1 is the whole gate.
+            accepted = ImplicitV2IAuth() ? phase1Ok
+                                         : (phase1Ok && decapOk && phase3Ok);
+
+            if (accepted && !replaySessionKey.empty())
+            {
+                // Give the replay its real consequence: a working authenticated
+                // session for the attacker at this RSU, keyed to the session it
+                // obtained by replaying somebody else's token.
+                V2IAuthSessionState hijacked;
+                hijacked.authenticated = true;
+                hijacked.sessionKey    = replaySessionKey;
+                hijacked.detectionKey  = DeriveV2IDetectionKey(replaySessionKey, victim,
+                                                               std::to_string(now));
+                hijacked.timestamp     = now;
+                if (rsu < g_rsuV2IAuthSessions.size())
+                    g_rsuV2IAuthSessions[rsu][a] = hijacked;
+                if (a < g_vehicleV2IAuthSessions.size())
+                    g_vehicleV2IAuthSessions[a][rsu] = hijacked;
+                LkhJoinVehicleAtRsu(a, rsu);
+                ++g_replayAttackAccepted;
+                std::cout << "[E4_REPLAY] ACCEPTED attacker=" << a
+                          << " replayed token of vehicle=" << victim
+                          << " rsu=" << rsu
+                          << " auth_mode=" << v2iAuthMode
+                          << " t=" << now << std::endl;
+            }
+            else
+            {
+                ++g_replayAttackRejected;
+            }
+
+            out << now << "," << a << "," << victim << "," << rsu << ","
+                << v2iAuthMode << ","
+                << (phase1Ok ? 1 : 0) << ","
+                << (ImplicitV2IAuth() ? 0 : 1) << ","
+                << (decapOk ? 1 : 0) << ","
+                << (phase3Ok ? 1 : 0) << ","
+                << (accepted ? 1 : 0) << ","
+                << static_cast<int>(g_activeAttackType) << "\n";
+        }
+        ++g_replayAttackRound;
+    }
+
+    if (replayAttackInterval > 0.0 && now + replayAttackInterval <= simTime)
+    {
+        Simulator::Schedule(Seconds(replayAttackInterval), &ReplayAttackRound);
+    }
 }
 
 
@@ -13334,7 +13673,11 @@ LogReceivedPacket(const std::string& receiverRole,
                         bool nonceOk = pit != g_vehiclePendingV2IAuthNonces[vId].end() && pit->second == nonceV;
                         std::string context = BuildV2IAuthChallengeContext(rId, nonceV, ctSess, tsText);
                         bool sigOk = VerifyRsuSignatureHex(rId, context, fields[7]);
-                        if (nonceOk && sigOk)
+                        // E4(i): implicit authentication skips phase 2 outright —
+                        // sigma_r is not verified and N_v is not checked against
+                        // the pending nonce. Both are still computed above so the
+                        // ledger can record what the checks WOULD have said.
+                        if (ImplicitV2IAuth() || (nonceOk && sigOk))
                         {
                             std::vector<uint8_t> kemSharedSecret;
                             if (FullPqcProfileActive())
@@ -13344,7 +13687,12 @@ LogReceivedPacket(const std::string& receiverRole,
                             }
                             else if (vId < g_vehicleV2IClassicalKemPriv.size())
                             {
-                                kemSharedSecret = CryptoEcdhCompute(g_vehicleV2IClassicalKemPriv[vId], ctSess);
+                                kemSharedSecret =
+                                    ClassicalKemIsRsa()
+                                        ? CryptoRsa2048Decapsulate(
+                                              ctSess, g_vehicleV2IClassicalKemPriv[vId])
+                                        : CryptoEcdhCompute(
+                                              g_vehicleV2IClassicalKemPriv[vId], ctSess);
                             }
                             if (kemSharedSecret.empty())
                             {
@@ -15530,6 +15878,10 @@ main(int argc, char* argv[])
     cmd.AddValue("rsuEndorserPolicy", "Ablation E3: dynamic = Table 3.4 trust-gated three-state endorser lifecycle; static = every RSU signs manifests permanently regardless of trust history", rsuEndorserPolicy);
     cmd.AddValue("maliciousRsuForgeRevocation", "Ablation E2/E3 adversary: a compromised RSU fabricates single-signer revocation manifests naming LEGITIMATE vehicles. Required for E2 to have any signal", maliciousRsuForgeRevocation);
     cmd.AddValue("maliciousRsuForgeInterval", "Seconds between forgery attempts per compromised RSU [default 5]", maliciousRsuForgeInterval);
+    cmd.AddValue("classicalKemScheme", "Ablation E1(ii): which classical KEM full_crypto_profile=1 uses for V2I session re-keying. rsa2048 = RSA-2048 OAEP (what the E1 spec names); ecdh = ECDH-P-256 (historical default)", classicalKemScheme);
+    cmd.AddValue("v2iAuthMode", "Ablation E4: explicit = three-phase V2I-AUTH with nonce binding, sigma_r verification and Auth_v key-possession proof; implicit = phases 2 and 3 skipped and nonce binding disabled (token presentation + IPFS registration check only)", v2iAuthMode);
+    cmd.AddValue("replayAttackEnabled", "Ablation E4 adversary: an attacker replays a session token captured from a legitimate vehicle's earlier handshake. Required for E4 to have any signal", replayAttackEnabled);
+    cmd.AddValue("replayAttackInterval", "Seconds between replay attempts per attacker [default 5]", replayAttackInterval);
     cmd.AddValue("detectLatency", "Full-mode modeled detection->revocation reaction delay in sim-seconds (verdict at t, revocation effective at t+detectLatency; 0 = instant)", detectLatencySec);
     cmd.AddValue("p4SelfTest", "Full-mode P4 FP-safety self-test: REAL vehicle id to inject a synthetic sybil verdict for at t=10 and t=20 (0=off; proves deferral->corroboration; daemon not launched)", p4SelfTestRealId);
     cmd.AddValue("vehicleSpacing",             "Initial vehicle spacing in metres",vehicleSpacing);
@@ -15616,6 +15968,7 @@ main(int argc, char* argv[])
         e1SuppressedRevocationCsv = outputDir + "/metrics_E1_suppressed_revocations.csv";
         e2ForgedRevocationCsv     = outputDir + "/metrics_E2_forged_revocations.csv";
         e1RevocationCostCsv       = outputDir + "/metrics_E1_revocation_cost.csv";
+        e4ReplayAttackCsv         = outputDir + "/metrics_E4_replay_attacks.csv";
         // Make sure the run folder (and the revocation-manifest subdir) exist — the flag
         // says "must exist", but a fresh datasets/<run> folder usually won't yet.
         std::system(("mkdir -p " + outputDir + "/ipfs-revocation-manifests").c_str());
@@ -15644,6 +15997,37 @@ main(int argc, char* argv[])
         NS_FATAL_ERROR("--rsuRevocationThreshold t=" << rsuRevocationThreshold
                        << " exceeds --rsuEndorserPoolSize n=" << rsuEndorserPoolSize
                        << "; t-of-n quorum is unreachable by construction");
+    }
+    if (v2iAuthMode != "explicit" && v2iAuthMode != "implicit")
+    {
+        NS_FATAL_ERROR("--v2iAuthMode must be explicit|implicit (got '"
+                       << v2iAuthMode << "')");
+    }
+    if (classicalKemScheme != "ecdh" && classicalKemScheme != "rsa2048")
+    {
+        NS_FATAL_ERROR("--classicalKemScheme must be ecdh|rsa2048 (got '"
+                       << classicalKemScheme << "')");
+    }
+
+    // E3(ii) is specified as a CONFIGURATION change: theta_endorse = 0,
+    // theta_remove = 0, Delta_penalty = 0, so every RSU stays in the Endorser
+    // state whatever its trust history. Applying it here, rather than only
+    // overriding IsRsuTrustEndorser, means the ablation is literally what the
+    // report describes: omega is still computed and still logged on every
+    // window, it just no longer drives a lifecycle transition.
+    //
+    // RSU revocation itself is NOT lost — rsuTrustImmediateRevoke (Alg. 7
+    // lines 5-6) fires on the S5/epsilon_5 condition without waiting for omega
+    // to decay past theta_remove — so L_revoke(e) at the RSU tier stays
+    // measurable in BOTH E3 arms, which is what E3's y-axis requires.
+    if (StaticEndorserPolicy())
+    {
+        rsuTrustEndorseThreshold = 0.0;
+        rsuTrustRemoveThreshold  = 0.0;
+        rsuTrustPenalty          = 0.0;
+        std::cout << "[GroupE] E3 static endorser set: theta_endorse=0 theta_remove=0 "
+                     "Delta_penalty=0 (trust still computed and logged, never applied "
+                     "to lifecycle transitions)" << std::endl;
     }
 
     // ── Security-suite manifest ────────────────────────────────────────────
@@ -15713,11 +16097,13 @@ main(int argc, char* argv[])
     }
     if (!ablateMitigation.empty() || rsuRevocationThreshold > 0 ||
         rsuEndorserPoolSize > 0 || rsuEndorserPolicy != "dynamic" ||
-        maliciousRsuForgeRevocation)
+        maliciousRsuForgeRevocation || v2iAuthMode != "explicit" ||
+        replayAttackEnabled || classicalKemScheme != "ecdh")
     {
         std::cout << "[GroupE] ABLATION active:"
                   << " mitigation=" << (ablateMitigation.empty() ? "full" : ablateMitigation)
                   << " crypto_profile=" << full_crypto_profile
+                  << " classical_kem=" << classicalKemScheme
                   << " revocation_t=" << (rsuRevocationThreshold > 0
                                               ? std::to_string(rsuRevocationThreshold)
                                               : std::string("legacy"))
@@ -15726,6 +16112,8 @@ main(int argc, char* argv[])
                                             : std::string("all"))
                   << " endorser_policy=" << rsuEndorserPolicy
                   << " forge_revocation=" << (maliciousRsuForgeRevocation ? "on" : "off")
+                  << " v2i_auth=" << v2iAuthMode
+                  << " replay_attack=" << (replayAttackEnabled ? "on" : "off")
                   << "\n" << std::flush;
     }
 
@@ -15972,6 +16360,26 @@ main(int argc, char* argv[])
     // Must run after routing_test / N_RSUs adjustments.
     DeclareAttackStates();
     DeclareAttackers();
+
+    // Ground-truth rosters for EVERY attack-enabled run, not just the
+    // sequential dataset modes (types 7 and 9) that used to be the only ones
+    // emitting them. Group E scores SINGLE-VARIANT runs — one
+    // --sybil_attack_type per run — and without this a scorer has no on-disk
+    // source for which vehicles are attackers or which RSUs are compromised,
+    // and would have to fall back on the claimedId >= N_Vehicles convention,
+    // which misses compromised REAL vehicles entirely.
+    if (sybil_attack_enabled && !outputDir.empty())
+    {
+        std::ofstream af((outputDir + "/sybil_attackers.csv").c_str());
+        af << "attacker_node_id\n";
+        for (uint32_t i = 0; i < N_Vehicles; ++i)
+            if (IsSybilVehicle(i)) af << i << "\n";
+
+        std::ofstream rf((outputDir + "/malicious_rsus.csv").c_str());
+        rf << "malicious_rsu_id\n";
+        for (uint32_t i = 0; i < N_RSUs; ++i)
+            if (IsRsuMalicious(i)) rf << i << "\n";
+    }
 
     // Sequential dataset mode: emit phase/attacker metadata so the single
     // communication_log can be labelled — which attack ran in each time window
@@ -16815,6 +17223,19 @@ main(int argc, char* argv[])
                             &MaliciousRsuForgeRevocationRound);
     }
 
+    // E4 adversary: attackers replaying session tokens captured from legitimate
+    // vehicles' earlier handshakes. Opt-in, same contract as the E2 adversary.
+    if (replayAttackEnabled && FullCryptoMechanismActive())
+    {
+        std::cout << "[E4Replay] enabled: attackers replay captured session tokens"
+                  << " every " << replayAttackInterval << "s; v2i_auth_mode="
+                  << v2iAuthMode
+                  << " (explicit rejects at phase 2/3, implicit has no phase 2/3)"
+                  << std::endl;
+        Simulator::Schedule(Seconds(std::max(0.1, replayAttackInterval)),
+                            &ReplayAttackRound);
+    }
+
     // v6 control-plane detector (malicious SDN controller).  Only meaningful
     // when the controller tier is under attack; the assertion path it scores
     // exists solely under sybil_attack_type=6.
@@ -16903,6 +17324,21 @@ main(int argc, char* argv[])
                   << g_forgedRevocationAccepted << "\n"
                   << "  rejected by quorum = " << g_forgedRevocationRejected << "\n"
                   << "  -> " << e2ForgedRevocationCsv << "\n";
+    }
+    if (replayAttackEnabled)
+    {
+        uint32_t attempts = g_replayAttackAccepted + g_replayAttackRejected;
+        std::cout << "\n[E4 replay summary]  (V2I-AUTH replay resistance)\n"
+                  << "  v2i_auth_mode      = " << v2iAuthMode
+                  << (ImplicitV2IAuth()
+                          ? "  (phases 2-3 skipped, nonce binding off)"
+                          : "  (nonce binding + sigma_r + Auth_v all enforced)")
+                  << "\n"
+                  << "  replay attempts    = " << attempts << "\n"
+                  << "  SUCCESSFUL replays (attacker obtained a working session) = "
+                  << g_replayAttackAccepted << "\n"
+                  << "  rejected           = " << g_replayAttackRejected << "\n"
+                  << "  -> " << e4ReplayAttackCsv << "\n";
     }
     if (MitigationDisabled())
     {
