@@ -180,7 +180,9 @@ static std::map<uint32_t, uint32_t> g_streak;
 // STEP 1 — RSSI to distance  (Cost231 inverse, paper eq. 1 → eq. 8)
 // =============================================================================
 
-static double __attribute__((unused)) RssiToDist(double rssiDbm)
+/// Exact inverse of the forward model in Sybil-Developing-Improved.cc:14534.
+/// Now called by MLEDist (see FIX 7); it was dead code before that.
+static double RssiToDist(double rssiDbm)
 {
     double pl    = kTxPowerDbm - rssiDbm;
     double plRel = pl - std::abs(kRef1mDbm);
@@ -190,34 +192,44 @@ static double __attribute__((unused)) RssiToDist(double rssiDbm)
 
 /// FIX 3 applied here — returns -1.0 if fewer than kMinSamplesForMle samples.
 /// Geometric-mean MLE distance over a rolling buffer of RSSI samples.
-/// Equivalent to paper MLE under log-normal shadow fading (eq. 6-8).
+///
+/// FIX 7 — SCALE. This previously evaluated the paper's eq. 6-8 Rayleigh-MLE
+/// closed form (sigmaHat, then d from sqrt(8*pi^3/3*f)). Those constants do not
+/// reconcile with the units of the forward model this simulator actually uses
+/// to synthesise RSSI (Sybil-Developing-Improved.cc:14534-14537,
+/// rssi = kTxPowerDbm - (|kRef1mDbm| + 10*kPathLossExp*log10(d))), and the
+/// result came out a constant 11059x too large: a vehicle 50 m from an RSU was
+/// estimated at 553 km. Every distance being astronomically large made the MMSE
+/// cost surface monotonic across the search area, so the grid search always
+/// terminated on a boundary point — measured at 100.0% of positioned rows
+/// sitting on a box edge, collapsing every identity into one of two clusters
+/// and flagging everything. That is why kMeanShiftR, kMinClusterIds,
+/// kStreakRequired and kMmseFineStep all measured completely inert: they were
+/// all downstream of coordinates that carried no information.
+///
+/// The correct inverse of the forward model was already present as
+/// RssiToDist(), written but marked __attribute__((unused)) and never called.
+/// It reproduces the true distance exactly (10/25/50/100/200 m round-trip to
+/// the centimetre). We now average over it.
+///
+/// Averaging is in the LOG domain (geometric mean of the per-sample distances,
+/// i.e. the mean of the dB values), which is the right estimator here: the
+/// fading term is applied additively in dB by the forward model, so the log
+/// domain is where the noise is symmetric. A linear mean would bias the
+/// estimate upward.
 static double MLEDist(const std::deque<RssiObs>& buf)
 {
     if (buf.size() < kMinSamplesForMle) return -1.0;
 
-    // Paper eq. 5 — link gain from each RSSI sample
-    // Paper eq. 6 — MLE: σ̂ = sqrt( (1/N) Σ g²/2 )  [closed-form Rayleigh MLE]
-    double sumG2 = 0.0;
+    double sumLogD = 0.0;
     uint32_t cnt = 0;
     for (const auto& o : buf) {
-        double rssiW = std::pow(10.0, (o.rssiDbm - 30.0) / 10.0); // dBm → Watts
-        double g = std::sqrt(rssiW / (std::pow(10.0, kTxPowerDbm/10.0) * 1e-3));
-        if (g > 0.0) { sumG2 += g * g; ++cnt; }
+        double d = RssiToDist(o.rssiDbm);
+        if (d > 0.0) { sumLogD += std::log(d); ++cnt; }
     }
     if (cnt < kMinSamplesForMle) return -1.0;
 
-    double sigmaHat = std::sqrt(sumG2 / (2.0 * cnt)); // closed-form Rayleigh MLE
-    if (sigmaHat <= 0.0) return -1.0;
-
-    // Paper eq. 8 — distance from sigma
-    static const double f  = 5.9e9;
-    static const double c  = 3e8;
-    static const double d0 = 1.0;
-    double n = kPathLossExp;
-    double num = c * std::pow(d0, n/2.0 - 1.0);
-    double den = std::sqrt(8.0 * M_PI*M_PI*M_PI / 3.0 * f) * sigmaHat;
-    if (den <= 0.0) return -1.0;
-    return std::pow(num / den, 2.0 / n);
+    return std::exp(sumLogD / static_cast<double>(cnt));
 }
 
 /// Majority-vote real ID from a buffer (ground truth for evaluation).
@@ -392,13 +404,23 @@ static void SetCsvPath(const std::string& path) { kCsvPath = path; }
 ///
 /// ONLY reachable from the solution_mode==MODE_BASELINE_RSSI path. MODE_FULL
 /// never includes this detector in its scoring, so this cannot perturb M_F.
+/// mmseCoarseStep / mmseFineStep control the MMSE grid-search RESOLUTION, not
+/// the decision rule. They matter because estimated positions are snapped to
+/// the fine step: at the default 0.5 m, distinct vehicles land on identical
+/// grid points, so Mean-Shift sees distance-zero pairs and clusters them no
+/// matter how small kMeanShiftR is. That quantisation — not any threshold — is
+/// what pins this detector's output, which is why kMeanShiftR, kMinClusterIds
+/// and kStreakRequired all measured completely inert on mobility_mode=2
+/// (12 grid cells, every one MCC 0.2750 / TP=27 FP=24 FN=0 TN=4).
 static void Configure(double   meanShiftR,
                       double   coLocDistThresh,
                       double   windowSec,
                       uint32_t minSamplesForMle,
                       uint32_t minRsuForMmse,
                       uint32_t minClusterIds,
-                      uint32_t streakRequired)
+                      uint32_t streakRequired,
+                      double   mmseCoarseStep = 0.0,
+                      double   mmseFineStep   = 0.0)
 {
     if (meanShiftR       > 0.0) kMeanShiftR       = meanShiftR;
     if (coLocDistThresh  > 0.0) kCoLocDistThresh  = coLocDistThresh;
@@ -407,6 +429,8 @@ static void Configure(double   meanShiftR,
     if (minRsuForMmse    > 0u)  kMinRsuForMmse    = minRsuForMmse;
     if (minClusterIds    > 0u)  kMinClusterIds    = minClusterIds;
     if (streakRequired   > 0u)  kStreakRequired   = streakRequired;
+    if (mmseCoarseStep   > 0.0) kMmseCoarseStep   = mmseCoarseStep;
+    if (mmseFineStep     > 0.0) kMmseFineStep     = mmseFineStep;
 }
 
 static void Init(uint32_t nRsu, const std::vector<RssiPos2D>& rsuPositions)
@@ -426,7 +450,8 @@ static void Init(uint32_t nRsu, const std::vector<RssiPos2D>& rsuPositions)
               << "  minSamp=" << kMinSamplesForMle
               << "  minRsuMmse=" << kMinRsuForMmse
               << "  minClusterIds=" << kMinClusterIds
-              << "  streak=" << kStreakRequired << "\n";
+              << "  streak=" << kStreakRequired
+              << "  mmseStep=" << kMmseCoarseStep << "/" << kMmseFineStep << "m\n";
     for (uint32_t u = 0; u < nRsu; ++u)
         std::cout << "  RSU" << u
                   << " pos=(" << rsuPositions[u].x

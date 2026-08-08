@@ -876,7 +876,15 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
         // and drown the detector's per-identity verdicts in per-packet FN/TN.
         // MODE_ADAPTIVE is no longer excluded wholesale: it resolves to LIGHTWEIGHT or FULL
         // per cycle, and the FULL case is filtered by the same MODE_FULL test below.
-        if (effMode != MODE_BASELINE_FL && effMode != MODE_FULL)
+        // MODE_BASELINE_ML joins this exclusion for the same reason: its verdicts
+        // arrive per (identity, window) via RecordMlPacketDecision. Leaving the
+        // per-packet path enabled would bury them under per-packet TN/FN — and
+        // because mode 3's isFlagged is permanently false (it is not in
+        // IsImplementedDetectionMode), that path previously produced the
+        // all-zero TP/FP matrix that made mode 3 look like a working detector
+        // scoring 0 rather than an unwired one.
+        if (effMode != MODE_BASELINE_FL && effMode != MODE_FULL &&
+            effMode != MODE_BASELINE_ML)
         {
             if      ( isActuallySybil &&  isFlagged) { m_windowMatrix.TP++; m_totalMatrix.TP++;
                                                        m_lwssdMatrix.TP++; }
@@ -1174,6 +1182,60 @@ class SecurityEvaluationMetrics : public SimpleRefCount<SecurityEvaluationMetric
             m_windowOverhead.AddEvent(40u, m_thresholdN, m_thresholdT, tier);
             m_totalOverhead.AddEvent(40u, m_thresholdN, m_thresholdT, tier);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // RecordMlPacketDecision — MODE_BASELINE_ML (=3), the AdaBoost/DPM baseline.
+    //
+    // Shape follows RecordFullModeDecision, NOT RecordFLPacketDecision: the DPM
+    // method emits one verdict per (identity, scoring window), not one per
+    // beacon. Scoring it per packet would drown a few dozen per-identity
+    // verdicts under hundreds of thousands of per-packet TN/FN.
+    //
+    // Must be called for BOTH sybil and legit verdicts, or TN stays 0 and MCC is
+    // undefined.
+    // -------------------------------------------------------------------------
+    void RecordMlPacketDecision(uint32_t           claimedId,
+                                bool               isActuallySybil,
+                                bool               predictedSybil,
+                                const std::string& tier,
+                                double             timestampSec)
+    {
+        if (m_proposedMethod != MODE_BASELINE_ML) return;
+
+        if      ( isActuallySybil &&  predictedSybil) { m_windowMatrix.TP++; m_totalMatrix.TP++; }
+        else if (!isActuallySybil &&  predictedSybil)
+        {
+            m_windowMatrix.FP++; m_totalMatrix.FP++;
+            std::cout << "[M6] ML_FP at t=" << timestampSec
+                      << " claimedId=" << claimedId << std::endl;
+        }
+        else if ( isActuallySybil && !predictedSybil) { m_windowMatrix.FN++; m_totalMatrix.FN++; }
+        else                                          { m_windowMatrix.TN++; m_totalMatrix.TN++; }
+
+        // M7: first-detection latency per flagged identity
+        if (predictedSybil &&
+            m_latencyTracker.pending.find(claimedId) == m_latencyTracker.pending.end())
+        {
+            m_latencyTracker.RecordDetectionStart(claimedId, m_proposedMethod, timestampSec);
+            double revDelaySec = 1.0 / 1000.0;
+            Simulator::Schedule(
+                Seconds(revDelaySec),
+                &SecurityEvaluationMetrics::OnRevocationComplete,
+                this, claimedId, isActuallySybil, timestampSec + revDelaySec);
+        }
+
+        // M8: overhead for flagged decisions (3 DPM features x 4 bytes = 12 B)
+        if (predictedSybil)
+        {
+            m_windowOverhead.AddEvent(12u, m_thresholdN, m_thresholdT, tier);
+            m_totalOverhead.AddEvent(12u, m_thresholdN, m_thresholdT, tier);
+        }
+
+        std::cout << "[ML_DETECTION] t=" << timestampSec
+                  << " claimedId=" << claimedId
+                  << " pred=" << (predictedSybil ? "SYBIL" : "normal")
+                  << " truth=" << (isActuallySybil ? "sybil" : "normal") << std::endl;
     }
 
     // -------------------------------------------------------------------------

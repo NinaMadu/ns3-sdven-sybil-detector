@@ -29,6 +29,7 @@
 #include "sybil_attacks.h"   // ← pulls in sybil_types.h and sybil_metrics.h
 #include "rssi_sybil_detection.h"
 #include "fl_sybil_detection.h"
+#include "ml_realtime_detection.h"    // baseline3 (MODE_BASELINE_ML) AdaBoost/DPM detector
 #include "llm_realtime_detection.h"   // full-mode (MODE_FULL) real-time LLM detector
 #include "controller_sybil_detection.h"  // v6 malicious-SDN-controller detector (isolated;
                                          // writes its own CSVs, never touches M5/M6 or the
@@ -114,6 +115,11 @@ uint32_t g_maliciousControllerCount   = 0; ///< explicit f; 0 = derive from sybi
 // hardcoded value; inert in every other solution_mode.
 double   flThreshold        = 0.5;    ///< FLEMDS sigmoid decision threshold tau
 
+// ML baseline (solution_mode=3, Laouiti AdaBoost/DPM) knobs. Inert elsewhere.
+std::string mlBaselineModel = "";     ///< .pkl for the window scorer; "" = its default
+double   mlDetectInterval   = 10.0;   ///< seconds between in-sim scoring windows
+uint32_t mlWarmupBeacons    = 0;      ///< min n_broadcasts before a verdict is scored; 0 = score all
+
 double   rssiClusterRadius  = 2.5;    ///< Mean-Shift radius R (m)      -> kMeanShiftR
 double   rssiDist1Thresh    = 1.5;    ///< 1-RSU co-location thresh (m) -> kCoLocDistThresh
 double   rssiWindowSec      = 0.3;    ///< Rolling observation window(s)-> kWindowSec
@@ -121,6 +127,8 @@ uint32_t rssiMinSamples     = 3;      ///< Min RSSI samples for MLE     -> kMinS
 uint32_t rssiStreakRequired = 1;      ///< Consecutive windows to confirm (1 = immediate)
 uint32_t rssiMinRsuForMmse  = 3;      ///< RSUs needed for MMSE fix     -> kMinRsuForMmse
 uint32_t rssiMinClusterIds  = 2;      ///< Distinct ids to flag cluster -> kMinClusterIds
+double   rssiMmseCoarseStep = 5.0;    ///< MMSE grid coarse pass (m)    -> kMmseCoarseStep
+double   rssiMmseFineStep   = 0.5;    ///< MMSE grid fine pass (m)      -> kMmseFineStep
 bool     sweepMode          = false;  ///< Suppress per-packet logging for fast threshold sweeps.
 bool     quietMode          = false;  ///< Suppress console output (CSV writes unaffected).
 /// Beacon channel policy — see BindSenderToChannel() in sybil_types.h.
@@ -8585,7 +8593,9 @@ InitializeRssiSolution()
                                  rssiMinSamples,
                                  rssiMinRsuForMmse,
                                  rssiMinClusterIds,
-                                 rssiStreakRequired);
+                                 rssiStreakRequired,
+                                 rssiMmseCoarseStep,
+                                 rssiMmseFineStep);
 
     // Keep the detection log inside the run's own directory. kCsvPath is
     // otherwise a single GLOBAL file that every run overwrites, which silently
@@ -8601,6 +8611,61 @@ InitializeRssiSolution()
         rsuPos.push_back({p.x, p.y});
     }
     RssiSybilDetector::Init(N_RSUs, rsuPos);
+}
+
+// ---------------------------------------------------------------------------
+// MODE_BASELINE_ML (solution_mode=3) — Laouiti et al. AdaBoost/DPM baseline.
+//
+// The detector header shipped with a 4-step integration recipe in its comment
+// block that was never carried out: MlSolutionModeActive() appeared ONLY in
+// that comment, so mode 3 ran the full simulation and detected nothing, while
+// the per-packet path filled M5/M6 with an all-zero TP/FP matrix that looked
+// like a working detector scoring 0. This is that integration.
+//
+// Scoring is per (identity, window) via RecordMlPacketDecision, mirroring
+// MODE_FULL. Ground truth is g_groundTruthSybilIds — the same identity-level
+// set MODE_FULL scores against, so the rows are directly comparable.
+// ---------------------------------------------------------------------------
+static bool
+MlSolutionModeActive()
+{
+    return solution_mode == MODE_BASELINE_ML;
+}
+
+static void
+InitializeMlBaselineSolution()
+{
+    if (!MlSolutionModeActive())
+        return;
+
+    if (!outputDir.empty())
+    {
+        MLRealtimeDetector::SetLog(outputDir + "/communication_log.csv");
+        MLRealtimeDetector::SetOutput(outputDir + "/realtime_predictions_insim.csv");
+    }
+    if (!mlBaselineModel.empty())
+        MLRealtimeDetector::SetModel(mlBaselineModel);
+    MLRealtimeDetector::SetWarmupBeacons(mlWarmupBeacons);
+
+    // Each window's verdicts land here and go straight into the M5/M6 matrix.
+    MLRealtimeDetector::SetVerdictSink(
+        [](const std::vector<MLRealtimeDetector::Verdict>& vs) {
+            if (!g_secMetrics)
+                return;
+            double now = Simulator::Now().GetSeconds();
+            for (std::size_t i = 0; i < vs.size(); ++i)
+            {
+                // Score BOTH sybil and legit verdicts, or TN stays 0 and MCC
+                // is undefined.
+                g_secMetrics->RecordMlPacketDecision(
+                    vs[i].claimedId,
+                    g_groundTruthSybilIds.count(vs[i].claimedId) > 0,
+                    vs[i].predSybil,
+                    "rsu", now);
+            }
+        });
+
+    MLRealtimeDetector::Init(mlDetectInterval);
 }
 
 static void
@@ -15961,6 +16026,9 @@ main(int argc, char* argv[])
     cmd.AddValue("mobilityMode5RsuPositionFile","Optional RSU CSV for mobility_mode=5",mobilityMode5RsuPositionFile);
 
     cmd.AddValue("flThreshold",        "FLEMDS baseline (solution_mode=1): sigmoid decision threshold tau; >= tau is flagged Sybil [default 0.5]", flThreshold);
+    cmd.AddValue("mlBaselineModel",    "ML baseline (solution_mode=3): path to the .pkl the window scorer loads; empty = rt_window_score.py's own default (the Jun-12 AdaBoost model)", mlBaselineModel);
+    cmd.AddValue("mlDetectInterval",   "ML baseline (solution_mode=3): sim-seconds between in-sim scoring windows [default 10]", mlDetectInterval);
+    cmd.AddValue("mlWarmupBeacons",    "ML baseline (solution_mode=3): minimum n_broadcasts before an identity's verdict is scored into M5/M6; verdicts are still logged to the predictions CSV. 0 = score all [default 0]", mlWarmupBeacons);
     // RSSI baseline (solution_mode=2) detector tuning. All seven are pushed
     // into RssiSybilDetector::Configure() by InitializeRssiSolution(); they are
     // inert in every other solution_mode.
@@ -15971,6 +16039,8 @@ main(int argc, char* argv[])
     cmd.AddValue("rssiStreak",         "RSSI baseline: consecutive windows an identity must be flagged in before the verdict commits; 1 = immediate [default 1]", rssiStreakRequired);
     cmd.AddValue("rssiMinRsuForMmse",  "RSSI baseline: RSUs that must observe an identity before MMSE positioning is attempted [default 3]", rssiMinRsuForMmse);
     cmd.AddValue("rssiMinClusterIds",  "RSSI baseline: distinct claimed ids in a cluster before it is flagged Sybil; 2 = the paper's rule [default 2]", rssiMinClusterIds);
+    cmd.AddValue("rssiMmseCoarseStep", "RSSI baseline: MMSE grid-search coarse step (m) [default 5.0]", rssiMmseCoarseStep);
+    cmd.AddValue("rssiMmseFineStep",   "RSSI baseline: MMSE grid-search fine step (m). Estimated positions are SNAPPED to this, so it sets the floor on how close two distinct vehicles can be resolved [default 0.5]", rssiMmseFineStep);
     cmd.AddValue("sweepMode",           "Suppress all per-packet logging for fast threshold sweeps", sweepMode);
     cmd.AddValue("quietMode",           "Suppress all console output; CSV writes are unaffected", quietMode);
     cmd.AddValue("beaconChannelMode",   "Beacon channel policy: 0=legacy (one beacon egresses all 7 DSRC channels, 7.33x measured duplication), 1=CCH only (ch178, DSRC/WAVE standard), 2=spread one beacon per channel round-robin [default 2]", beaconChannelMode);
@@ -16586,6 +16656,7 @@ main(int argc, char* argv[])
     }
 
     InitializeRssiSolution();
+    InitializeMlBaselineSolution();
 
     // -----------------------------------------------------------------------
     // Wireless channels — 7-channel 802.11p DSRC/WAVE (5.9 GHz band)
@@ -17368,6 +17439,12 @@ main(int argc, char* argv[])
         std::cout.clear();
     }
     Simulator::Destroy();
+    if (MlSolutionModeActive())
+    {
+        // Drain any verdicts from the final window before reporting.
+        MLRealtimeDetector::DrainNewVerdicts();
+        MLRealtimeDetector::FinalizeAndReport();
+    }
     WriteLwSsdFlagAttributionCsv();
     WriteLwSsdIdentityMatrixCsv();
     if (v6DetectActive)
