@@ -81,6 +81,17 @@ sybil-attack/**/visualizations/**
 !sybil-attack/inputs/mobility/**/*.tcl
 !sybil-attack/inputs/mobility/**/*.netccfg
 !sybil-attack/inputs/mobility/**/*.sumocfg
+# The SUMO builder scripts + their notes ARE the reproducible source for the
+# generated scenario assets below — always track these.
+!sybil-attack/inputs/mobility/**/*.py
+!sybil-attack/inputs/mobility/**/*.md
+
+# S-SOTA-2 / S-SOTA-3 ns-2 traces are ~283MB of machine-generated output (one
+# file breaches GitHub's 50MB warning). They are deterministically rebuilt by
+# the build_sota*.py scripts above, so keep them out of Git; the small route /
+# net / vType / RSU inputs beside them stay tracked.
+sybil-attack/inputs/mobility/kuala-lumpur-bb/sota2_speed/*_mobility.tcl
+sybil-attack/inputs/mobility/kuala-lumpur-bb/sota3_scale/*_mobility.tcl
 
 # ns-3/build artifacts and local tooling.
 build/

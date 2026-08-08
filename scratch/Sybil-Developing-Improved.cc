@@ -8154,11 +8154,90 @@ struct MobilityScenario
     std::string rsuPositionFile;
 };
 
+// ─── S-SOTA-2 / S-SOTA-3 derived scenarios (modes 6-13) ──────────────────────
+// These are additive: they are built FROM mode 5's klbb2km inputs by the two
+// generators under inputs/mobility/kuala-lumpur-bb/{sota2_speed,sota3_scale}/
+// and they never modify them.  Mode 5 keeps its own hand-written case below and
+// its own mobilityMode5* globals, unchanged.
+//
+// S-SOTA-2 (modes 6-9) varies vehicle speed only: same routes, same rerouter,
+// same 64-RSU 8x8 deployment; only the road speed limit and the vType caps move.
+// Speed points are 10/40/60/100 km/h -- NOT 140 -- because klbb2km's median edge
+// is 39.5 m, so above ~60 km/h edge geometry, not the posted limit, bounds the
+// achieved speed.  Achieved means: 2.55 / 7.10 / 7.34 / 8.01 m/s.
+//
+// S-SOTA-3 (modes 10-13) varies population only: same net, same vTypes, same 60
+// rerouter hubs; N_V in {100,200,300,400} with RSUs = floor(64*N_V/200).  Route
+// sets are strictly nested and mode 11 IS mode 5 (same trace, same RSU CSV), so
+// the N_V=200 anchor is bit-identical to the existing baseline runs.
+static const struct DerivedSumoScenario
+{
+    uint32_t mode;
+    const char* name;
+    const char* traceFile;
+    const char* rsuPositionFile;
+} kDerivedSumoScenarios[] = {
+    // S-SOTA-2: vehicle mobility (RSU deployment identical to mode 5)
+    {6,  "sota2_speed_10kmh",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota2_speed/klbb2km_v010_mobility.tcl",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_rsus_8x8.csv"},
+    {7,  "sota2_speed_40kmh",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota2_speed/klbb2km_v040_mobility.tcl",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_rsus_8x8.csv"},
+    {8,  "sota2_speed_60kmh",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota2_speed/klbb2km_v060_mobility.tcl",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_rsus_8x8.csv"},
+    {9,  "sota2_speed_100kmh",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota2_speed/klbb2km_v100_mobility.tcl",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_rsus_8x8.csv"},
+    // S-SOTA-3: network scalability
+    {10, "sota3_scale_100veh_32rsu",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota3_scale/klbb2km_n100_mobility.tcl",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota3_scale/klbb2km_rsus_8x4.csv"},
+    // Anchor.  Same 200 vehicles as mode 5 (klbb2km.rou.xml is reused verbatim)
+    // but RE-EXPORTED with the current SUMO.  It deliberately does NOT point at
+    // klbb2km_mobility.tcl: that committed trace carries 259 ns-2 node ids for a
+    // 200-vehicle route file (an older-traceExporter artefact), which would make
+    // sumoAutoConfig read N_Vehicles=259 and turn this sweep's x-axis into
+    // 100/259/300/400.  Mode 5 still uses the 259-node trace, unchanged.
+    {11, "sota3_scale_200veh_64rsu_anchor",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota3_scale/klbb2km_n200_mobility.tcl",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/klbb2km_rsus_8x8.csv"},
+    {12, "sota3_scale_300veh_96rsu",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota3_scale/klbb2km_n300_mobility.tcl",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota3_scale/klbb2km_rsus_12x8.csv"},
+    {13, "sota3_scale_400veh_128rsu",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota3_scale/klbb2km_n400_mobility.tcl",
+     "sybil-attack/inputs/mobility/kuala-lumpur-bb/sota3_scale/klbb2km_rsus_16x8.csv"},
+};
+
+/// Lowest and highest mobility_mode backed by a SUMO/ns-2 trace.
+static const uint32_t kFirstSumoMobilityMode = 3;
+static const uint32_t kLastSumoMobilityMode  = 13;
+
 static MobilityScenario
 GetMobilityScenario(uint32_t mode)
 {
     MobilityScenario scenario;
     scenario.mode = mode;
+
+    for (const DerivedSumoScenario& derived : kDerivedSumoScenarios)
+    {
+        if (derived.mode != mode)
+            continue;
+
+        scenario.name = derived.name;
+        scenario.usesSumoTrace = true;
+        scenario.traceFile = derived.traceFile;
+        scenario.rsuPositionFile = derived.rsuPositionFile;
+
+        // Honour the same one-run overrides the mode 3-5 scenarios accept.
+        if (!mobilityTraceFile.empty())
+            scenario.traceFile = mobilityTraceFile;
+        if (!mobilityRsuPositionFile.empty())
+            scenario.rsuPositionFile = mobilityRsuPositionFile;
+        return scenario;
+    }
 
     switch (mode)
     {
@@ -8290,7 +8369,7 @@ AutoConfigureSumoMode()
 {
     if (!sumoAutoConfig) return;
     if (routing_test) return;
-    if (mobility_mode < 3 || mobility_mode > 5) return;
+    if (mobility_mode < kFirstSumoMobilityMode || mobility_mode > kLastSumoMobilityMode) return;
 
     MobilityScenario scenario = GetMobilityScenario(mobility_mode);
     if (!scenario.usesSumoTrace || scenario.traceFile.empty()) return;
@@ -8514,7 +8593,7 @@ InstallSumoTraceMobility(const MobilityScenario& scenario)
 static void
 InstallSelectedMobility()
 {
-    if (mobility_mode < 1 || mobility_mode > 5)
+    if (mobility_mode < 1 || mobility_mode > kLastSumoMobilityMode)
     {
         std::cerr << "[Mobility] WARNING: invalid mobility_mode=" << mobility_mode
                   << "; falling back to programmed road mobility.\n";
@@ -8534,14 +8613,19 @@ InstallSelectedMobility()
         boundedRoadMobility = true;
         InstallConstantVelocityVehicles(true);
         break;
-    case 3:
-    case 4:
-    case 5:
-        boundedRoadMobility = false;
-        InstallSumoTraceMobility(scenario);
-        break;
     default:
-        InstallConstantVelocityVehicles(true);
+        // Modes 3-5 (hand-written scenarios) and 6-13 (S-SOTA-2/3 derived
+        // scenarios) are all SUMO/ns-2 trace driven.
+        if (mobility_mode >= kFirstSumoMobilityMode &&
+            mobility_mode <= kLastSumoMobilityMode)
+        {
+            boundedRoadMobility = false;
+            InstallSumoTraceMobility(scenario);
+        }
+        else
+        {
+            InstallConstantVelocityVehicles(true);
+        }
         break;
     }
 
@@ -15952,7 +16036,7 @@ main(int argc, char* argv[])
     cmd.AddValue("cloudPresenceSyncInterval",  "Seconds between controller cache syncs from cloud presence table",cloudPresenceSyncInterval);
     cmd.AddValue("cloudPresenceTimeout",       "Seconds before cloud vehicle presence rows expire",cloudPresenceTimeout);
     cmd.AddValue("channelHandshakeTimeout",    "Seconds before retrying a pending V2RSU channel handshake",channelHandshakeTimeout);
-    cmd.AddValue("mobility_mode",              "Mobility mode: 1=test 2=programmed road 3=SUMO trace1 4=SUMO trace2 5=SUMO trace3",mobility_mode);
+    cmd.AddValue("mobility_mode",              "Mobility mode: 1=test 2=programmed road 3=SUMO trace1 4=SUMO trace2 5=SUMO trace3 (klbb2km baseline) | S-SOTA-2 speed sweep 6=10km/h 7=40 8=60 9=100 | S-SOTA-3 scale sweep 10=100veh/32rsu 11=200veh/64rsu(==mode 5 anchor) 12=300veh/96rsu 13=400veh/128rsu",mobility_mode);
     cmd.AddValue("sumoAutoConfig",             "Auto-set N_Vehicles/N_RSUs from SUMO trace files (default true)",sumoAutoConfig);
     cmd.AddValue("boundedRoadMobility",        "Keep vehicles inside a bounded multi-lane road corridor",boundedRoadMobility);
     cmd.AddValue("roadStartX",                 "Bounded road start x-coordinate",roadStartX);
